@@ -9,14 +9,28 @@ Author: Harry Qiu <hqiu678@outlook.com>
 Date: 12-03-2024
 """
 
-# Your code goes here...
-
+import cysgp4
+from cysgp4 import PyTle, PyObserver
+from cysgp4 import get_example_tles, propagate_many
 import numpy as np
+import matplotlib
+import matplotlib.cm as cm
+import matplotlib.pyplot as plt
+import pycraf
+from pycraf import conversions as cnv
+from pycraf import protection, antenna, geometry
+from astropy import units as u, constants as const
+from astropy.time import Time
+from astropy.utils.misc import NumpyRNGContext
 
 
 class observatory:
-    def __init__(self, name):
+    def __init__(self, name, lat, lon, alt):
         self.name = name
+        self.lat = lat
+        self.lon = lon
+        self.alt = alt
+        self.observer=PyObserver(name, lat, lon, alt)
     
     def __len__(self):
         return len(self.name)
@@ -24,8 +38,7 @@ class observatory:
 
 
 
-
-    def sample_on_cell_grid_m1583(
+def pointpop(
             niters,
             step_size=3 * u.deg,
             lat_range=(0 * u.deg, 90 * u.deg),
