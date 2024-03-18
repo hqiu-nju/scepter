@@ -23,21 +23,7 @@ from astropy import units as u, constants as const
 from astropy.time import Time
 from astropy.utils.misc import NumpyRNGContext
 
-
-class observatory:
-    def __init__(self, name, lat, lon, alt):
-        self.name = name
-        self.lat = lat
-        self.lon = lon
-        self.alt = alt
-        self.observer=PyObserver(name, lat, lon, alt)
     
-    def __len__(self):
-        return len(self.name)
-    
-
-
-
 def pointpop(
             niters,
             step_size=3 * u.deg,
