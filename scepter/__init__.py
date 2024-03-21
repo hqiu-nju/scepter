@@ -7,7 +7,7 @@ A brief description of the package.
 
 """
 
-__doc__ = "SCEPTer, simulating satellite constellation emission patterns"
+__doc__ = "SCEPTer, Simulating Constellation Emission Patterns for Telescopes"
 
 # Import any modules or sub-packages here
 from . import pfd, skynet

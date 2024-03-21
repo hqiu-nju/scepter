@@ -19,52 +19,59 @@ from pycraf import conversions as cnv
 from pycraf import protection, antenna, geometry
 from astropy import units as u, constants as const
 
-def dummy_gain(sat_obs_az,sat_obs_el,d_tx,freq,tp_az,tp_el):
+def dummy_gain(phi,d_tx,freq):
     '''
     Description: Retrieves gain from basic gain pattern function with angular separation to pointing considered
 
     Parameters:
-    sat_obs_az: float
-        azimuth angle of the satellite
-    sat_obs_el: float
-        elevation angle of the satellite
+
+    phi: float
+        beam tilt angle of the satellite (this is a dummy version so just assume 
+        tilt angle in reference to satellite perpendicular to earth)
     d_tx: float
-        diameter of the transmitter telescope
+        diameter of the transmitter
     freq: float
         frequency of the signal
-    tp_az: float
-        azimuth angle of the telescope pointing
-    tp_el: float
-        elevation angle of the telescope pointing
 
     Returns:
     G_tx: float
         transmitter gain
     '''
     gmax=antenna.fl_G_max_from_size(d_tx,freq)
-    hpbw=antenna.fl_hpbw_from_size(d_tx,freq)  
+    # hpbw=antenna.fl_hpbw_from_size(d_tx,freq)  ## get hpbw from diameter and frequency
     ### calculate angular separation of satellite to telescope pointing
-    phi=geometry.angular_separation(tp_az,tp_el,sat_obs_az,sat_obs_el) 
     flpattern=antenna.fl_pattern(phi,diameter=d_tx,frequency=freq,G_max=gmax)
-
+    G_tx=flpattern
     return G_tx
 
 
-def grx(ang_sep,d_rx,freq,eta_a_rx):
+def grx(sat_obs_az,sat_obs_el,tp_az,tp_el,d_rx,freq,eta_a_rx):
     '''
-    Description: This function calculates the receiver gain
+    Description: This function calculates the receiver gain of an model antenna 
+    using the ras_pattern function from pycraf.antenna module. 
+    I changed wavelength to frequency just for the hack.
 
     Parameters:
-    ang_sep: float
-        angular separation between observing direction and telescope pointing
+    sat_obs_az: float
+        azimuth angle of the satellite
+    sat_obs_el: float
+        elevation angle of the satellite
+    tp_az: float
+        azimuth angle of the telescope pointing
+    tp_el: float
+        elevation angle of the telescope pointing
     d_rx: float
         diameter of the receiver telescope
     freq: float
         frequency of the signal
     eta_a_rx: float
         aperture efficiency of the receiver telescope
+
+    Returns:
+    G_rx: float
+        receiver gain
     '''
-    
+    ang_sep = geometry.true_angular_distance(tp_az, tp_el, sat_obs_az, sat_obs_el)
     G_rx = antenna.ras_pattern(
         ang_sep, d_rx, const.c / freq, eta_a_rx
         )
@@ -81,7 +88,7 @@ def ptx(p_tx_carrier,carrier_bandwidth,duty_cycle,ras_bandwidth):
     p_tx = p_tx_carrier
     return p_tx
 
-def prx(freq,sat_obs_dist,sat_obs_az,sat_obs_el):
+def prx(freq,sat_obs_dist,sat_obs_az,sat_obs_el,tp_az,tp_el,d_rx,eta_a_rx,p_tx):
     '''
     Description: This function calculates the received power, astropy units needed for all inputs
 
@@ -104,7 +111,7 @@ def prx(freq,sat_obs_dist,sat_obs_az,sat_obs_el):
         sat_obs_az * u.deg,
         sat_obs_el * u.deg,
         )
-    
+    G_rx = grx(sat_obs_az,sat_obs_el,tp_az,tp_el,d_rx,freq,eta_a_rx)
     p_rx = np.sum(p_tx+G_tx+FSPL+G_rx).to_value(u.W)
     return p_rx
 
