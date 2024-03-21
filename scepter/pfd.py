@@ -19,7 +19,7 @@ from pycraf import conversions as cnv
 from pycraf import protection, antenna, geometry
 from astropy import units as u, constants as const
 
-def dummy_gain(phi,d_tx,freq):
+def dummy_gain_tx(phi,d_tx,freq):
     '''
     Description: Retrieves gain from basic gain pattern function with angular separation to pointing considered
 
@@ -35,7 +35,7 @@ def dummy_gain(phi,d_tx,freq):
 
     Returns:
     G_tx: float
-        transmitter gain
+        transmitter gain (dBi)
     '''
     gmax=antenna.fl_G_max_from_size(d_tx,freq)
     # hpbw=antenna.fl_hpbw_from_size(d_tx,freq)  ## get hpbw from diameter and frequency
@@ -45,7 +45,7 @@ def dummy_gain(phi,d_tx,freq):
     return G_tx
 
 
-def grx(sat_obs_az,sat_obs_el,tp_az,tp_el,d_rx,freq,eta_a_rx):
+def gain_rx(sat_obs_az,sat_obs_el,tp_az,tp_el,d_rx,freq,eta_a_rx):
     '''
     Description: This function calculates the receiver gain of an model antenna 
     using the ras_pattern function from pycraf.antenna module. 
@@ -69,7 +69,7 @@ def grx(sat_obs_az,sat_obs_el,tp_az,tp_el,d_rx,freq,eta_a_rx):
 
     Returns:
     G_rx: float
-        receiver gain
+        receiver gain (dBi)
     '''
     ang_sep = geometry.true_angular_distance(tp_az, tp_el, sat_obs_az, sat_obs_el)
     G_rx = antenna.ras_pattern(
@@ -78,7 +78,24 @@ def grx(sat_obs_az,sat_obs_el,tp_az,tp_el,d_rx,freq,eta_a_rx):
     return G_rx
 
 
-def ptx(p_tx_carrier,carrier_bandwidth,duty_cycle,ras_bandwidth):
+def power_tx(p_tx_carrier,carrier_bandwidth,duty_cycle,ras_bandwidth):
+    '''
+    Description: This function calculates the transmitted power, astropy units needed for all inputs
+
+    Parameters:
+    p_tx_carrier: float
+        transmitted power of the carrier signal
+    carrier_bandwidth: float
+        bandwidth of the carrier signal
+    duty_cycle: float
+        duty cycle of the signal
+    ras_bandwidth: float
+        observation bandwidth
+    
+    Returns:
+    p_tx: float
+        transmitted power in dBm
+    '''
     # Calculate the transmitted power
     p_tx_nu_peak = (
     p_tx_carrier.physical / carrier_bandwidth
@@ -88,7 +105,7 @@ def ptx(p_tx_carrier,carrier_bandwidth,duty_cycle,ras_bandwidth):
     p_tx = p_tx_carrier
     return p_tx
 
-def prx(freq,sat_obs_dist,sat_obs_az,sat_obs_el,tp_az,tp_el,d_rx,eta_a_rx,p_tx):
+def power_rx(freq,sat_obs_dist,sat_obs_az,sat_obs_el,tp_az,tp_el,d_rx,eta_a_rx,p_tx):
     '''
     Description: This function calculates the received power, astropy units needed for all inputs
 
@@ -104,7 +121,7 @@ def prx(freq,sat_obs_dist,sat_obs_az,sat_obs_el,tp_az,tp_el,d_rx,eta_a_rx,p_tx):
     
     Returns:
     p_rx: float
-        received power (Watts)
+        received power in linear space (W)
     '''
     FSPL = cnv.free_space_lost(sat_obs_dist,freq) ### calculate free space path loss
     G_tx = sat_gain_func(  ### calculate transmitter gain
@@ -112,6 +129,6 @@ def prx(freq,sat_obs_dist,sat_obs_az,sat_obs_el,tp_az,tp_el,d_rx,eta_a_rx,p_tx):
         sat_obs_el * u.deg,
         )
     G_rx = grx(sat_obs_az,sat_obs_el,tp_az,tp_el,d_rx,freq,eta_a_rx)
-    p_rx = np.sum(p_tx+G_tx+FSPL+G_rx).to_value(u.W)
+    p_rx = (p_tx+G_tx+FSPL+G_rx).to_value(u.W) ### convert decibels to linear space
     return p_rx
 
