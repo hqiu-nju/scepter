@@ -1,6 +1,0 @@
-numpy
-matplotlib
-astropy
-pycraf
-cysgp4
-pandas
