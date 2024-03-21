@@ -1,5 +1,5 @@
 # SCEPTer
-Simulating Constellation Emission Patterns for Telescopes
+**S**imulating **C**onstellation **E**mission **P**atterns for **Te**lescopes (**r**adio)
 
 This is a repository to simulate the satellite constellation emissions and measure the EPFD of the observed sky area.
 
