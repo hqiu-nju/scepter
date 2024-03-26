@@ -37,10 +37,13 @@ def dummy_gain_tx(phi,d_tx,freq):
     G_tx: float
         transmitter gain (dBi)
     '''
-    gmax=antenna.fl_G_max_from_size(d_tx,freq)
-    # hpbw=antenna.fl_hpbw_from_size(d_tx,freq)  ## get hpbw from diameter and frequency
+    
+    wavelength=const.c/freq
+    gmax=antenna.fl_G_max_from_size(d_tx,wavelength)  ## get G_max from diameter and frequency
+
+    # hpbw=antenna.fl_hpbw_from_size(d_tx,wavelength)  ## get hpbw from diameter and frequency
     ### calculate angular separation of satellite to telescope pointing
-    flpattern=antenna.fl_pattern(phi,diameter=d_tx,frequency=freq,G_max=gmax)
+    flpattern=antenna.fl_pattern(phi,diameter=d_tx,wavelength=wavelength,G_max=gmax)
     G_tx=flpattern
     return G_tx
 
@@ -105,7 +108,7 @@ def power_tx(p_tx_carrier,carrier_bandwidth,duty_cycle,ras_bandwidth):
     p_tx = p_tx_carrier
     return p_tx
 
-def power_rx(freq,sat_obs_dist,sat_obs_az,sat_obs_el,tp_az,tp_el,d_rx,eta_a_rx,p_tx):
+def power_rx(freq,d_rx,eta_a_rx,d_tx,p_tx,sat_obs_dist,sat_obs_az,sat_obs_el,tp_az,tp_el):
     '''
     Description: This function calculates the received power, astropy units needed for all inputs
 
@@ -123,12 +126,15 @@ def power_rx(freq,sat_obs_dist,sat_obs_az,sat_obs_el,tp_az,tp_el,d_rx,eta_a_rx,p
     p_rx: float
         received power in linear space (W)
     '''
-    FSPL = cnv.free_space_lost(sat_obs_dist,freq) ### calculate free space path loss
-    G_tx = sat_gain_func(  ### calculate transmitter gain
-        sat_obs_az * u.deg,
-        sat_obs_el * u.deg,
+    FSPL = cnv.free_space_loss(sat_obs_dist,freq) ### calculate free space path loss
+    phi = geometry.true_angular_distance(  ### calculate transmitter gain
+        sat_obs_az ,
+        sat_obs_el ,
+        tp_az ,
+        tp_el 
         )
-    G_rx = grx(sat_obs_az,sat_obs_el,tp_az,tp_el,d_rx,freq,eta_a_rx)
-    p_rx = (p_tx+G_tx+FSPL+G_rx).to_value(u.W) ### convert decibels to linear space
+    G_tx = dummy_gain_tx(phi,d_tx,freq)
+    G_rx = gain_rx(sat_obs_az,sat_obs_el,tp_az,tp_el,d_rx,freq,eta_a_rx)
+    p_rx = (p_tx+G_tx+FSPL+G_rx).to(u.W) ### convert decibels to linear space
     return p_rx
 
