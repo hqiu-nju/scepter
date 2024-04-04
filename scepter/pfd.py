@@ -89,7 +89,7 @@ class transmitter_info():
 
         # hpbw=antenna.fl_hpbw_from_size(d_tx,wavelength)  ## get hpbw from diameter and frequency
         ### calculate angular separation of satellite to telescope pointing
-        flpattern=antenna.fl_pattern(phi,diameter=d_tx,wavelength=wavelength,G_max=gmax)
+        flpattern=antenna.fl_pattern(phi,diameter=self.d_tx,wavelength=wavelength,G_max=gmax)
         G_tx=flpattern
         return G_tx
     def power_arrv(self,sat_obs_dist,g_tx,outunit=u.W):
@@ -131,7 +131,7 @@ class transmitter_info():
 
 
 class receiver_info():
-    def __init__(self,d_rx,eta_a_rx,lat,lon,alt):
+    def __init__(self,d_rx,eta_a_rx,lat,lon,alt,freq):
         '''
         Description: Information holder class to store receiver information
 
@@ -147,13 +147,16 @@ class receiver_info():
             longitude of the observer
         alt: float
             altitude of the observer
+        freq: float
+            receiver frequency band
     
         '''
         self.d_rx = d_rx
         self.eta_a_rx = eta_a_rx
         self.location = cysgp4.PyObserver(lat,lon,alt)
+        self.freq = freq
     
-    def antgain1d(self,phi):
+    def antgain1d(self,phi,tp_az,tp_el,sat_obs_az,sat_obs_el):
         '''
         Description: This function calculates the 1d receiver gain of an model antenna 
         using the ras_pattern function from pycraf.antenna module. 
@@ -169,30 +172,62 @@ class receiver_info():
         '''
         ang_sep = geometry.true_angular_distance(tp_az, tp_el, sat_obs_az, sat_obs_el)
         G_rx = antenna.ras_pattern(
-            ang_sep, self.d_rx, const.c / freq, self.eta_a_rx
+            ang_sep, self.d_rx, const.c / self.freq, self.eta_a_rx
             )
         self.G_rx = G_rx
         return G_rx
-    def populate(self,tles_list,obstime):
+
+class obs_sim():
+    def __init__(self,transmitter,receiver,tles_list):
+        '''
+        Description: simulate observing programme
+
+        Parameters:
+
+        transmitter: transmitter_info object
+            transmitter object
+        receiver: receiver_info object
+            receiver object
+        tles_list: list
+            list of tle objects (PyTle objects)
+        '''
+
+        self.transmitter = transmitter
+        self.receiver = receiver
+        self.tles_list = tles_list
+
+
+
+    def populate(self,mjds,sat_beam_tilt=[0,0]):
         '''
         Description: This function populates the observer object with satellite information
 
         Parameters:
         tles_list: list
-            list of tle objects
-        obstime: astropy time object
-            time of observation
+            list of tle objects (PyTle objects)
+        mjds: array
+            mjd time of observation
+        sat_beam: coordinate object
+            beam tilt direction of the satellite in the satellite reference frame. no distance needed just az and el
 
         Returns:
-        sate_info: cysgp4 Satellite object  
+        sat_info: cysgp4 Satellite object  
             Satellite class that stores the satellite coordinates and information to the observer object
 
         '''
+        obs=self.location
+        tles=self.tles_list
+        sat_info=cysgp4.propagate_many(mjds,tles,observers=obs,do_eci_pos=True, do_topo=True, do_obs_pos=True, do_sat_azel=True)
+        
+        return sat_info
+
+        
 
 
 
 
-def prx_cnv(pwr,g_rx, outunit=u.W)
+
+def prx_cnv(pwr,g_rx, outunit=u.W):
     '''
     description: Calculates the received power with the receiver gain response. 
     Uses the observing pointing and source coordinates to determine the gain.
@@ -210,7 +245,7 @@ def prx_cnv(pwr,g_rx, outunit=u.W)
             received power in linear space (W)
     '''
 
-    p_db = pwr + G_rx
+    p_db = pwr + g_rx
     p_rx = p_db.to(outunit) ## convert to unit needed
     return p_rx
 
