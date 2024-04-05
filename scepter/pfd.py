@@ -165,6 +165,15 @@ class receiver_info():
         Parameters:
         phi: float
             angular separation between the satellite and the telescope pointing
+        tp_az: float
+            azimuth of the telescope pointing
+        tp_el: float    
+            elevation of the telescope pointing
+        sat_obs_az: float   
+            azimuth of the satellite in the observer reference frame
+        sat_obs_el: float
+            elevation of the satellite in the observer reference frame
+    
 
         Returns:
         G_rx: float
@@ -218,11 +227,14 @@ class obs_sim():
         obs=self.location
         tles=self.tles_list
         sat_info=cysgp4.propagate_many(mjds,tles,observers=obs,do_eci_pos=True, do_topo=True, do_obs_pos=True, do_sat_azel=True)
-        
+        self.propagation = sat_info
         return sat_info
+    def power_1d(self,tel_az,tel_el):
+        '''
+        Description: Calculates the received power with the receiver gain response using the dummy 1d gain models
 
-        
-
+        Parameters:
+        '''
 
 
 
