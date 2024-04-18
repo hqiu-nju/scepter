@@ -27,23 +27,22 @@ class transmitter_info():
 
         Parameters:
 
-        p_tx_carrier: float
+        p_tx_carrier: astropy quantity
             transmitted power of the carrier signal
-        carrier_bandwidth: float
+        carrier_bandwidth: astropy quantity
             bandwidth of the carrier signal
-        duty_cycle: float 
+        duty_cycle: astropy quantity 
             duty cycle of the signal
-        ras_bandwidth: float
-            observation bandwidth
-        d_tx: float
+        d_tx: astropy quantity
             diameter of the transmitter
-        freq: float
-    
+        freq: astropy quantity
+            frequency of the signal (centre of band)
         '''
         self.carrier = p_tx_carrier
         self.carrier_bandwidth = carrier_bandwidth
         self.duty_cycle = duty_cycle
         self.d_tx = d_tx
+        self.freq = freq
     
 
 
@@ -52,17 +51,17 @@ class transmitter_info():
         Description: This function calculates the transmitted power, astropy units needed for all inputs
 
         Parameters:
-        ras_bandwidth: float
+        ras_bandwidth: astropy quantity
             observation bandwidth
         
         Returns:
-        p_tx: float
+        p_tx: astropy quantity
             transmitted power in dBm
         '''
         # Calculate the transmitted power
         self.ras_bandwidth = ras_bandwidth
         p_tx_nu_peak = (
-        self.p_tx_carrier.physical / self.carrier_bandwidth
+        self.carrier.physical / self.carrier_bandwidth
         ).to(u.W / u.Hz)
         p_tx_nu = p_tx_nu_peak * self.duty_cycle
         p_tx = p_tx_nu.to(u.W / u.Hz) * ras_bandwidth
@@ -75,7 +74,7 @@ class transmitter_info():
 
         Parameters:
 
-        phi: float
+        phi: astropy quantity
             beam tilt angle of the satellite (this is a dummy version so just assume 
             tilt angle in reference to satellite perpendicular to earth)
 
@@ -109,29 +108,11 @@ class transmitter_info():
         FSPL = cnv.free_space_loss(sat_obs_dist,self.freq)
         sat_power= self.p_tx+FSPL+g_tx ### in dBm space
         return sat_power
-    def localise(self,pyobs,pydt,tle):
-        '''
-        Description: This function populates the observer object with satellite information
 
-        Parameters:
-        pyobs: cysgp4 observer object
-            observer object
-        pydt: astropy time object
-            time of observation
-        tle: cysgp4 tle object
-            tle object
-
-        Returns:
-        sate_info: cysgp4 Satellite object  
-            Satellite class that stores the satellite coordinates and information to the observer object
-
-        '''
-        sate_info = cysgp4.PySatellite(tle,pyobs,pydt)
-        return sate_info 
 
 
 class receiver_info():
-    def __init__(self,d_rx,eta_a_rx,lat,lon,alt,freq):
+    def __init__(self,d_rx,eta_a_rx,pyobs,freq,bandwidth):
         '''
         Description: Information holder class to store receiver information
 
@@ -141,20 +122,19 @@ class receiver_info():
             diameter of the receiver telescope
         eta_a_rx: float
             aperture efficiency of the receiver telescope
-        lat: float
-            latitude of the observer
-        lon: float
-            longitude of the observer
-        alt: float
-            altitude of the observer
+        pyobs: cysgp4 observer object
+            observer object
         freq: float
             receiver frequency band
+        bandwidth: float
+            receiver bandwidth
     
         '''
         self.d_rx = d_rx
         self.eta_a_rx = eta_a_rx
-        self.location = cysgp4.PyObserver(lat,lon,alt)
+        self.location = pyobs
         self.freq = freq
+        self.bandwidth = bandwidth
     
     def antgain1d(self,phi,tp_az,tp_el,sat_obs_az,sat_obs_el):
         '''
@@ -203,11 +183,12 @@ class obs_sim():
 
         self.transmitter = transmitter
         self.receiver = receiver
+        self.ras_bandwidth = receiver.bandwidth
+        self.transmitter.power_tx(self.ras_bandwidth)
         self.tles_list = tles_list
+        self.location = receiver.location
 
-
-
-    def populate(self,mjds,sat_beam_tilt=[0,0]):
+    def populate(self,mjds):
         '''
         Description: This function populates the observer object with satellite information
 
@@ -216,8 +197,6 @@ class obs_sim():
             list of tle objects (PyTle objects)
         mjds: array
             mjd time of observation
-        sat_beam: coordinate object
-            beam tilt direction of the satellite in the satellite reference frame. no distance needed just az and el
 
         Returns:
         sat_info: cysgp4 Satellite object  
@@ -229,12 +208,44 @@ class obs_sim():
         sat_info=cysgp4.propagate_many(mjds,tles,observers=obs,do_eci_pos=True, do_topo=True, do_obs_pos=True, do_sat_azel=True)
         self.propagation = sat_info
         return sat_info
-    def power_1d(self,tel_az,tel_el):
-        '''
-        Description: Calculates the received power with the receiver gain response using the dummy 1d gain models
 
-        Parameters:
-        '''
+
+
+
+def sat_frame_pointing(sat_info,beam_el,beam_az):
+    '''
+    Description: Calculate the satellite pointing angle separation to the observer in the satellite reference frame
+
+    Parameters:
+    sat_info: obs_sim object
+        sat_info from obs_sim class populate function
+    beam_el: float
+        beam elevation angle in satellite reference frame
+    beam_az: float  
+        beam azimuth angle in satellite reference frame
+    
+    Returns:
+    ang_sep: float
+        angular separation between the satellite pointing and observer in the satellite reference frame
+    delta_az: float
+        azimuth difference between the satellite pointing and observer in the satellite reference frame
+    delta_el: float
+        elevation difference between the satellite pointing and observer in the satellite reference frame
+    obs_dist: float
+        distance between the observer and the satellite
+    '''
+    result=sat_info
+    # eci_pos = result['eci_pos']
+    # topo_pos = result['topo']
+    sat_azel = result['sat_azel']  ### check cysgp4 for satellite frame orientation description
+
+    # eci_pos_x, eci_pos_y, eci_pos_z = (eci_pos[..., i] for i in range(3))
+    # topo_pos_az, topo_pos_el, topo_pos_dist, _ = (topo_pos[..., i] for i in range(4))
+    obs_az, obs_el, obs_dist = (sat_azel[..., i] for i in range(3))
+    ang_sep=geometry.true_angular_distance(obs_az,obs_el,beam_az,beam_el)
+    delta_az=obs_az-beam_az
+    delta_el=obs_el-beam_el
+    return ang_sep,delta_az,delta_el,obs_dist
 
 
 
@@ -261,25 +272,6 @@ def prx_cnv(pwr,g_rx, outunit=u.W):
     p_rx = p_db.to(outunit) ## convert to unit needed
     return p_rx
 
-def tx_1d():
-    '''
-    Description: generate gain calibrated power from transmitter using 1d gain pattern in satellite reference frame,
-
-    Input:
-        sat_obs_dist: float
-            distance between the satellite and the observer
-        sat_obs_az: float
-            azimuth of observer from satellite
-        sat_obs_el: float
-            elevation of observer from satellite
-        sat_pointing_az:
-            azimuth of the satellite pointing in satellite reference frame
-        sat_pointing_el:
-            elevation of the satellite pointing in satellite reference frame
-        g_tx: float
-            1-d transmitter gain function
-
-    '''
 
 
 # def power_rx(freq,d_rx,eta_a_rx,d_tx,p_tx,sat_obs_dist,sat_obs_az,sat_obs_el,tilt,tp_az,tp_el):

@@ -24,7 +24,7 @@ from astropy.time import Time
 from astropy.utils.misc import NumpyRNGContext
 
     
-def pointpop(
+def pointgen(
             niters,
             step_size=3 * u.deg,
             lat_range=(0 * u.deg, 90 * u.deg),
@@ -83,3 +83,10 @@ def pointpop(
         return tel_az, tel_el, grid_info[:, 0]
 
 
+def tlegen():
+    tle = PyTle(
+        'ISS (ZARYA)',
+        '1 25544U 98067A   21282.92300926  .00001289  00000-0  32413-4 0  9999',
+        '2 25544  51.6444  95.4518 0004413  84.8506 275.2786 15.48971401308252',
+        )
+    return tle
