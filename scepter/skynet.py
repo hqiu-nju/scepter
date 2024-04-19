@@ -34,9 +34,9 @@ def pointgen(
         def sample( low_lon, high_lon, low_lat, high_lat):
 
             z_low, z_high = np.cos(np.radians(90 - low_lat)), np.cos(np.radians(90 - high_lat))
-            az = np.random.uniform(low_lon, high_lon, size=niters)
+            az = np.random.uniform(low_lon, high_lon)
             el = 90 - np.degrees(np.arccos(
-                np.random.uniform(z_low, z_high, size=niters)
+                np.random.uniform(z_low, z_high)
                 ))
             return az, el
 
