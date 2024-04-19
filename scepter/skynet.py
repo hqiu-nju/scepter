@@ -25,13 +25,13 @@ from astropy.utils.misc import NumpyRNGContext
 
     
 def pointgen(
-            niters,
+            
             step_size=3 * u.deg,
             lat_range=(0 * u.deg, 90 * u.deg),
             rnd_seed=None,
             ):
         ### sampling of the sky in equal solid angle
-        def sample(niters, low_lon, high_lon, low_lat, high_lat):
+        def sample( low_lon, high_lon, low_lat, high_lat):
 
             z_low, z_high = np.cos(np.radians(90 - low_lat)), np.cos(np.radians(90 - high_lat))
             az = np.random.uniform(low_lon, high_lon, size=niters)
@@ -65,7 +65,7 @@ def pointgen(
                     cell_edges.append((low_lon, high_lon, low_lat, high_lat))
                     cell_mids.append((mid_lon, mid_lat))
                     solid_angles.append(solid_angle)
-                    cell_tel_az, cell_tel_el = sample(niters, low_lon, high_lon, low_lat, high_lat)
+                    cell_tel_az, cell_tel_el = sample( low_lon, high_lon, low_lat, high_lat)
                     tel_az.append(cell_tel_az)
                     tel_el.append(cell_tel_el)
 

@@ -9,6 +9,10 @@ Call functions for power flux density calculation
 At the moment I will use a dummy isotropic antenna gain with cysgp4 and pycraf 
 
 Author: Harry Qiu <hqiu678@outlook.com>
+
+Date Created: 12-03-2024
+
+Version: 0.1
 """
 
 import numpy as np
@@ -65,9 +69,9 @@ class transmitter_info():
         ).to(u.W / u.Hz)
         p_tx_nu = p_tx_nu_peak * self.duty_cycle
         p_tx = p_tx_nu.to(u.W / u.Hz) * ras_bandwidth
-        self.p_tx = p_tx
+        self.p_tx = p_tx.to(cnv.dBm)
 
-        return p_tx
+        return self.p_tx
     def satgain1d(self,phi):
         '''
         Description: Retrieves 1-d gain from basic gain pattern function with angular separation to pointing considered
@@ -92,12 +96,13 @@ class transmitter_info():
         G_tx=flpattern
         return G_tx
     def power_arrv(self,sat_obs_dist,g_tx,outunit=u.W):
+        ### convert to power flux density values,
         '''
         Description: The corrected power of the transmitter at the observation end
         
         Parameters:
-        sat_obs_dist: float 
-            distance between the satellite and the observer
+        sat_obs_dist: float or astropy quantity
+            distance between the satellite and the observer, float will be assumed to be in m
         g_tx: float
             transmitter gain in dBi
     
@@ -112,54 +117,54 @@ class transmitter_info():
 
 
 class receiver_info():
-    def __init__(self,d_rx,eta_a_rx,pyobs,freq,bandwidth):
+    def __init__(self,d_rx,eta_a_rx,pyobs,freq,bandwidth,tsys=20*u.k):
         '''
         Description: Information holder class to store receiver information
 
         Parameters:
 
-        d_rx: float
+        d_rx: astropy quantity
             diameter of the receiver telescope
-        eta_a_rx: float
+        eta_a_rx: astropy quantity
             aperture efficiency of the receiver telescope
         pyobs: cysgp4 observer object
             observer object
-        freq: float
+        freq: astropy quantity
             receiver frequency band
-        bandwidth: float
-            receiver bandwidth
-    
+        bandwidth: astropy quantity
+            receiver bandwidth (Hz)
+        tsys: astropy quantity
+            system temperature of the receiver (K)
         '''
         self.d_rx = d_rx
         self.eta_a_rx = eta_a_rx
         self.location = pyobs
         self.freq = freq
         self.bandwidth = bandwidth
+        self.tsys = tsys
     
-    def antgain1d(self,phi,tp_az,tp_el,sat_obs_az,sat_obs_el):
+    def antgain1d(self,tp_az,tp_el,sat_obs_az,sat_obs_el):
         '''
         Description: This function calculates the 1d receiver gain of an model antenna 
         using the ras_pattern function from pycraf.antenna module. 
         I changed wavelength to frequency just for the hack.
 
         Parameters:
-        phi: float
-            angular separation between the satellite and the telescope pointing
         tp_az: float
-            azimuth of the telescope pointing
+            azimuth of the telescope pointing in degree
         tp_el: float    
-            elevation of the telescope pointing
+            elevation of the telescope pointing in degree
         sat_obs_az: float   
-            azimuth of the satellite in the observer reference frame
+            azimuth of the satellite in the observer reference frame in degree
         sat_obs_el: float
-            elevation of the satellite in the observer reference frame
+            elevation of the satellite in the observer reference frame in degreet
     
 
         Returns:
         G_rx: float
             receiver gain (dBi)
         '''
-        ang_sep = geometry.true_angular_distance(tp_az, tp_el, sat_obs_az, sat_obs_el)
+        ang_sep = geometry.true_angular_distance(tp_az*u.deg, tp_el*u.deg, sat_obs_az*u.deg, sat_obs_el*u.deg)
         G_rx = antenna.ras_pattern(
             ang_sep, self.d_rx, const.c / self.freq, self.eta_a_rx
             )
@@ -205,7 +210,7 @@ class obs_sim():
         '''
         obs=self.location
         tles=self.tles_list
-        sat_info=cysgp4.propagate_many(mjds,tles,observers=obs,do_eci_pos=True, do_topo=True, do_obs_pos=True, do_sat_azel=True)
+        sat_info=cysgp4.propagate_many(mjds,tles,observers=obs,do_eci_pos=True, do_topo=True, do_obs_pos=True, do_sat_azel=True,sat_frame='zxy') 
         self.propagation = sat_info
         return sat_info
 
@@ -220,7 +225,7 @@ def sat_frame_pointing(sat_info,beam_el,beam_az):
     sat_info: obs_sim object
         sat_info from obs_sim class populate function
     beam_el: float
-        beam elevation angle in satellite reference frame
+        beam elevation angle in satellite reference frame zxy, where z is the motion vector
     beam_az: float  
         beam azimuth angle in satellite reference frame
     
@@ -242,7 +247,10 @@ def sat_frame_pointing(sat_info,beam_el,beam_az):
     # eci_pos_x, eci_pos_y, eci_pos_z = (eci_pos[..., i] for i in range(3))
     # topo_pos_az, topo_pos_el, topo_pos_dist, _ = (topo_pos[..., i] for i in range(4))
     obs_az, obs_el, obs_dist = (sat_azel[..., i] for i in range(3))
-    ang_sep=geometry.true_angular_distance(obs_az,obs_el,beam_az,beam_el)
+
+    #### check numpy braodcasting to fix dimensions
+
+    ang_sep=geometry.true_angular_distance(obs_az*u.deg,obs_el*u.deg,beam_az*u.deg,beam_el*u.deg)
     delta_az=obs_az-beam_az
     delta_el=obs_el-beam_el
     return ang_sep,delta_az,delta_el,obs_dist
