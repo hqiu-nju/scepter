@@ -14,7 +14,7 @@ In the pfd module, we have the tools for creating an observation simulation that
 
 The simulation is organised through multiple dimensions to give consideration of the telescope pointings, satellite design, constellation beam patterns through a series of time.
 
-### simulation grid explanation
+### Simulation grid explanation
 
 Currently, 5 dimensions are used:
 1. telescope pointings/sky grid cells

@@ -83,10 +83,19 @@ def pointgen(
         return tel_az, tel_el, grid_info[:, 0]
 
 
-def tlegen():
-    tle = PyTle(
-        'ISS (ZARYA)',
-        '1 25544U 98067A   21282.92300926  .00001289  00000-0  32413-4 0  9999',
-        '2 25544  51.6444  95.4518 0004413  84.8506 275.2786 15.48971401308252',
+def plotgrid(val, grid_info,  point_az, point_el,elmin=30, elmax=85):
+    fig = plt.figure(figsize=(12, 4))
+    # val = pfd_avg.to_value(cnv.dB_W_m2)
+    vmin, vmax = val.min(), val.max()
+    val_norm = (val - vmin) / (vmax - vmin)
+    plt.bar(
+        grid_info['cell_lon_low'],
+        height=grid_info['cell_lat_high'] - grid_info['cell_lat_low'],
+        width=grid_info['cell_lon_high'] - grid_info['cell_lon_low'],
+        bottom=grid_info['cell_lat_low'],
+        color=plt.cm.viridis(val_norm),
+        align='edge'
         )
-    return tle
+    plt.scatter(point_az,point_el)
+    plt.ylim(elmin, elmax)
+    plt.show()
