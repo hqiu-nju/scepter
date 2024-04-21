@@ -83,7 +83,44 @@ def pointgen(
         return tel_az, tel_el, grid_info[:, 0]
 
 
-def plotgrid(val, grid_info,  point_az, point_el,elmin=30, elmax=85):
+def plantime(epochs,cadence,trange,tint,startdate=cysgp4.PyDateTime()):
+    '''
+    Description: This function generates the time grid for the simulation
+
+    Parameters:
+
+    epochs: astropy quantity
+        number of time steps
+    cadence: astropy quantity
+        cadence between epochs
+    trange: astropy quantity
+        time range of the simulation
+    tint: astropy quantity  
+        sample integration time of the simulation 
+    startdate: cysgp4 PyDateTime object
+        start date of the simulation, default cysgp4.PyDateTime() for current date and time
+
+    Returns:
+    mjds: numpy array
+        a 2d array of time intervals for the simulation, first dimension is the number of epochs, 
+        second dimension is the separate time stamps for each integration time sample, in MJD
+    '''
+    pydt = startdate ## take current date and time
+    start_mjd=pydt.mjd  ## get mjd step
+    niters = epochs
+
+    start_times_window = cadence
+
+    time_range, time_resol = trange.to_value(u.s), tint.to_value(u.s)  # seconds
+
+
+    start_times = start_mjd + np.arange(epochs) * start_times_window.to_value(u.day)
+    td = np.arange(0, time_range, time_resol) *u.s
+    td = td.to_value(u.day)
+    mjds = np.array(start_times[:, np.newaxis,np.newaxis] + td[np.newaxis,np.newaxis,:])
+    return mjds
+
+def plotgrid(val, grid_info,  point_az, point_el,elmin=30, elmax=85,zlabel='PFD average / cell [dB(W/m2)]',xlabel='Azimuth [deg]',ylabel='Elevation [deg]'):
     fig = plt.figure(figsize=(12, 4))
     # val = pfd_avg.to_value(cnv.dB_W_m2)
     vmin, vmax = val.min(), val.max()
@@ -97,5 +134,8 @@ def plotgrid(val, grid_info,  point_az, point_el,elmin=30, elmax=85):
         align='edge'
         )
     plt.scatter(point_az,point_el)
+    sm = plt.cm.ScalarMappable(cmap=plt.cm.viridis, norm=plt.Normalize(vmin=vmin, vmax=vmax))
+    cbar = plt.colorbar(sm, ax=plt.gca())
+    cbar.set_label(zlabel)
     plt.ylim(elmin, elmax)
     plt.show()

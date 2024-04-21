@@ -17,9 +17,10 @@ The simulation is organised through multiple dimensions to give consideration of
 ### Simulation grid explanation
 
 Currently, 5 dimensions are used:
-1. telescope pointings/sky grid cells
-2. epochs (separate observations)
-3. number of satellites
-4. iterations: the subintegrations during an observation
-5. (under development) individual beams
+1. observers/telescopes (cysgp4 pyobserver object)
+1. telescope pointings/sky grid cells (skygrid pointings using skynet.pointgen)
+1. epochs (separate observations)
+1. nint, the subintegrations during an observation
+1. number of transmitter/satellites
+1. (under development) individual beams from each transmitter/satellite
 

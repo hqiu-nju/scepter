@@ -22,6 +22,7 @@ import cysgp4
 from pycraf import conversions as cnv
 from pycraf import protection, antenna, geometry
 from astropy import units as u, constants as const
+from .skynet import *
 
 class transmitter_info():
 
@@ -94,25 +95,48 @@ class transmitter_info():
         ### calculate angular separation of satellite to telescope pointing
         flpattern=antenna.fl_pattern(phi,diameter=self.d_tx,wavelength=wavelength,G_max=gmax)
         G_tx=flpattern
+        self.g_tx = G_tx
+        self.sat_power = G_tx
         return G_tx
-    def power_arrv(self,sat_obs_dist,g_tx,outunit=u.W):
+    def fspl(self,sat_obs_dist,outunit=u.W):
         ### convert to power flux density values,
         '''
-        Description: The corrected power of the transmitter at the observation end
+        Description: The corrected power of the transmitter at the observation end after free space path loss
         
         Parameters:
         sat_obs_dist: float or astropy quantity
             distance between the satellite and the observer, float will be assumed to be in m
-        g_tx: float
-            transmitter gain in dBi
     
         Returns:
         sat_power: float
             power of the transmitter at the observation end in dBm
         '''
         FSPL = cnv.free_space_loss(sat_obs_dist,self.freq)
-        sat_power= self.p_tx+FSPL+g_tx ### in dBm space
+        sat_power= self.p_tx+FSPL+self.g_tx ### in dBm space
         return sat_power
+    def custom_gain(self,el,az,gfunc):
+        '''
+        Description: Retrieves gain from basic gain pattern function with angular separation to pointing considered
+
+        Parameters:
+
+        el: float
+            elevation angle (deg) in satellite reference frame zxy, where z is the motion vector
+        az: float
+            azimuth angle (deg) in satellite reference frame
+        gfunc: function
+            gain function to be used for the satellite, it should only take the directional coordinates as input
+
+        Returns:
+        G_tx: float
+            transmitter gain (dBi)
+        '''
+        G_tx=gfunc(el,az)
+        self.g_tx = G_tx
+        self.sat_power = G_tx
+        return G_tx
+
+
 
 
 
@@ -138,7 +162,9 @@ class receiver_info():
         '''
         self.d_rx = d_rx
         self.eta_a_rx = eta_a_rx
-        self.location = pyobs
+        observers = np.array([pyobs
+                ])[ np.newaxis,:,np.newaxis, np.newaxis]
+        self.location = observers
         self.freq = freq
         self.bandwidth = bandwidth
         self.tsys = tsys
@@ -157,7 +183,7 @@ class receiver_info():
         sat_obs_az: float   
             azimuth of the satellite in the observer reference frame in degree
         sat_obs_el: float
-            elevation of the satellite in the observer reference frame in degreet
+            elevation of the satellite in the observer reference frame in degree
     
 
         Returns:
@@ -172,7 +198,7 @@ class receiver_info():
         return G_rx
 
 class obs_sim():
-    def __init__(self,transmitter,receiver,tles_list):
+    def __init__(self,transmitter,receiver,tles_list,skygrid,mjds):
         '''
         Description: simulate observing programme
 
@@ -184,6 +210,10 @@ class obs_sim():
             receiver object
         tles_list: list
             list of tle objects (PyTle objects)
+        skygrid: tuple
+            output of the pointgen function from skynet module
+        mjds: array
+            2-d mjd array of epochs and observation times using skynet.plantime function
         '''
 
         self.transmitter = transmitter
@@ -192,12 +222,18 @@ class obs_sim():
         self.transmitter.power_tx(self.ras_bandwidth)
         self.tles_list = tles_list
         self.location = receiver.location
+        self.mjds = mjds
+        tel_az, tel_el, self.grid_info = skygrid
+        ### add axis for simulation over time and iterations
+        self.tel_az=tel_az[:,np.newaxis,np.newaxis,np.newaxis]
+        self.tel_el=tel_el[:,np.newaxis,np.newaxis,np.newaxis]
 
-    def populate(self,mjds):
+
+    def populate(self):
         '''
         Description: This function populates the observer object with satellite information
 
-        Parameters:
+        Used the following values from setup:
         tles_list: list
             list of tle objects (PyTle objects)
         mjds: array
@@ -208,12 +244,52 @@ class obs_sim():
             Satellite class that stores the satellite coordinates and information to the observer object
 
         '''
-        obs=self.location
-        tles=self.tles_list
-        sat_info=cysgp4.propagate_many(mjds,tles,observers=obs,do_eci_pos=True, do_topo=True, do_obs_pos=True, do_sat_azel=True,sat_frame='zxy') 
-        self.propagation = sat_info
-        return sat_info
+        obs = self.location
+        mjds = self.mjds
+        tles = self.tles_list
+        print('Obtaining satellite and time information, propagation for large arrays may take a while...')
+        result = cysgp4.propagate_many(mjds,tles,observers=obs,do_eci_pos=True, do_topo=True, do_obs_pos=True, do_sat_azel=True,sat_frame='zxy') 
+        print('Done. Satellite coordinates obtained')
+        self.sat_info = result
+        # self.eci_pos = result['eci_pos']
+        topo_pos = result['topo']
+        sat_azel = result['sat_azel']  ### check cysgp4 for satellite frame orientation description
 
+        # eci_pos_x, eci_pos_y, eci_pos_z = (eci_pos[..., i] for i in range(3))
+        self.topo_pos_az, self.topo_pos_el, self.topo_pos_dist, _ = (topo_pos[..., i] for i in range(4))
+        self.obs_az, self.obs_el, self.obs_dist = (sat_azel[..., i] for i in range(3))
+
+    def get_angsep1d(self,beam_el,beam_az):
+        '''
+        Description: Calculate the satellite pointing angle separation to the observer in the satellite reference frame
+
+        Parameters:
+        beam_el: float
+            beam elevation angle in satellite reference frame zxy, where z is the motion vector
+        beam_az: float  
+            beam azimuth angle in satellite reference frame
+        
+        Returns:
+        ang_sep: float
+            angular separation between the satellite pointing and observer in the satellite reference frame
+        '''
+        result=self.sat_info
+        self.angsep=sat_frame_pointing(result,beam_el,beam_az)[0]
+        return self.angsep
+    
+    def calcgain1d(self):
+        '''
+        Description: Calculate the gain of the transmitter and receiver
+
+        Returns:
+        pfd: float
+            power flux density in dBm
+        '''
+        tp_az
+
+
+        self.transmitter.satgain1d(self.angsep)
+        self.receiver.antgain1d(tp_el,tp_az,sat_obs_az,sat_obs_el)
 
 
 
