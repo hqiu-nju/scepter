@@ -25,18 +25,18 @@ from astropy.utils.misc import NumpyRNGContext
 
     
 def pointgen(
-            
+            niters,
             step_size=3 * u.deg,
             lat_range=(0 * u.deg, 90 * u.deg),
             rnd_seed=None,
             ):
         ### sampling of the sky in equal solid angle
-        def sample( low_lon, high_lon, low_lat, high_lat):
+        def sample(niters,low_lon, high_lon, low_lat, high_lat):
 
             z_low, z_high = np.cos(np.radians(90 - low_lat)), np.cos(np.radians(90 - high_lat))
-            az = np.random.uniform(low_lon, high_lon)
+            az = np.random.uniform(low_lon, high_lon,size=niters)
             el = 90 - np.degrees(np.arccos(
-                np.random.uniform(z_low, z_high)
+                np.random.uniform(z_low, z_high,size=niters)
                 ))
             return az, el
 
@@ -65,7 +65,7 @@ def pointgen(
                     cell_edges.append((low_lon, high_lon, low_lat, high_lat))
                     cell_mids.append((mid_lon, mid_lat))
                     solid_angles.append(solid_angle)
-                    cell_tel_az, cell_tel_el = sample( low_lon, high_lon, low_lat, high_lat)
+                    cell_tel_az, cell_tel_el = sample(niters, low_lon, high_lon, low_lat, high_lat)
                     tel_az.append(cell_tel_az)
                     tel_el.append(cell_tel_el)
 
@@ -117,7 +117,8 @@ def plantime(epochs,cadence,trange,tint,startdate=cysgp4.PyDateTime()):
     start_times = start_mjd + np.arange(epochs) * start_times_window.to_value(u.day)
     td = np.arange(0, time_range, time_resol) *u.s
     td = td.to_value(u.day)
-    mjds = np.array(start_times[:, np.newaxis,np.newaxis] + td[np.newaxis,np.newaxis,:])
+    mjds = np.array(start_times[np.newaxis,np.newaxis,np.newaxis, :, np.newaxis,np.newaxis] + 
+                td[np.newaxis,np.newaxis,np.newaxis,np.newaxis,:,np.newaxis])
     return mjds
 
 def plotgrid(val, grid_info,  point_az, point_el,elmin=30, elmax=85,zlabel='PFD average / cell [dB(W/m2)]',xlabel='Azimuth [deg]',ylabel='Elevation [deg]'):

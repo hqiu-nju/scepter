@@ -2,9 +2,9 @@
 # -*- coding: utf-8 -*-
 
 """
-pfd.py
+obs.py
 
-Call functions for power flux density calculation
+Call functions to simulate source and observer interactions
 
 At the moment I will use a dummy isotropic antenna gain with cysgp4 and pycraf 
 
@@ -162,9 +162,7 @@ class receiver_info():
         '''
         self.d_rx = d_rx
         self.eta_a_rx = eta_a_rx
-        observers = np.array([pyobs
-                ])[ np.newaxis,:,np.newaxis, np.newaxis]
-        self.location = observers
+        self.location = pyobs
         self.freq = freq
         self.bandwidth = bandwidth
         self.tsys = tsys
@@ -176,21 +174,21 @@ class receiver_info():
         I changed wavelength to frequency just for the hack.
 
         Parameters:
-        tp_az: float
-            azimuth of the telescope pointing in degree
-        tp_el: float    
-            elevation of the telescope pointing in degree
-        sat_obs_az: float   
-            azimuth of the satellite in the observer reference frame in degree
-        sat_obs_el: float
-            elevation of the satellite in the observer reference frame in degree
+        tp_az: astropy quantity
+            azimuth of the telescope pointing 
+        tp_el: astropy quantity
+            elevation of the telescope pointing 
+        sat_obs_az: astropy quantity   
+            azimuth of source
+        sat_obs_el: astropy quantity
+            elevation of source 
     
 
         Returns:
         G_rx: float
             receiver gain (dBi)
         '''
-        ang_sep = geometry.true_angular_distance(tp_az*u.deg, tp_el*u.deg, sat_obs_az*u.deg, sat_obs_el*u.deg)
+        ang_sep = geometry.true_angular_distance(tp_az, tp_el, sat_obs_az, sat_obs_el)
         G_rx = antenna.ras_pattern(
             ang_sep, self.d_rx, const.c / self.freq, self.eta_a_rx
             )
@@ -208,8 +206,8 @@ class obs_sim():
             transmitter object
         receiver: receiver_info object
             receiver object
-        tles_list: list
-            list of tle objects (PyTle objects)
+        tles_list: array
+            numpy 1-d array of PyTle objects
         skygrid: tuple
             output of the pointgen function from skynet module
         mjds: array
@@ -220,13 +218,14 @@ class obs_sim():
         self.receiver = receiver
         self.ras_bandwidth = receiver.bandwidth
         self.transmitter.power_tx(self.ras_bandwidth)
+        # reformat and reorganise tle array dimension?
         self.tles_list = tles_list
         self.location = receiver.location
         self.mjds = mjds
-        tel_az, tel_el, self.grid_info = skygrid
+        self.tel_az, self.tel_el, self.grid_info = skygrid
         ### add axis for simulation over time and iterations
-        self.tel_az=tel_az[:,np.newaxis,np.newaxis,np.newaxis]
-        self.tel_el=tel_el[:,np.newaxis,np.newaxis,np.newaxis]
+        # self.tel_az=tel_az[np.newaxis,:,:,np.newaxis,np.newaxis,np.newaxis]
+        # self.tel_el=tel_el[np.newaxis,:,:,np.newaxis,np.newaxis,np.newaxis]
 
 
     def populate(self):
@@ -244,11 +243,12 @@ class obs_sim():
             Satellite class that stores the satellite coordinates and information to the observer object
 
         '''
-        obs = self.location
+        observatories = self.location[:,np.newaxis,np.newaxis,np.newaxis,np.newaxis,np.newaxis]
         mjds = self.mjds
-        tles = self.tles_list
+        tles = self.tles_list[np.newaxis,np.newaxis,np.newaxis,np.newaxis,np.newaxis,:]
+        print(obs.shape,tles.shape,mjds.shape)
         print('Obtaining satellite and time information, propagation for large arrays may take a while...')
-        result = cysgp4.propagate_many(mjds,tles,observers=obs,do_eci_pos=True, do_topo=True, do_obs_pos=True, do_sat_azel=True,sat_frame='zxy') 
+        result = cysgp4.propagate_many(mjds,tles,observers=observatories,do_eci_pos=True, do_topo=True, do_obs_pos=True, do_sat_azel=True,sat_frame='zxy') 
         print('Done. Satellite coordinates obtained')
         self.sat_info = result
         # self.eci_pos = result['eci_pos']
@@ -356,62 +356,3 @@ def prx_cnv(pwr,g_rx, outunit=u.W):
     p_rx = p_db.to(outunit) ## convert to unit needed
     return p_rx
 
-
-
-# def power_rx(freq,d_rx,eta_a_rx,d_tx,p_tx,sat_obs_dist,sat_obs_az,sat_obs_el,tilt,tp_az,tp_el):
-#     '''
-#     Description: This function calculates the received power, astropy units needed for all inputs
-
-#     Parameters:
-#     freq: float
-#         frequency of the signal
-#     sat_obs_dist: float
-#         distance between the satellite and the observer 
-#     sat_obs_az: float
-#         azimuth angle of the satellite
-#     sat_obs_el: float
-#         elevation angle of the satellite
-    
-#     Returns:
-#     p_rx: float
-#         received power in linear space (W)
-#     '''
-#     FSPL = cnv.free_space_loss(sat_obs_dist,freq) ### calculate free space path loss
-#     phi = geometry.true_angular_distance(  ### calculate transmitter gain
-#         sat_obs_az ,
-#         sat_obs_el ,
-#         tp_az ,
-#         tp_el 
-#         )
-#     G_tx = dummy_gain_tx(tilt,d_tx,freq)
-#     G_rx = gain_rx(sat_obs_az,sat_obs_el,tp_az,tp_el,d_rx,freq,eta_a_rx)
-#     p_rx = (p_tx+G_tx+FSPL+G_rx).to(u.W) ### convert decibels to linear space
-#     return p_rx
-
-# def dummy_gain(phi,d_tx,freq):
-#     '''
-#     Description: Retrieves gain from basic gain pattern function with angular separation to pointing considered
-
-#     Parameters:
-
-#     phi: float
-#         beam tilt angle of the satellite (this is a dummy version so just assume 
-#         tilt angle in reference to satellite perpendicular to earth)
-#     d_tx: float
-#         diameter of the transmitter
-#     freq: float
-#         frequency of the signal
-
-#     Returns:
-#     G_tx: float
-#         transmitter gain (dBi)
-#     '''
-    
-#     wavelength=const.c/freq
-#     gmax=antenna.fl_G_max_from_size(d_tx,wavelength)  ## get G_max from diameter and frequency
-
-#     # hpbw=antenna.fl_hpbw_from_size(d_tx,wavelength)  ## get hpbw from diameter and frequency
-#     ### calculate angular separation of satellite to telescope pointing
-#     flpattern=antenna.fl_pattern(phi,diameter=d_tx,wavelength=wavelength,G_max=gmax)
-#     G_tx=flpattern
-#     return G_tx

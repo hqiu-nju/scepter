@@ -10,7 +10,7 @@ A brief description of the package.
 __doc__ = "SCEPTer, Simulating Constellation Emission Patterns for Telescopes"
 
 # Import any modules or sub-packages here
-from . import pfd, skynet
+from . import obs, skynet
 
 import cysgp4
 import pycraf
@@ -30,5 +30,5 @@ import matplotlib.pyplot as plt
 # Import the submodule here
 
 # Optionally, add the submodule to the __all__ list
-__all__ = ['skynet','pfd']
+__all__ = ['skynet','obs']
 
