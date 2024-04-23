@@ -246,7 +246,7 @@ class obs_sim():
         observatories = self.location[:,np.newaxis,np.newaxis,np.newaxis,np.newaxis,np.newaxis]
         mjds = self.mjds
         tles = self.tles_list[np.newaxis,np.newaxis,np.newaxis,np.newaxis,np.newaxis,:]
-        print(obs.shape,tles.shape,mjds.shape)
+        print(observatories.shape,tles.shape,mjds.shape)
         print('Obtaining satellite and time information, propagation for large arrays may take a while...')
         result = cysgp4.propagate_many(mjds,tles,observers=observatories,do_eci_pos=True, do_topo=True, do_obs_pos=True, do_sat_azel=True,sat_frame='zxy') 
         print('Done. Satellite coordinates obtained')
