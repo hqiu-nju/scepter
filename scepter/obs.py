@@ -259,7 +259,7 @@ class obs_sim():
         self.topo_pos_az, self.topo_pos_el, self.topo_pos_dist, _ = (topo_pos[..., i] for i in range(4))
         self.obs_az, self.obs_el, self.obs_dist = (sat_azel[..., i] for i in range(3))
 
-    def get_angsep1d(self,beam_el,beam_az):
+    def txbeam_angsep(self,beam_el,beam_az):
         '''
         Description: Calculate the satellite pointing angle separation to the observer in the satellite reference frame
 
@@ -277,20 +277,16 @@ class obs_sim():
         self.angsep=sat_frame_pointing(result,beam_el,beam_az)[0]
         return self.angsep
     
-    def calcgain1d(self):
-        '''
-        Description: Calculate the gain of the transmitter and receiver
+    # def calcgain1d(self):
+    #     '''
+    #     Description: Calculate the gain of the transmitter and receiver
 
-        Returns:
-        pfd: float
-            power flux density in dBm
-        '''
-        tp_az
-
-
-        self.transmitter.satgain1d(self.angsep)
-        self.receiver.antgain1d(tp_el,tp_az,sat_obs_az,sat_obs_el)
-
+    #     Returns:
+    #     pfd: float
+    #         power flux density in dBm
+    #     '''
+    #     self.transmitter.satgain1d(self.angsep)
+    #     self.receiver.antgain1d(tp_el,tp_az,sat_obs_az,sat_obs_el)
 
 
 def sat_frame_pointing(sat_info,beam_el,beam_az):
