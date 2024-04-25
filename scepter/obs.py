@@ -174,13 +174,13 @@ class receiver_info():
         I changed wavelength to frequency just for the hack.
 
         Parameters:
-        tp_az: astropy quantity
+        tp_az: float
             azimuth of the telescope pointing 
-        tp_el: astropy quantity
+        tp_el: float
             elevation of the telescope pointing 
-        sat_obs_az: astropy quantity   
+        sat_obs_az: float  
             azimuth of source
-        sat_obs_el: astropy quantity
+        sat_obs_el: float
             elevation of source 
     
 
@@ -188,12 +188,15 @@ class receiver_info():
         G_rx: float
             receiver gain (dBi)
         '''
-        ang_sep = geometry.true_angular_distance(tp_az, tp_el, sat_obs_az, sat_obs_el)
+        print('Obtaining satellite and telescope pointing coordinates, calculation for large arrays may take a while...')
+        ang_sep = geometry.true_angular_distance(tp_az*u.deg, tp_el*u.deg, sat_obs_az*u.deg, sat_obs_el *u.deg)
+        print('Done. putting angular separation into gain pattern function')
         G_rx = antenna.ras_pattern(
-            ang_sep, self.d_rx, const.c / self.freq, self.eta_a_rx
+            ang_sep.flatten(), self.d_rx, const.c / self.freq, self.eta_a_rx
             )
-        self.G_rx = G_rx
-        return G_rx
+        
+        self.G_rx = G_rx.reshape(ang_sep.shape)
+        return self.G_rx
 
 class obs_sim():
     def __init__(self,transmitter,receiver,tles_list,skygrid,mjds):
@@ -222,10 +225,10 @@ class obs_sim():
         self.tles_list = tles_list
         self.location = receiver.location
         self.mjds = mjds
-        self.tel_az, self.tel_el, self.grid_info = skygrid
+        tel_az, tel_el, self.grid_info = skygrid
         ### add axis for simulation over time and iterations
-        # self.tel_az=tel_az[np.newaxis,:,:,np.newaxis,np.newaxis,np.newaxis]
-        # self.tel_el=tel_el[np.newaxis,:,:,np.newaxis,np.newaxis,np.newaxis]
+        self.tel_az=tel_az[np.newaxis,:,:,np.newaxis,np.newaxis,np.newaxis]
+        self.tel_el=tel_el[np.newaxis,:,:,np.newaxis,np.newaxis,np.newaxis]
 
 
     def populate(self):
