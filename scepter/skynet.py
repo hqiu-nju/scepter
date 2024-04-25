@@ -139,4 +139,6 @@ def plotgrid(val, grid_info,  point_az, point_el,elmin=30, elmax=85,zlabel='PFD 
     cbar = plt.colorbar(sm, ax=plt.gca())
     cbar.set_label(zlabel)
     plt.ylim(elmin, elmax)
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
     plt.show()
