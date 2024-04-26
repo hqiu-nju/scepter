@@ -279,6 +279,24 @@ class obs_sim():
         result=self.sat_info
         self.angsep=sat_frame_pointing(result,beam_el,beam_az)[0]
         return self.angsep
+    def g_rx(gainfunc):
+        '''
+        Description: Calculate the receiver gain response function
+
+        Parameters:
+        gainfunc: function
+            gain function to be used for the receiver, it should take telescope pointing and source coordinates as input (l1,b1,l2,b2)
+
+        Returns:
+        g_rx: float
+            receiver gain response function, 2d array
+        '''
+        self.g_rx=gainfunc(self.tel_az,self.tel_el,self.topo_pos_az,self.topo_pos_el)
+        return self.g_rx
+
+
+    
+   
     
     # def calcgain1d(self):
     #     '''

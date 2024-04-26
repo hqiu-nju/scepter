@@ -121,7 +121,7 @@ def plantime(epochs,cadence,trange,tint,startdate=cysgp4.PyDateTime()):
                 td[np.newaxis,np.newaxis,np.newaxis,np.newaxis,:,np.newaxis])
     return mjds
 
-def plotgrid(val, grid_info,  point_az, point_el,elmin=30, elmax=85,zlabel='PFD average / cell [dB(W/m2)]',xlabel='Azimuth [deg]',ylabel='Elevation [deg]'):
+def plotgrid(val, grid_info,  point_az=[], point_el=[],elmin=30, elmax=85,zlabel='PFD average / cell [dB(W/m2)]',xlabel='Azimuth [deg]',ylabel='Elevation [deg]'):
     fig = plt.figure(figsize=(12, 4))
     # val = pfd_avg.to_value(cnv.dB_W_m2)
     vmin, vmax = val.min(), val.max()
@@ -134,7 +134,7 @@ def plotgrid(val, grid_info,  point_az, point_el,elmin=30, elmax=85,zlabel='PFD 
         color=plt.cm.viridis(val_norm),
         align='edge'
         )
-    plt.scatter(point_az,point_el)
+    plt.scatter(point_az,point_el,c='r',s=1)
     sm = plt.cm.ScalarMappable(cmap=plt.cm.viridis, norm=plt.Normalize(vmin=vmin, vmax=vmax))
     cbar = plt.colorbar(sm, ax=plt.gca())
     cbar.set_label(zlabel)
