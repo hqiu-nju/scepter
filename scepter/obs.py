@@ -96,7 +96,6 @@ class transmitter_info():
         flpattern=antenna.fl_pattern(phi,diameter=self.d_tx,wavelength=wavelength,G_max=gmax)
         G_tx=flpattern
         self.g_tx = G_tx
-        self.sat_power = G_tx
         return G_tx
     def fspl(self,sat_obs_dist,outunit=u.W):
         ### convert to power flux density values,
@@ -121,9 +120,9 @@ class transmitter_info():
         Parameters:
 
         el: float
-            elevation angle (deg) in satellite reference frame zxy, where z is the motion vector
+            elevation angle (deg) of direction in reference to transmitter pointing
         az: float
-            azimuth angle (deg) in satellite reference frame
+            azimuth angle (deg) of direction in reference to transmitter pointing
         gfunc: function
             gain function to be used for the satellite, it should only take the directional coordinates as input
 
@@ -133,7 +132,6 @@ class transmitter_info():
         '''
         G_tx=gfunc(el,az)
         self.g_tx = G_tx
-        self.sat_power = G_tx
         return G_tx
 
 
@@ -279,7 +277,17 @@ class obs_sim():
         result=self.sat_info
         self.angsep=sat_frame_pointing(result,beam_el,beam_az)[0]
         return self.angsep
-    def g_rx(gainfunc):
+    def pwr_on_ground(self,gainfunc,corrections,beam_el,beam_az):
+        '''
+        Description: Calculate the power of the transmitter on the ground
+
+        Returns:
+        pfd: float
+            power flux density in dBm
+        '''
+
+
+    def g_rx(self,gainfunc):
         '''
         Description: Calculate the receiver gain response function
 
