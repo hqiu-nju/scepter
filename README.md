@@ -1,7 +1,7 @@
 # SCEPTer
 **S**imulating **C**onstellation **E**mission **P**atterns for **Te**lescopes (**r**adio)
 
-This is a repository to simulate the satellite constellation emissions and measure the EPFD of the observed sky area.
+This is a modular package to systematically simulate the satellite constellation emissions and measure the EPFD of the observed sky area.
 
 The simulation can be performed using a simulated constellation or from real satellite constellation two line elements (TLEs).
 Satellite TLEs can be found on https://celestrak.org/
