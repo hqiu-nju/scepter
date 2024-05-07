@@ -10,7 +10,7 @@ We use the PyCRAF and cysgp4 packages for many of the base calculations, see req
 
 ## Running the observation simulator
 
-In the pfd module, we have the tools for creating an observation simulation that will provide an RFI sky model from satellite emissions.
+In the obs module, we have the tools for creating an observation simulation that will provide an RFI sky model from satellite emissions.
 
 The simulation is organised through multiple dimensions to give consideration of the telescope pointings, satellite design, constellation beam patterns through a series of time.
 
