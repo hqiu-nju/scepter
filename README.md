@@ -27,3 +27,10 @@ Currently, 6 dimensions are used:
 following are under development:
 1. individual beams from each transmitter/satellite
 
+
+### Simulation Example Figure
+![Figure](notebook/example.png)
+
+
+
+
