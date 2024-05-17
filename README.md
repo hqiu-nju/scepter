@@ -29,8 +29,5 @@ following are under development:
 
 
 ### Simulation Example Figure
-![Figure](notebook/example.png)
 
-
-
-
+![Simulation Grid](./notebooks/example.png)
