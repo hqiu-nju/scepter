@@ -47,32 +47,27 @@ class TLEfinder():
         bestdate_idx = []
         best_tle = []
         best_tle_file = []
-        if type(mjd) == float:
-            bestdate = np.argmin(np.abs(self.filedates - mjd))
-            bestdate_idx= bestdate
-            best_tle=self.pytles_by_date[bestdate]
-            best_tle_file= self.tle_files[bestdate]
-            return bestdate_idx,best_tle,best_tle_file
-        else:
-            for i in mjd:
-                bestdate = np.argmin(np.abs(self.filedates - i))
-                bestdate_idx.append(bestdate)
-                best_tle.append(self.pytles_by_date[bestdate])
-                best_tle_file.append(self.tle_files[bestdate])
-            return np.array(bestdate_idx),np.array(best_tle),np.array(best_tle_file)
-    
-    def run_propagator(bestdates,best_tle):
+
+
+        for i in mjd:
+            bestdate = np.argmin(np.abs(self.filedates - i))
+            bestdate_idx.append(bestdate)
+            best_tle.append(self.pytles_by_date[bestdate])
+            best_tle_file.append(self.tle_files[bestdate])
+        return np.array(bestdate_idx),np.array(best_tle),np.array(best_tle_file)
+
+    def run_propagator(mjds,best_tle,geteci=False,getsat=True):
         '''
         Run the propagator for the best dates
 
         Parameters
         ----------
-        bestdates : numpy array
-            Array of the best dates for the TLEs
+        mjds : numpy array
+            array of mjd date
         best_tle : numpy array
             Array of the TLEs, should be 2d array to match bestdates [n_dates,n_tles]
         '''
-        return propagate_satellites_from_SKAO_database(self.obs,bestdates,best_tle)
+        self.satinfo = propagate_satellites_from_SKAO_database(self.obs,mjds,best_tle,geteci=geteci,getsat=getsat)
 
 
 
@@ -100,6 +95,7 @@ def propagate_satellites_from_SKAO_database(observatory,obs_mjds,pytle,geteci=Fa
     satname : numpy array 
         Array of the satellite names
     '''
+    obs_mjds = np.array(obs_mjds)
     observatory =  observatory[:,np.newaxis,np.newaxis]
     obs_mjds = obs_mjds[np.newaxis,:,np.newaxis]
     pytle = pytle[np.newaxis,:,:]
@@ -108,7 +104,7 @@ def propagate_satellites_from_SKAO_database(observatory,obs_mjds,pytle,geteci=Fa
 
     return satinfo
 
-def parse_cysgp4prop(satinfo, frame='sat_azel'):
+def parse_sgp4info(satinfo, frame='sat_azel'):
     '''
     Function to parse the output of cysgp4.propagate_many
     
