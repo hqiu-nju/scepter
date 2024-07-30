@@ -381,3 +381,31 @@ def prx_cnv(pwr,g_rx, outunit=u.W):
     p_rx = p_db.to(outunit) ## convert to unit needed
     return p_rx
 
+def pfd_to_Jy(P_dBm):
+    '''
+    Description: quick function to convert power flux density from dBm to Jansky
+
+    Parameters:
+    P_dBm: float
+        power flux density in dBm, dBm/m2/Hz
+    frequency_GHz: float
+
+    Returns:
+    F_Jy: float
+        power flux density in Jansky (Jy), (1 Jy = 10^-26 W/m^2/Hz)
+    '''
+
+    # Convert dBm to mW
+    P_mW = 10 ** (P_dBm / 10)
+
+    # Convert mW to W
+    P_W = P_mW / 1000
+
+    
+    # Define the reference flux density (1 Jy = 10^-26 W/m^2/Hz)
+    S_0 = 10**-26    
+
+    # Convert W to Jy
+    F_Jy = P_W / S_0 
+    
+    return F_Jy
