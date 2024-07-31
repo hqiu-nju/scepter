@@ -81,7 +81,16 @@ def pointgen(
             ])
         
         return tel_az, tel_el, grid_info[:, 0]
-
+def gridmatch(az,el,grid_info):
+    ### get the grid for a fixed list of az and el pointings
+    grid_indx=[]
+    for i,j,k,l in zip(grid_info['cell_lon_low'],grid_info['cell_lon_high'],grid_info['cell_lat_low'],grid_info['cell_lat_high']):
+        azmask=(az >= i) * (az <= j) 
+        elmask=(el >= k) * (el <= l)
+        mask=azmask & elmask
+        grid_indx.append(mask)
+    grid_indx=np.array(grid_indx)
+    return grid_indx
 
 def plantime(epochs,cadence,trange,tint,startdate=cysgp4.PyDateTime()):
     '''
