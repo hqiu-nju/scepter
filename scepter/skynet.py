@@ -90,7 +90,8 @@ def gridmatch(az,el,grid_info):
         mask=azmask & elmask
         grid_indx.append(mask)
     grid_indx=np.array(grid_indx)
-    return grid_indx
+    used_grids=np.where(grid_indx.sum(1)>0)[0]
+    return used_grids,grid_indx[used_grids]
 
 def plantime(epochs,cadence,trange,tint,startdate=cysgp4.PyDateTime()):
     '''
