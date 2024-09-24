@@ -131,7 +131,7 @@ def plantime(epochs,cadence,trange,tint,startdate=cysgp4.PyDateTime()):
                 td[np.newaxis,np.newaxis,np.newaxis,np.newaxis,:,np.newaxis])
     return mjds
 
-def plotgrid(val, grid_info,  point_az=[], point_el=[],elmin=30, elmax=85,zlabel='PFD average / cell [dB(W/m2)]',xlabel='Azimuth [deg]',ylabel='Elevation [deg]'):
+def plotgrid(val, grid_info,  point_az=[], point_el=[],elmin=30, elmax=85,zlabel='PFD average / cell [dB(W/m2)]',xlabel='Azimuth [deg]',ylabel='Elevation [deg]',azmin=0,azmax=360):
     fig = plt.figure(figsize=(12, 4))
     # val = pfd_avg.to_value(cnv.dB_W_m2)
     vmin, vmax = val.min(), val.max()
@@ -149,6 +149,7 @@ def plotgrid(val, grid_info,  point_az=[], point_el=[],elmin=30, elmax=85,zlabel
     cbar = plt.colorbar(sm, ax=plt.gca())
     cbar.set_label(zlabel)
     plt.ylim(elmin, elmax)
+    plt.xlim(azmin,azmax)
     plt.xlabel(xlabel)
     plt.ylabel(ylabel)
-    plt.show()
+    # plt.show() ### don't show here just load figure into matplotlib

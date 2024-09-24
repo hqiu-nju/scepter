@@ -208,7 +208,7 @@ class obs_sim():
         receiver: receiver_info object
             receiver object
         tles_list: array
-            numpy 1-d array of PyTle objects
+            numpy 1-d array of PyTle objects, converts to [np.newaxis,np.newaxis,np.newaxis,np.newaxis,np.newaxis,:] format, change after if needed
         skygrid: tuple
             output of the pointgen function from skynet module
         mjds: array
@@ -220,8 +220,9 @@ class obs_sim():
         self.ras_bandwidth = receiver.bandwidth
         self.transmitter.power_tx(self.ras_bandwidth)
         # reformat and reorganise tle array dimension?
-        self.tles_list = tles_list
-        self.location = receiver.location
+        ## in the order of [location,antenna pointing per grid,grid cell, epochs,time,satellite]
+        self.tles_list = tles_list[np.newaxis,np.newaxis,np.newaxis,np.newaxis,np.newaxis,:]
+        self.location = receiver.location[:,np.newaxis,np.newaxis,np.newaxis,np.newaxis,np.newaxis]
         self.mjds = mjds
         tel_az, tel_el, self.grid_info = skygrid
         ### add axis for simulation over time and iterations
@@ -244,9 +245,9 @@ class obs_sim():
             Satellite class that stores the satellite coordinates and information to the observer object
 
         '''
-        observatories = self.location[:,np.newaxis,np.newaxis,np.newaxis,np.newaxis,np.newaxis]
+        observatories = self.location
         mjds = self.mjds
-        tles = self.tles_list[np.newaxis,np.newaxis,np.newaxis,np.newaxis,np.newaxis,:]
+        tles = self.tles_list
         print(observatories.shape,tles.shape,mjds.shape)
         print('Obtaining satellite and time information, propagation for large arrays may take a while...')
         result = cysgp4.propagate_many(mjds,tles,observers=observatories,do_eci_pos=True, do_topo=True, do_obs_pos=True, do_sat_azel=True,sat_frame='zxy') 
