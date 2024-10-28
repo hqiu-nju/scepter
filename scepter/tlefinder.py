@@ -73,7 +73,7 @@ class TLEfinder():
 
 def propagate_satellites_from_SKAO_database(observatory,obs_mjds,pytle,geteci=False,getsat=True):
     '''
-    Function to propagate the satellites from the SKAO database
+    Function to propagate the satellites from the SKAO TLE database
     
     Parameters
     ----------

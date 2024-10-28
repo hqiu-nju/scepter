@@ -197,7 +197,7 @@ class receiver_info():
         return self.G_rx
 
 class obs_sim():
-    def __init__(self,transmitter,receiver,tles_list,skygrid,mjds):
+    def __init__(self,transmitter,receiver,skygrid,mjds):
         '''
         Description: simulate observing programme
 
@@ -221,16 +221,23 @@ class obs_sim():
         self.transmitter.power_tx(self.ras_bandwidth)
         # reformat and reorganise tle array dimension?
         ## in the order of [location,antenna pointing per grid,grid cell, epochs,time,satellite]
-        self.tles_list = tles_list[np.newaxis,np.newaxis,np.newaxis,np.newaxis,np.newaxis,:]
+        
         self.location = receiver.location[:,np.newaxis,np.newaxis,np.newaxis,np.newaxis,np.newaxis]
         self.mjds = mjds
         tel_az, tel_el, self.grid_info = skygrid
         ### add axis for simulation over time and iterations
         self.tel_az=tel_az[np.newaxis,:,:,np.newaxis,np.newaxis,np.newaxis]
         self.tel_el=tel_el[np.newaxis,:,:,np.newaxis,np.newaxis,np.newaxis]
+    def load_propagation(self,nparray):
+
+        tleprop=np.load(nparray,allow_pickle=True)
+        #### obtain coordinates in observation frame and satellite
+        obs_az, obs_el, obs_dist = tleprop['obs_az'], tleprop['obs_el'], tleprop['obs_dist']
+        sat_frame_az, sat_frame_el= tleprop['sat_frame_az'], tleprop['sat_frame_el']
+        
 
 
-    def populate(self):
+    def populate(self,tles_list):
         '''
         Description: This function populates the observer object with satellite information
 
@@ -245,6 +252,7 @@ class obs_sim():
             Satellite class that stores the satellite coordinates and information to the observer object
 
         '''
+        self.tles_list = tles_list[np.newaxis,np.newaxis,np.newaxis,np.newaxis,np.newaxis,:]
         observatories = self.location
         mjds = self.mjds
         tles = self.tles_list
