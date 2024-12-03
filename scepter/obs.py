@@ -220,7 +220,7 @@ class obs_sim():
         self.ras_bandwidth = receiver.bandwidth
         self.transmitter.power_tx(self.ras_bandwidth)
         # reformat and reorganise tle array dimension?
-        ## in the order of [location,antenna pointing per grid,grid cell, epochs,time,satellite]
+        ## in the order of [location,grid cell,antenna pointing per grid, epochs,time,satellite]
         
         self.location = receiver.location[:,np.newaxis,np.newaxis,np.newaxis,np.newaxis,np.newaxis]
         self.mjds = mjds
@@ -267,7 +267,9 @@ class obs_sim():
 
         # eci_pos_x, eci_pos_y, eci_pos_z = (eci_pos[..., i] for i in range(3))
         self.topo_pos_az, self.topo_pos_el, self.topo_pos_dist, _ = (topo_pos[..., i] for i in range(4))
-        self.obs_az, self.obs_el, self.obs_dist = (sat_azel[..., i] for i in range(3))
+        
+        ### this means azimuth and elevation of the observer, I think the naming is a bit confusing
+        self.obs_az, self.obs_el, self.obs_dist = (sat_azel[..., i] for i in range(3))  
 
     def txbeam_angsep(self,beam_el,beam_az):
         '''

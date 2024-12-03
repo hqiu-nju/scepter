@@ -24,7 +24,7 @@ class TLEfinder():
         tle_files = sorted(glob.glob(f'{tdir}/*.npz'))
         self.tle_files = tle_files
         self.filedates = collect_datetimes_from_TLEs(tle_files)
-        self.pytles_by_date=np.array([readtlenpz(i) for i in tle_files])
+        self.pytles_by_date=[readtlenpz(i) for i in tle_files]
 
     def mjd_locator(self,mjd):
         '''
