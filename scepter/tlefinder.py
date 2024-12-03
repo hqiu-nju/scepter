@@ -3,7 +3,7 @@ from datetime import datetime
 import cysgp4
 from astropy.time import Time
 import numpy as np
-
+import pandas as pd
 class TLEfinder():
     def __init__(self, obs, tdir = './'):
         '''
@@ -54,9 +54,11 @@ class TLEfinder():
             bestdate_idx.append(bestdate)
             best_tle.append(self.pytles_by_date[bestdate])
             best_tle_file.append(self.tle_files[bestdate])
-        return np.array(bestdate_idx),np.array(best_tle),np.array(best_tle_file)
+        # Find the maximum length of the lists
 
-    def run_propagator(mjds,best_tle,geteci=False,getsat=True):
+        return np.array(bestdate_idx),pd.DataFrame(best_tle).values,np.array(best_tle_file)
+
+    def run_propagator(self,geteci=False,getsat=True):
         '''
         Run the propagator for the best dates
 
@@ -67,7 +69,7 @@ class TLEfinder():
         best_tle : numpy array
             Array of the TLEs, should be 2d array to match bestdates [n_dates,n_tles]
         '''
-        self.satinfo = propagate_satellites_from_SKAO_database(self.obs,mjds,best_tle,geteci=geteci,getsat=getsat)
+        self.satinfo = propagate_satellites_from_SKAO_database(self.obs,self.mjds,self.best_tle,geteci=geteci,getsat=getsat)
 
 
 
