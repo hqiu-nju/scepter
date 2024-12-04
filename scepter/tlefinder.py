@@ -54,9 +54,33 @@ class TLEfinder():
             bestdate_idx.append(bestdate)
             best_tle.append(self.pytles_by_date[bestdate])
             best_tle_file.append(self.tle_files[bestdate])
-        # Find the maximum length of the lists
-
-        return np.array(bestdate_idx),pd.DataFrame(best_tle).values,np.array(best_tle_file)
+        # Find the length of the best tles and check if they are consistent
+        check_len=[len(i) for i in best_tle ]
+        cnts=np.unique(check_len)
+        if len(cnts) != 1:
+            best_tle_array=[]
+            setids=[np.where(check_len==i)[0] for i in cnts]
+            print('WARNING: TLEs are not consistent in the archive, checking and removing the changed TLEs....')
+            ### Find the maximum length of the TLEs
+            real_set=setids[np.argmin(cnts)][-1] ### this will be the reduced number of tles in the best_tle list
+            real_sat_n=np.min(cnts)
+            line=best_tle[real_set]
+            real_int_des=[bytes.decode(sattle.int_designator) for sattle in line ]
+            for line in best_tle:
+                if len(line) != real_sat_n:
+                    int_des_array=[bytes.decode(sattle.int_designator) for sattle in line ]
+                    extra_elements = [item for item in int_des_array if item not in real_int_des]
+                    # print(f'Extra elements in the TLEs: {extra_elements}')
+                    extra_elements_positions = [ int_des_array.index(item) for item in extra_elements]
+                    ### remove the extra elements from the line in best_tle
+                    best_tle_array.append(np.delete(line,[i for i in extra_elements_positions]))
+                else:
+                    best_tle_array.append(line)
+            best_tle_array=np.array(best_tle_array)
+        else:
+            best_tle_array=np.array(best_tle)
+        
+        return np.array(bestdate_idx),best_tle_array,np.array(best_tle_file)
 
     def run_propagator(self,geteci=False,getsat=True):
         '''
