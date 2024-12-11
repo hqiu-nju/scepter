@@ -50,40 +50,41 @@ class TLEfinder():
         for i in mjd:
             bestdate = np.argmin(np.abs(self.filedates - i))
             useddates.append(bestdate)
+
+
         useddate_idx = np.unique(useddates)
         used_tles = [self.pytles_by_date[i] for i in useddate_idx]
         used_dates = [self.filedates[i] for i in useddate_idx]
         used_tle_files = [self.tle_files[i] for i in useddate_idx]
-        check_len=[len(i) for i in used_tles ]
-        cnts=np.unique(check_len)
-        if len(cnts) != 1:
-            used_tles_array=[]
-            setids=[np.where(check_len==i)[0] for i in cnts]
-            print('WARNING: TLEs are not consistent in the archive, checking and removing the changed TLEs')
-            print(f"Number of TLEs being checked: {len(used_tles)}")
-            ### Find the maximum length of the TLEs
-            real_set=setids[np.argmin(cnts)][-1] ### this will be the reduced number of tles in the best_tle list
-            real_sat_n=np.min(cnts)
-            line=used_tles[real_set]
-            real_int_des=[bytes.decode(sattle.int_designator) for sattle in line ]
-            for line in used_tles:
-                
-                if len(line) != real_sat_n:
-                    int_des_array=[bytes.decode(sattle.int_designator) for sattle in line ]
-                    
-                    # Find the extra elements using NumPy's set operations
-                    extra_elements = np.setdiff1d(int_des_array, real_int_des)
+        check_len = np.array([len(i) for i in used_tles])
+        cnts = np.unique(check_len)
+        used_tles_array=[]
+        setids=[np.where(check_len==i)[0] for i in cnts]
+        real_sat_n = np.min(cnts)
+        print('Satellite group in TLEs may not be consistent across time in the archive, checking and removing the changed TLEs')
+        print(f"Number of TLEs being checked: {len(used_tles)}, with {len(setids)} different lengths")
+        ### Find the maximum length of the TLEs
+        print(f"Estimate Number of TLEs consistent in the TLE list: {real_sat_n}")
 
-                    # Find the positions of the extra elements
-                    extra_elements_positions = np.nonzero(np.in1d(int_des_array, extra_elements))[0]
 
-                    ### remove the extra elements from the line in best_tle
-                    used_tles_array.append(np.delete(line,[i for i in extra_elements_positions]))
-                else:
-                    used_tles_array.append(line)
-            used_tles_array=np.array(used_tles_array)
-        else:
-            used_tles_array=np.array(used_tles)
+        ### get the satellites that appear in all tles
+        real_int_des=np.array([bytes.decode(sattle.int_designator) for sattle in used_tles[0] ])
+        for line in used_tles[1:]:
+            int_des_array=np.array([bytes.decode(sattle.int_designator) for sattle in line ])
+            real_int_des = np.intersect1d(real_int_des,int_des_array)
+        ## sanity check that numbers match
+        print(f'Intersection method found the true number of satellites appearing in all intervals to be {len(real_int_des)}')
+        
+        for line in used_tles: 
+            int_des_array=[bytes.decode(sattle.int_designator) for sattle in line ]
+            intersection = np.intersect1d(int_des_array,real_int_des)
+            # print(len(line),len(int_des_array))
+            # Find the positions of the extra elements
+            remask = np.in1d(int_des_array, intersection)
+            # print(sum(remask))
+            ### remove the extra elements from the line in best_tle
+            used_tles_array.append(line[remask])
+        used_tles_array=np.array(used_tles_array)
         bestdate_idx = []
         best_tle = []
         best_tle_file = []
