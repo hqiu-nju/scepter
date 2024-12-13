@@ -21,7 +21,7 @@ class TLEfinder():
         '''
         self.obs = np.array(obs)
         self.tdir = tdir
-        tle_files = sorted(glob.glob(f'{tdir}/*.npz'))
+        tle_files = np.array(sorted(glob.glob(f'{tdir}/*.npz')))
         self.tle_files = tle_files
         self.filedates = collect_datetimes_from_TLEs(tle_files)
         self.pytles_by_date=[readtlenpz(i) for i in tle_files]
@@ -92,7 +92,7 @@ class TLEfinder():
             bestdate = np.argmin(np.abs(used_dates - i))
             bestdate_idx.append(bestdate)
             best_tle.append(used_tles_array[bestdate])
-            best_tle_file.append(self.tle_files[bestdate])
+            best_tle_file.append(used_tle_files[bestdate])
         # Find the length of the best tles and check if they are consistent
 
         return np.array(bestdate_idx),np.array(best_tle),np.array(best_tle_file)
