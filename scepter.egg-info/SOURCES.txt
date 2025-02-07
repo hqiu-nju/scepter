@@ -1,8 +1,31 @@
+.DS_Store
 LICENSE
 README.md
+requirements.txt
 setup.py
+notebooks/.DS_Store
+notebooks/Onsala simulation.ipynb
+notebooks/example.png
+notebooks/grid generation.ipynb
+notebooks/observation simulation demo v0.0.1 oneweb.ipynb
+notebooks/observation simulation demo v0.0.1.ipynb
+notebooks/starlink_statistical_pfd.csv
+notebooks/.ipynb_checkpoints/Onsala simulation-checkpoint.ipynb
+notebooks/.ipynb_checkpoints/grid generation-checkpoint.ipynb
+notebooks/.ipynb_checkpoints/observation simulation demo v0.0.1 oneweb-Copy1-checkpoint.ipynb
+notebooks/.ipynb_checkpoints/observation simulation demo v0.0.1 oneweb-checkpoint.ipynb
+notebooks/.ipynb_checkpoints/observation simulation demo v0.0.1-checkpoint.ipynb
+scepter/__init__.py
+scepter/obs.py
+scepter/skynet.py
+scepter/tlefinder.py
 scepter.egg-info/PKG-INFO
 scepter.egg-info/SOURCES.txt
 scepter.egg-info/dependency_links.txt
 scepter.egg-info/requires.txt
 scepter.egg-info/top_level.txt
+scepter/__pycache__/__init__.cpython-310.pyc
+scepter/__pycache__/obs.cpython-310.pyc
+scepter/__pycache__/pfd.cpython-310.pyc
+scepter/__pycache__/skynet.cpython-310.pyc
+scepter/__pycache__/tlefinder.cpython-310.pyc

@@ -110,7 +110,11 @@ class TLEfinder():
         '''
         self.satinfo = propagate_satellites_from_SKAO_database(self.obs,self.mjds,self.best_tle,geteci=geteci,getsat=getsat)
 
-
+def id_locator(used_tles,int_designator):
+    
+    real_int_des=np.array([bytes.decode(sattle.int_designator).split(" ")[0] for sattle in used_tles ])
+    mask = (real_int_des == int_designator)
+    return np.where(mask)[0],used_tles[mask]
 
 def propagate_satellites_from_SKAO_database(observatory,obs_mjds,pytle,geteci=False,getsat=True):
     '''
@@ -161,12 +165,12 @@ def parse_sgp4info(satinfo, frame='sat_azel'):
 
     return obs_az, obs_el, obs_dist
 
-def readtlenpz(path):
+def readtlenpz(path,key='arr_0'):
     '''
     Function to read tle file from directory and return the TLEs in pytle
     '''
     tles=np.load(path,allow_pickle=True)
-    response=tles['arr_0']
+    response=tles[key]
     tle_string=response.item().text
     # print(tle_string)
     tles=np.array(cysgp4.tles_from_text(tle_string))
