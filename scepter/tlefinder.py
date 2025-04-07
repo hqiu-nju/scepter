@@ -14,7 +14,7 @@ class TLEfinder():
         obs : list of cysgp4.PyObserver object
             Observer object from cysgp4 of the observatory
         dir : String (default = './')
-            Directory where the TLEs are stored, TLEs need to be in datetime format of %Y%m%d_%H%M%S
+            Directory where the TLEs are stored, TLEs need to be in datetime format of %Y%m%d_%H%M%S in a npz file
 
 
 
