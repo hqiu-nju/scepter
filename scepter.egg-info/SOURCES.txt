@@ -16,9 +16,11 @@ notebooks/.ipynb_checkpoints/observation simulation demo v0.0.1 oneweb-Copy1-che
 notebooks/.ipynb_checkpoints/observation simulation demo v0.0.1 oneweb-checkpoint.ipynb
 notebooks/.ipynb_checkpoints/observation simulation demo v0.0.1-checkpoint.ipynb
 scepter/__init__.py
+scepter/antenna.py
 scepter/obs.py
 scepter/skynet.py
 scepter/tlefinder.py
+scepter/tleforger.py
 scepter.egg-info/PKG-INFO
 scepter.egg-info/SOURCES.txt
 scepter.egg-info/dependency_links.txt
