@@ -5,11 +5,13 @@ This module contains a set of antennas that could be used for compatibility calc
 
 Author: boris.sorokin <mralin@protonmail.com>
 Date: 28-01-2025
+Revised 01-04-2025 - added 3dB beamwidth calculation for 1d radial symmetry antenna patterns
 """
 import numpy as np
 from astropy import units as u
 from pycraf import conversions as cnv
 from pycraf.utils import ranged_quantity_input
+from scipy.optimize import root_scalar
 
 
 @ranged_quantity_input(offset_angles = (None, None, u.deg), 
@@ -139,3 +141,63 @@ def s_1528_rec1_2_pattern(offset_angles,
     gains[mask6] = LB
 
     return gains, Gm, psi_b
+
+
+
+
+
+
+
+def calculate_3dB_angle_1d(antenna_gain_func: callable = s_1528_rec1_2_pattern, **antenna_pattern_kwargs) -> u.Quantity:
+    """
+    Calculates the -3 dB beamwidth angle for a given antenna pattern function with radial symmetry and maximum gain in the main axis direction.
+    
+    Parameters
+    ----------
+    antenna_gain_func : callable
+        Function that returns the antenna gain given an angle.
+    antenna_pattern_kwargs : dict
+        Additional keyword arguments for the antenna gain function.
+    
+    Returns
+    -------
+    theta_3dB : astropy.units.Quantity
+        The -3 dB beamwidth angle in degrees.
+    """
+    try:
+        gain_result = antenna_gain_func(0 * u.deg, **antenna_pattern_kwargs)
+        if isinstance(gain_result, (tuple, list)):
+            Gmax_dBi = gain_result[0]
+        else:
+            Gmax_dBi = gain_result
+        if not isinstance(Gmax_dBi, u.Quantity):
+            Gmax_dBi = Gmax_dBi * cnv.dBi
+        Gmax_dBi = Gmax_dBi.to(cnv.dBi)
+    except Exception as e:
+        raise ValueError(f"Could not get Gmax: {e}") from e
+
+    G_target_dBi = Gmax_dBi - 3.0 * cnv.dB
+
+    def gain_diff(angle_deg_scalar):
+        try:
+            gain_val = antenna_gain_func(angle_deg_scalar * u.deg, **antenna_pattern_kwargs)
+            if isinstance(gain_val, (tuple, list)):
+                current_gain_dBi = gain_val[0]
+            else:
+                current_gain_dBi = gain_val
+            if not isinstance(current_gain_dBi, u.Quantity):
+                current_gain_dBi = current_gain_dBi * cnv.dBi
+            current_gain_dBi = current_gain_dBi.to(cnv.dBi)
+            diff = (current_gain_dBi - G_target_dBi).value
+            return diff if np.isfinite(diff) else 1e9
+        except Exception:
+            return 1e9
+
+    try:
+        sol = root_scalar(gain_diff, bracket=[1e-9, 90.0], method='brentq')
+        if not sol.converged:
+            raise RuntimeError(f"-3dB root finding failed: {sol.flag}")
+        theta_3dB = sol.root * u.deg
+        return theta_3dB
+    except Exception as e:
+        raise RuntimeError(f"Finding -3dB angle failed: {e}")
