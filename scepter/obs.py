@@ -231,10 +231,15 @@ class obs_sim():
     def load_propagation(self,nparray):
 
         tleprop=np.load(nparray,allow_pickle=True)
-        #### obtain coordinates in observation frame and satellite
-        obs_az, obs_el, obs_dist = tleprop['obs_az'], tleprop['obs_el'], tleprop['obs_dist']
-        sat_frame_az, sat_frame_el= tleprop['sat_frame_az'], tleprop['sat_frame_el']
-        
+        #### obtain coordinates in observation frame and satellite frame
+        topo_pos_az, topo_pos_el, topo_pos_dist = tleprop['obs_az'], tleprop['obs_el'], tleprop['obs_dist']
+        satf_az, satf_el, satf_dist = tleprop['sat_frame_az'], tleprop['sat_frame_el'] , tleprop['sat_frame_dist']
+        self.topo_pos_az = topo_pos_az[np.newaxis,np.newaxis,np.newaxis,np.newaxis,np.newaxis,:]
+        self.topo_pos_el = topo_pos_el[np.newaxis,np.newaxis,np.newaxis,np.newaxis,np.newaxis,:]
+        self.satf_az = satf_az[np.newaxis,np.newaxis,np.newaxis,:]
+        self.satf_el = satfel[np.newaxis,np.newaxis,np.newaxis,:]
+        self.satf_dist = satf_dist[np.newaxis,np.newaxis,np.newaxis,:]
+
 
 
     def populate(self,tles_list):
@@ -260,7 +265,6 @@ class obs_sim():
         print('Obtaining satellite and time information, propagation for large arrays may take a while...')
         result = cysgp4.propagate_many(mjds,tles,observers=observatories,do_eci_pos=True, do_topo=True, do_obs_pos=True, do_sat_azel=True,sat_frame='zxy') 
         print('Done. Satellite coordinates obtained')
-        self.sat_info = result
         # self.eci_pos = result['eci_pos']
         topo_pos = result['topo']
         sat_azel = result['sat_azel']  ### check cysgp4 for satellite frame orientation description
@@ -269,7 +273,7 @@ class obs_sim():
         self.topo_pos_az, self.topo_pos_el, self.topo_pos_dist, _ = (topo_pos[..., i] for i in range(4))
         
         ### this means azimuth and elevation of the observer, I think the naming is a bit confusing
-        self.obs_az, self.obs_el, self.obs_dist = (sat_azel[..., i] for i in range(3))  
+        self.sat_az, self.sat_el, self.sat_dist = (sat_azel[..., i] for i in range(3))  
 
     def txbeam_angsep(self,beam_el,beam_az):
         '''
@@ -358,13 +362,13 @@ def sat_frame_pointing(sat_info,beam_el,beam_az):
 
     # eci_pos_x, eci_pos_y, eci_pos_z = (eci_pos[..., i] for i in range(3))
     # topo_pos_az, topo_pos_el, topo_pos_dist, _ = (topo_pos[..., i] for i in range(4))
-    obs_az, obs_el, obs_dist = (sat_azel[..., i] for i in range(3))
+    sat_az, sat_el, obs_dist = (sat_azel[..., i] for i in range(3))
 
     #### check numpy braodcasting to fix dimensions
 
-    ang_sep=geometry.true_angular_distance(obs_az*u.deg,obs_el*u.deg,beam_az*u.deg,beam_el*u.deg)
-    delta_az=obs_az-beam_az
-    delta_el=obs_el-beam_el
+    ang_sep=geometry.true_angular_distance(sat_az*u.deg,sat_el*u.deg,beam_az*u.deg,beam_el*u.deg)
+    delta_az=sat_az-beam_az
+    delta_el=sat_el-beam_el
     return ang_sep,delta_az,delta_el,obs_dist
 
 
@@ -377,15 +381,15 @@ def prx_cnv(pwr,g_rx, outunit=u.W):
 
     Parameters:
         pwr: float
-            power of the signal
+            power of the signal (Units in dBm)
         g_rx: float
-            receiver gain response function, 2d array, 1d array for ideal beam is also accepted.
+            receiver gain response function, 2d array, 1d array for ideal beam is also accepted (Units in dBm)
         outunit: astropy unit
-            unit of the output power
+            unit of the output power (Default in W)
     
     Returns:
         p_rx: float
-            received power in linear space (W)
+            received power in linear space (Units in W)
     '''
 
     p_db = pwr + g_rx
