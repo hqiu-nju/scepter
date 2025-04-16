@@ -142,13 +142,8 @@ def s_1528_rec1_2_pattern(offset_angles,
 
     return gains, Gm, psi_b
 
-
-
-
-
-
-
-def calculate_3dB_angle_1d(antenna_gain_func: callable = s_1528_rec1_2_pattern, **antenna_pattern_kwargs) -> u.Quantity:
+def calculate_3dB_angle_1d(antenna_gain_func: callable = s_1528_rec1_2_pattern, 
+                           **antenna_pattern_kwargs) -> u.Quantity:
     """
     Calculates the -3 dB beamwidth angle for a given antenna pattern function with radial symmetry and maximum gain in the main axis direction.
     

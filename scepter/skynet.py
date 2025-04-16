@@ -86,7 +86,6 @@ def pointgen_S_1586_1(niters=1, rnd_seed=None):
         tuple : (cell_az_low_bc, cell_az_high_bc, z_bound_lower_bc,
                  z_bound_upper_bc, n_total_cells)
         """
-        # print("Calculating and caching S.1586-1 definitions and broadcast arrays (inside pointgen)...") # Debug print
 
         # Define S.1586-1 constants locally, matching Table 1 exactly.
         # Keys are the lower elevation edge of the 3-degree ring.

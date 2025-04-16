@@ -25,7 +25,7 @@ from functools import lru_cache
 
 
 # -----------------------------------------------------------------------------
-# MAIN FUNCTIONS: CALCULATE FOOTPRINT SIZE
+# CALCULATE FOOTPRINT SIZE
 # -----------------------------------------------------------------------------
 @ranged_quantity_input(
     altitude=(0.001, None, u.km),
@@ -394,7 +394,7 @@ def trunc_hexgrid_to_impactful(grid_longitudes, grid_latitudes, sat_altitude, mi
     station_lon : astropy.units.Quantity
         Longitude of the radio astronomy station.
     station_height : astropy.units.Quantity
-        Station elevation above Earth's surface (provided for completeness).
+        Station elevation above Earth's surface (provided for completeness, not used at the moment).
         
     Returns
     -------

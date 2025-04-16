@@ -30,5 +30,5 @@ import matplotlib.pyplot as plt
 # Import the submodule here
 
 # Optionally, add the submodule to the __all__ list
-__all__ = ['skynet','obs','tlefinder','antenna','tleforger','earthgrid']
+__all__ = ['skynet','obs','tlefinder','tleforger','antenna','earthgrid','satsim','scenario','visualise','gpu_accel']
 
