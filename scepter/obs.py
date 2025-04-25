@@ -371,8 +371,54 @@ def sat_frame_pointing(sat_info,beam_el,beam_az):
     delta_el=sat_el-beam_el
     return ang_sep,delta_az,delta_el,obs_dist
 
+def tdelay(baseline,theta):
+    """
+    Calculate the delay in seconds for a given angle
+    Args:
+        baseline (quantity): Baseline in meters etc.
+        theta (quantity): pointing angle in radians
+    Returns:
+        delay (quantity): delay in seconds
+    """
+    c = 3e8  # speed of light in m/s
+    theta = theta.to(u.rad).value  # Convert angle to radians
+    baseline = baseline.to(u.m).value  # Convert baseline to meters
+    return baseline * np.cos(theta) / c *u.s
 
 
+def fringe_attenuation(theta, baseline, bandwidth):
+    """
+    Calculate the fringe attenuation for a given angle, baseline, frequency, and bandwidth.
+    Args:
+        theta (quantity): off phase center Angle in radians/degrees etc.
+        baseline (quantity): Baseline in meters etc.
+        bandwidth (quantity): Bandwidth in Hz etc.
+    """
+    c = 3e8  # speed of light in m/s
+    theta = theta.to(u.rad).value  # Convert angle to radians
+    baseline = baseline.to(u.m).value  # Convert baseline to meters
+    bandwidth = bandwidth.to(u.Hz).value  # Convert bandwidth to Hz
+    return np.sinc(np.sin(theta)*baseline*bandwidth/c)
+
+def baseline_nearfield_delay(theta,l1,l2,baseline):
+    """
+    Calculate the delay difference from source pointing in seconds for a given angle
+    Args:
+        theta (quantity): pointing angle along baseline vector
+        l1 (quantity): distance to antenna 1 
+        l2 (quantity): distance to antenna 2 
+        baseline (quantity): Baseline length in meters etc.
+    Returns:
+        delay (quantity): delay in seconds
+    """
+    c = 3e8 *u.m/u.s  # speed of light in m/s
+    theta = theta.to(u.rad) # Convert angle to radians
+    l1 = l1.to(u.m) # Convert distance to meters
+    l2 = l2.to(u.m) # Convert distance to meters
+    baseline = baseline.to(u.m) # Convert baseline to meters
+    tau1=tdelay(baseline,theta)
+    
+    return  tau1-(l1-l2)/c
 
 def prx_cnv(pwr,g_rx, outunit=u.W):
     '''
