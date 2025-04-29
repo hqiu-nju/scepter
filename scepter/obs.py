@@ -234,15 +234,15 @@ class obs_sim():
         #### obtain coordinates in observation frame and satellite frame
         topo_pos_az, topo_pos_el, topo_pos_dist = tleprop['obs_az'], tleprop['obs_el'], tleprop['obs_dist']
         satf_az, satf_el, satf_dist = tleprop['sat_frame_az'], tleprop['sat_frame_el'] , tleprop['sat_frame_dist']
-        self.topo_pos_az = topo_pos_az[np.newaxis,np.newaxis,np.newaxis,np.newaxis,np.newaxis,:]
-        self.topo_pos_el = topo_pos_el[np.newaxis,np.newaxis,np.newaxis,np.newaxis,np.newaxis,:]
-        self.satf_az = satf_az[np.newaxis,np.newaxis,np.newaxis,:]
-        self.satf_el = satfel[np.newaxis,np.newaxis,np.newaxis,:]
-        self.satf_dist = satf_dist[np.newaxis,np.newaxis,np.newaxis,:]
+        self.topo_pos_az = topo_pos_az
+        self.topo_pos_el = topo_pos_el
+        self.satf_az = satf_az
+        self.satf_el = satf_el
+        self.satf_dist = satf_dist
 
 
 
-    def populate(self,tles_list):
+    def populate(self,tles_list,save=False, savename="satellite_info.npz"):
         '''
         Description: This function populates the observer object with satellite information
 
@@ -251,7 +251,10 @@ class obs_sim():
             list of tle objects (PyTle objects)
         mjds: array
             mjd time of observation
-
+        save: bool
+            save the satellite information to a file to avoid redoing the calculation
+        savename: str
+            name of the file to save the satellite information
         Returns:
         sat_info: cysgp4 Satellite object  
             Satellite class that stores the satellite coordinates and information to the observer object
@@ -274,6 +277,8 @@ class obs_sim():
         
         ### this means azimuth and elevation of the observer, I think the naming is a bit confusing
         self.sat_az, self.sat_el, self.sat_dist = (sat_azel[..., i] for i in range(3))  
+        if save == True:
+            np.savez(savename,obs_az=self.topo_pos_az,obs_el=self.topo_pos_el,obs_dist=self.topo_pos_dist,sat_frame_az=self.sat_az,sat_frame_el=self.sat_el,sat_frame_dist=self.sat_dist)
 
     def txbeam_angsep(self,beam_el,beam_az):
         '''

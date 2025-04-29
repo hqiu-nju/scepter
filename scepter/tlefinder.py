@@ -1,3 +1,16 @@
+#!/usr/bin/env python3
+
+"""
+tlefinder.py
+
+A smart utility to find TLEs from the SKA Observatory TLE archive and propagate them to the observer location.
+For tle npz format, please contact the SKAO spectrum management team.
+
+Author: Harry Qiu <hqiu678@outlook.com>
+
+Date: 12-04-2025
+"""
+
 import glob 
 from datetime import datetime
 import cysgp4
