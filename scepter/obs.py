@@ -316,8 +316,7 @@ class obs_sim():
         '''
         self.g_rx=gainfunc(self.tel_az,self.tel_el,self.topo_pos_az,self.topo_pos_el)
         return self.g_rx
-
-
+    
     
    
     
@@ -371,6 +370,65 @@ def sat_frame_pointing(sat_info,beam_el,beam_az):
     delta_el=sat_el-beam_el
     return ang_sep,delta_az,delta_el,obs_dist
 
+
+def baseline_bearing(ant1,ant2):
+    """
+    calculate the bearing of antenna 2 with respect to antenna 1
+    Args:
+        ant1 (object): antenna 1/A object
+        ant2 (object): antenna 2/B object
+    Returns:
+        bearing: vector from antenna 1 in cartesian coordinates
+    """
+
+    lon1 = ant1.loc.lon
+    lat1 = ant1.loc.lat
+    alt1 = ant1.loc.alt*(u.km.to(u.m))
+    lon2 = ant2.loc.lon
+    lat2 = ant2.loc.lat
+    alt2 = ant2.loc.alt*(u.km.to(u.m))
+    alt_meanm = (alt1+alt2)/2
+    # Earth's radius in meters
+    Rearth = 6371000  # Approximate average radius
+
+    # Convert latitude and longitude from degrees to radians
+    lat1=np.deg2rad(lat1)
+    lon1=np.deg2rad(lon1)
+    lat2=np.deg2rad(lat2)
+    lon2=np.deg2rad(lon2)
+
+    rab=np.arccos(np.sin(lat1)*np.sin(lat2)+np.cos(lat1)*np.cos(lat2)*np.cos(lon2-lon1))
+    # print(f"Great circle distance in radian s:{rab},  distance in m: {rab*Rearth}")
+    bearing_ab=np.arccos((np.sin(lat1)-np.sin(lat2)*np.cos(rab))/(np.cos(lat2)*np.sin(rab)))
+    # print (np.degrees(lon2-lon1))
+    if (np.sin(lon2-lon1)<0): ## smaller than 0 means lon2 is west of lon1
+        bearing_ab=2*np.pi-bearing_ab
+    # print(f"Bearing from B to A in sradians: {bearing_ab}, degrees: {np.rad2deg(bearing_ab)} to the east of north")
+        
+    
+
+    
+    return bearing_ab,rab*(Rearth+alt_meanm) # Return the distance in meters
+
+
+def baseline_theta(ant1,ant2,az,el):
+    """
+    Calculate the pointing angle along the baseline vector
+    Args:
+        ant1 (tuple): antenna 1/A ra,dec,elevation
+        ant2 (tuple): antenna 2/B ra,dec,elevation
+        az (quantity): azimuth angle in radians
+        el (quantity): elevation angle in radians
+
+    Returns:
+        delay (quantity): delay in seconds
+    """
+    C=ant1[0]-ant2[0]
+    b=np.pi/2-np.deg2rad(ant1[1])
+    a=np.pi/2-np.deg2rad(ant1[2])
+
+    
+
 def tdelay(baseline,theta):
     """
     Calculate the delay in seconds for a given angle
@@ -419,6 +477,44 @@ def baseline_nearfield_delay(theta,l1,l2,baseline):
     tau1=tdelay(baseline,theta)
     
     return  tau1-(l1-l2)/c
+
+
+def fringe_response(delay,frequency):
+    """
+    Calculate the fringe response for a given delay and frequency
+    based on two element equation integration, assuming equal gain
+
+    Args:
+        delay (quantity): delay in seconds
+        frequency (quantity): frequency in Hz
+    Returns:
+        response (quantity): fringe response
+    """
+    delay = delay.to(u.s).value  # Convert delay to seconds
+    frequency = frequency.to(u.Hz).value  # Convert frequency to Hz
+
+    return np.cos(2*np.pi*frequency*delay)
+
+
+def bw_fringe(delays,bwchan,nchan,fch1):
+    """
+    Calculate the fringe response for a given delay and frequency
+    based on two element equation integration, assuming equal gain
+
+    Args:
+        delays (array): delay array in seconds
+        bwchan (float): channel bandwidth in MHz
+        nchan (int): number of channels
+        fch1 (float): channel frequency in MHz
+    Returns:
+        response (quantity): fringe response
+    """
+
+    freq_array=np.linspace(fch1,fch1+bwchan,nchan)*u.MHz
+    meshgrid=np.meshgrid(delays,freq_array)
+    fringes=fringe_response(meshgrid[0],meshgrid[1])
+    return np.sum(fringes,axis=0)/nchan
+
 
 def prx_cnv(pwr,g_rx, outunit=u.W):
     '''
