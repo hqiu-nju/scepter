@@ -276,9 +276,9 @@ class obs_sim():
         self.topo_pos_az, self.topo_pos_el, self.topo_pos_dist, _ = (topo_pos[..., i] for i in range(4))
         
         ### this means azimuth and elevation of the observer, I think the naming is a bit confusing
-        self.sat_az, self.sat_el, self.sat_dist = (sat_azel[..., i] for i in range(3))  
+        self.satf_az, self.satf_el, self.satf_dist = (sat_azel[..., i] for i in range(3))  
         if save == True:
-            np.savez(savename,obs_az=self.topo_pos_az,obs_el=self.topo_pos_el,obs_dist=self.topo_pos_dist,sat_frame_az=self.sat_az,sat_frame_el=self.sat_el,sat_frame_dist=self.sat_dist)
+            np.savez(savename,obs_az=self.topo_pos_az,obs_el=self.topo_pos_el,obs_dist=self.topo_pos_dist,sat_frame_az=self.satf_az,sat_frame_el=self.satf_el,sat_frame_dist=self.satf_dist)
 
     def txbeam_angsep(self,beam_el,beam_az):
         '''
@@ -376,12 +376,13 @@ def sat_frame_pointing(sat_info,beam_el,beam_az):
     return ang_sep,delta_az,delta_el,obs_dist
 
 
+
 def baseline_bearing(ant1,ant2):
     """
     calculate the bearing of antenna 2 with respect to antenna 1
     Args:
-        ant1 (object): antenna 1/A object
-        ant2 (object): antenna 2/B object
+        ant1 (object): antenna 1/A PyObserver object
+        ant2 (object): antenna 2/B PyObserver object
     Returns:
         bearing: vector from antenna 1 in cartesian coordinates
     """
@@ -409,29 +410,59 @@ def baseline_bearing(ant1,ant2):
     if (np.sin(lon2-lon1)<0): ## smaller than 0 means lon2 is west of lon1
         bearing_ab=2*np.pi-bearing_ab
     # print(f"Bearing from B to A in sradians: {bearing_ab}, degrees: {np.rad2deg(bearing_ab)} to the east of north")
-        
-    
+    l1=Rearth+alt1
+    l2=Rearth+alt2
+    # Calculate the Cartesian coordinates of the antennas
+    x1=np.cos(lat1)*np.sin(lon1)*l1
+    y1=np.cos(lat1)*np.cos(lon1)*l1
+    z1=np.sin(lat1)*l1
+    x2=np.cos(lat2)*np.sin(lon2)*l2
+    y2=np.cos(lat2)*np.cos(lon2)*l2
+    z2=np.sin(lat2)*l2
+    baseline = np.sqrt((x2-x1)**2+(y2-y1)**2+(z2-z1)**2)
 
     
-    return bearing_ab,rab*(Rearth+alt_meanm) # Return the distance in meters
+    return bearing_ab,rab*(Rearth+alt_meanm),baseline # Return the distance in meters
 
-
-def baseline_theta(ant1,ant2,az,el):
+def baseline_pairs(antennas):
+    import itertools
     """
-    Calculate the pointing angle along the baseline vector
+    Calculate the baseline pairs for a given set of antennas and returns a mask for the baseline distances
     Args:
-        ant1 (tuple): antenna 1/A ra,dec,elevation
-        ant2 (tuple): antenna 2/B ra,dec,elevation
-        az (quantity): azimuth angle in radians
-        el (quantity): elevation angle in radians
-
+        antennas (list): list of antenna objects
     Returns:
-        delay (quantity): delay in seconds
+        baselines (list): list of baseline pairs
     """
-    C=ant1[0]-ant2[0]
-    b=np.pi/2-np.deg2rad(ant1[1])
-    a=np.pi/2-np.deg2rad(ant1[2])
+    combinations = (itertools.combinations(antennas, 2))
+    itermask= list(itertools.combinations(range(len(antennas)), 2))
+    baselines=[]
+    bearings=[]
+    rabs=[]
+    for i,j in combinations:
+        # print(f"Pair: {i} and {j}")
+        ant1 = i
+        ant2 = j
+        # Calculate the baseline distance
+        bearing_ab,great_circle,baseline = baseline_bearing(ant1, ant2)
+        # print(f"Distance: {distance}, Baseline: {baseline}")
+        # Append the baseline to the list
+        baselines.append(baseline)
+        bearings.append(bearing_ab)
+        rabs.append(baseline*np.sin(bearing_ab))
+    return bearings,baselines,rabs,itermask
 
+def ew_elevation(el,az):
+    """
+    Calculate the east-west component of the elevation angle
+    Args:
+        el (quantity): elevation angle in radians
+        az (quantity): azimuth angle in radians
+    Returns:
+        ew_el (quantity): east-west component of the elevation angle
+    """
+    el = el.to(u.rad).value  # Convert angle to radians
+    az = az.to(u.rad).value  # Convert angle to radians
+    return np.arctan(np.tan(el) / np.cos(az)) * u.rad
     
 
 def tdelay(baseline,theta):
@@ -449,19 +480,6 @@ def tdelay(baseline,theta):
     return baseline * np.cos(theta) / c *u.s
 
 
-def fringe_attenuation(theta, baseline, bandwidth):
-    """
-    Calculate the fringe attenuation for a given angle, baseline, frequency, and bandwidth.
-    Args:
-        theta (quantity): off phase center Angle in radians/degrees etc.
-        baseline (quantity): Baseline in meters etc.
-        bandwidth (quantity): Bandwidth in Hz etc.
-    """
-    c = 3e8  # speed of light in m/s
-    theta = theta.to(u.rad).value  # Convert angle to radians
-    baseline = baseline.to(u.m).value  # Convert baseline to meters
-    bandwidth = bandwidth.to(u.Hz).value  # Convert bandwidth to Hz
-    return np.sinc(np.sin(theta)*baseline*bandwidth/c)
 
 def baseline_nearfield_delay(theta,l1,l2,baseline):
     """
@@ -483,6 +501,19 @@ def baseline_nearfield_delay(theta,l1,l2,baseline):
     
     return  tau1-(l1-l2)/c
 
+def fringe_attenuation(theta, baseline, bandwidth):
+    """
+    Calculate the fringe attenuation for a given angle, baseline, frequency, and bandwidth.
+    Args:
+        theta (quantity): off phase center Angle in radians/degrees etc.
+        baseline (quantity): Baseline east-west component in meters etc.
+        bandwidth (quantity): Bandwidth in Hz etc.
+    """
+    c = 3e8  # speed of light in m/s
+    theta = theta.to(u.rad).value  # Convert angle to radians
+    baseline = baseline.to(u.m).value  # Convert baseline to meters
+    bandwidth = bandwidth.to(u.Hz).value  # Convert bandwidth to Hz
+    return np.sinc(np.sin(theta)*baseline*bandwidth/c)
 
 def fringe_response(delay,frequency):
     """
@@ -516,8 +547,8 @@ def bw_fringe(delays,bwchan,nchan,fch1):
     """
 
     freq_array=np.linspace(fch1,fch1+bwchan,nchan)*u.MHz
-    meshgrid=np.meshgrid(delays,freq_array)
-    fringes=fringe_response(meshgrid[0],meshgrid[1])
+    
+    fringes=np.array([fringe_response(delays,i) for i in freq_array])
     return np.sum(fringes,axis=0)/nchan
 
 

@@ -18,7 +18,7 @@ In the obs module, we have the tools for creating an observation simulation that
 
 The simulation is organised through multiple dimensions to give consideration of the telescope pointings, satellite design, constellation beam patterns through a series of time.
 
-
+scepter operates in a dynamic cube to store the measurements corresponding to each antenna and satellite pairs.
 
 ### Simulation grid explanation
 
@@ -30,7 +30,5 @@ Currently, 6 dimensions are used:
 1. nint, the subintegrations during an observation
 1. number of transmitter/satellites
 
-following are ideas for development:
-1. individual beams from each transmitter/satellite
 
 
