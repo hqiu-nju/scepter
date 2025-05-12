@@ -201,6 +201,7 @@ def pointgen(
             niters,
             step_size=3 * u.deg,
             lat_range=(0 * u.deg, 90 * u.deg),
+            lon_range=(0 * u.deg, 360 * u.deg),
             rnd_seed=None,
             ):
         ### sampling of the sky in equal solid angle
@@ -216,6 +217,7 @@ def pointgen(
         cell_edges, cell_mids, solid_angles, tel_az, tel_el = [], [], [], [], []
 
         lat_range = (lat_range[0].to_value(u.deg), lat_range[1].to_value(u.deg))
+        lon_range = (lon_range[0].to_value(u.deg), lon_range[1].to_value(u.deg))
         ncells_lat = int(
             (lat_range[1] - lat_range[0]) / step_size.to_value(u.deg) + 0.5
             )
@@ -227,8 +229,8 @@ def pointgen(
         with NumpyRNGContext(rnd_seed):
             for low_lat, mid_lat, high_lat in zip(edge_lats[:-1], mid_lats, edge_lats[1:]):
 
-                ncells_lon = int(360 * np.cos(np.radians(mid_lat)) / step_size.to_value(u.deg) + 0.5)
-                edge_lons = np.linspace(0, 360, ncells_lon + 1, endpoint=True)
+                ncells_lon = int( (lon_range[1] - lon_range[0]) * np.cos(np.radians(mid_lat)) / step_size.to_value(u.deg) + 0.5)
+                edge_lons = np.linspace(lon_range[0], lon_range[1], ncells_lon + 1, endpoint=True)
                 mid_lons = 0.5 * (edge_lons[1:] + edge_lons[:-1])
 
                 solid_angle = (edge_lons[1] - edge_lons[0]) * np.degrees(
@@ -244,6 +246,7 @@ def pointgen(
 
         tel_az = np.array(tel_az).T  # TODO, return u.deg
         tel_el = np.array(tel_el).T
+        # lon_mask= (cell_lon> lon_range[0].to_value(u.deg))*(cell_lon< lon_range[1].to_value(u.deg))
 
         grid_info = np.column_stack([cell_mids, cell_edges, solid_angles])
         grid_info.dtype = np.dtype([  # TODO, return a QTable
