@@ -22,7 +22,9 @@ import cysgp4
 from pycraf import conversions as cnv
 from pycraf import protection, antenna, geometry
 from astropy import units as u, constants as const
-from .skynet import *
+from astropy.coordinates import EarthLocation,SkyCoord
+from astropy.time import Time
+from astropy.coordinates import AltAz, ICRS
 
 
 
@@ -474,8 +476,32 @@ class obs_sim():
         ### add axis for simulation over time and iterations
         self.tel_az=tel_az[np.newaxis,:,:,np.newaxis,np.newaxis,np.newaxis]
         self.tel_el=tel_el[np.newaxis,:,:,np.newaxis,np.newaxis,np.newaxis]
+    def sky_track(self,ra,dec):
 
+        '''
+        Description: This function calculates the azimuth and elevation of a celestial ra dec source from the reference antenna location
 
+        Parameters:
+        ra: float/array
+            right ascension of the source (degrees)
+        dec: float/array
+            declination of the source (degrees)
+        
+        Returns:
+        az: float
+            azimuth of the source in the observer frame (degrees)
+        el: float
+            elevation of the source in the observer frame (degrees)
+        '''
+        self.pnt_ra = ra
+        self.pnt_dec = dec
+        ant1 = self.location.flatten()[0]
+        loc1 = EarthLocation(lat=ant1.loc.lat, lon=ant1.loc.lon, height=ant1.loc.alt)
+        altaz = AltAz( obstime=time, location=loc1)
+        skycoord_track=SkyCoord(ra,dec, unit=u.deg,frame='icrs')
+        tel1_pnt=skycoord_track.transform_to(altaz)
+        self.pnt_az, self.pnt_el = tel1_pnt.az, tel1_pnt.alt
+        return tel1_pnt
     def load_propagation(self,nparray):
 
         tleprop=np.load(nparray,allow_pickle=True)
@@ -620,8 +646,8 @@ class obs_sim():
         Description: Calculate the near field delay for the baselines
         '''
 
-        el=self.tel_el[0][np.newaxis,:]
-        az=self.tel_az[0][np.newaxis,:]
+        el=self.pnt_el[np.newaxis,:]
+        az=self.pnt_az[np.newaxis,:]
         lat = self.location.flatten()[0].loc.lat
         l1 = self.topo_pos_dist[0][np.newaxis,:]*u.km
         l2 = self.topo_pos_dist*u.km
