@@ -144,9 +144,9 @@ def mod_tau(az,el,lat,D):
     c = 3e8 *u.m/u.s  # speed of light in m/s
     baseline = D.to(u.m) # Convert baseline to meters
     new_bearing = baseline_vector(baseline,az,el,lat)
-    print(new_bearing.shape)
+    # print(new_bearing.shape)
     D_eff = np.linalg.norm(new_bearing,axis=0)
-    print(D_eff.shape)    
+    # print(D_eff.shape)    
     return D_eff/c
 
 
@@ -156,12 +156,9 @@ def baseline_nearfield_delay(l1,l2,tau):
     """
     Calculate the delay difference from source pointing in seconds for a given angle
     Args:
-        az (float): azimuth angle in radians
-        el (float): elevation angle in radians
-        lat (float): latitude of the antenna in radians
-        l1 (quantity): distance to antenna 1 
-        l2 (quantity): distance to antenna 2 
-        D (quantity): real baseline length in meters etc.
+        l1 (quantity): distance to the antenna 1 in distance units
+        l2 (quantity): distance to the antenna 2 in distance units
+        tau (quantity): baseline delay between two antennas in time units
     Returns:
         delay (quantity): delay in seconds
     """
@@ -474,9 +471,9 @@ class obs_sim():
         self.mjds = mjds
         tel_az, tel_el, self.grid_info = skygrid
         ### add axis for simulation over time and iterations
-        self.tel_az=tel_az[np.newaxis,:,:,np.newaxis,np.newaxis,np.newaxis]
-        self.tel_el=tel_el[np.newaxis,:,:,np.newaxis,np.newaxis,np.newaxis]
-    def sky_track(self,ra,dec):
+        self.grid_az=tel_az[np.newaxis,:,:,np.newaxis,np.newaxis,np.newaxis]
+        self.grid_el=tel_el[np.newaxis,:,:,np.newaxis,np.newaxis,np.newaxis]
+    def sky_track(self,ra,dec,frame='icrs'):
 
         '''
         Description: This function calculates the azimuth and elevation of a celestial ra dec source from the reference antenna location
@@ -486,19 +483,21 @@ class obs_sim():
             right ascension of the source (degrees)
         dec: float/array
             declination of the source (degrees)
+        frame: str/astropy object
+            frame of the source coordinates, default is ICRS
+            Note: can also input astropy alt az object for az el tracking
         
         Returns:
-        az: float
-            azimuth of the source in the observer frame (degrees)
-        el: float
-            elevation of the source in the observer frame (degrees)
+        tel1_pnt: astropy object
+            azimuth and elevation of the source in the telescope reference frame
         '''
         self.pnt_ra = ra
         self.pnt_dec = dec
         ant1 = self.location.flatten()[0]
+        time_1d = Time(self.mjds.flatten(), format='mjd', scale='utc')
         loc1 = EarthLocation(lat=ant1.loc.lat, lon=ant1.loc.lon, height=ant1.loc.alt)
-        altaz = AltAz( obstime=time, location=loc1)
-        skycoord_track=SkyCoord(ra,dec, unit=u.deg,frame='icrs')
+        altaz = AltAz( obstime=time_1d, location=loc1)
+        skycoord_track=SkyCoord(ra,dec, unit=u.deg,frame=frame)
         tel1_pnt=skycoord_track.transform_to(altaz)
         self.pnt_az, self.pnt_el = tel1_pnt.az, tel1_pnt.alt
         return tel1_pnt
@@ -626,7 +625,7 @@ class obs_sim():
         g_rx: float
             receiver gain response function, 2d array
         '''
-        self.g_rx=gainfunc(self.tel_az,self.tel_el,self.topo_pos_az,self.topo_pos_el)
+        self.g_rx=gainfunc(self.grid_az,self.grid_el,self.topo_pos_az,self.topo_pos_el)
         return self.g_rx
 
     def create_baselines(self):
