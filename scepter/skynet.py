@@ -308,10 +308,10 @@ def plantime(epochs,cadence,trange,tint,startdate=cysgp4.PyDateTime()):
                 td[np.newaxis,np.newaxis,np.newaxis,np.newaxis,:,np.newaxis])
     return mjds
 
-def plotgrid(val, grid_info,  point_az=[], point_el=[],elmin=30, elmax=85,zlabel='PFD average / cell [dB(W/m2)]',xlabel='Azimuth [deg]',ylabel='Elevation [deg]',azmin=0,azmax=360):
+def plotgrid(val, grid_info,  point_az=[], point_el=[],elmin=30, elmax=85,zlabel='PFD average / cell [dB(W/m2)]',xlabel='Azimuth [deg]',ylabel='Elevation [deg]',azmin=0,azmax=360,vmin=0,vmax=100):
     fig = plt.figure(figsize=(12, 4))
     # val = pfd_avg.to_value(cnv.dB_W_m2)
-    vmin, vmax = val.min(), val.max()
+    # vmin, vmax = val.min(), val.max()
     val_norm = (val - vmin) / (vmax - vmin)
     plt.bar(
         grid_info['cell_lon_low'],

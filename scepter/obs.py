@@ -28,13 +28,15 @@ from astropy.coordinates import AltAz, ICRS
 
 
 
-def sat_frame_pointing(sat_info,beam_el,beam_az):
+def sat_frame_pointing(satf_az,satf_el,beam_el,beam_az):
     '''
     Description: Calculate the satellite pointing angle separation to the observer in the satellite reference frame
 
     Parameters:
-    sat_info: obs_sim object
-        sat_info from obs_sim class populate function
+    satf_az: float
+        azimuth of the satellite in the satellite reference frame
+    satf_el: float
+        elevation of the satellite in the satellite reference frame
     beam_el: float
         beam elevation angle in satellite reference frame zxy, where z is the motion vector
     beam_az: float  
@@ -50,10 +52,10 @@ def sat_frame_pointing(sat_info,beam_el,beam_az):
     obs_dist: float
         distance between the observer and the satellite
 '''
-    tleprop = sat_info
-    #### obtain coordinates in observation frame and satellite frame
-    # topo_pos_az, topo_pos_el= tleprop['obs_az'], tleprop['obs_el']
-    satf_az, satf_el, satf_dist = tleprop['sat_frame_az'], tleprop['sat_frame_el'], tleprop['sat_frame_dist']
+    # tleprop = sat_info
+    # #### obtain coordinates in observation frame and satellite frame
+    # # topo_pos_az, topo_pos_el= tleprop['obs_az'], tleprop['obs_el']
+    # satf_az, satf_el, satf_dist = tleprop['sat_frame_az'], tleprop['sat_frame_el'], tleprop['sat_frame_dist']
 
 
     #### check numpy braodcasting to fix dimensions
@@ -61,7 +63,7 @@ def sat_frame_pointing(sat_info,beam_el,beam_az):
     ang_sep=geometry.true_angular_distance(satf_az*u.deg,satf_el*u.deg,beam_az*u.deg,beam_el*u.deg)
     delta_az=satf_az-beam_az
     delta_el=satf_el-beam_el
-    return ang_sep,delta_az,delta_el,satf_dist
+    return ang_sep,delta_az,delta_el
 
 
 
@@ -199,24 +201,30 @@ def fringe_response(delay,frequency):
     return np.cos(2*np.pi*frequency*delay)
 
 
-def bw_fringe(delays,bwchan,nchan,fch1):
+def bw_fringe(delays,bwchan,fch1,chan_bin=100):
     """
     Calculate the fringe response for a given delay and frequency
-    based on two element equation integration, assuming equal gain
+    based on two element equation integration, assuming equal gain.
+    the function takes into the frequency settings and does a integration with 0.1 kHz resolution
+    over the channel bandwidth and number of channels
+    delay array must be 1d array, flatten your input and reshape the output.
 
     Args:
-        delays (array): delay array in seconds
-        bwchan (float): channel bandwidth in MHz
-        nchan (int): number of channels
-        fch1 (float): channel frequency in MHz
+        delays (array): delay array in seconds, 
+        bwchan (quantity): channel bandwidth 
+        fch1 (quantity): channel centre frequency
+        chan_bin (int): number of channels in the band
     Returns:
-        response (quantity): fringe response
+        response (float): fringe response
     """
-
-    freq_array=np.linspace(fch1,fch1+bwchan,nchan)*u.MHz
-    
-    fringes=np.array([fringe_response(delays,i) for i in freq_array])
-    return np.sum(fringes,axis=0)/nchan
+    fch1 = fch1.to(u.kHz).value  # Convert frequency to kHz
+    bwchan = bwchan.to(u.kHz).value  # Convert bandwidth to kHz
+    # chan_bin=np.int32(bwchan/0.1) ### the bin number
+    freq_array= np.linspace(fch1-bwchan*0.5,fch1+bwchan*0.5,chan_bin) *u.kHz # 0.1 kHz resolution
+    delays= delays[:,np.newaxis] # add axis to delays
+    freq_array = freq_array[np.newaxis,:]
+    fringes=fringe_response(delays,freq_array)
+    return np.mean(fringes,axis=1)
 
 
 def prx_cnv(pwr,g_rx, outunit=u.W):
@@ -442,7 +450,7 @@ class receiver_info():
         return self.G_rx
 
 class obs_sim():
-    def __init__(self,transmitter,receiver,skygrid,mjds):
+    def __init__(self,skygrid,mjds):
         '''
         Description: simulate observing programme
 
@@ -460,10 +468,10 @@ class obs_sim():
             2-d mjd array of epochs and observation times using skynet.plantime function
         '''
 
-        self.transmitter = transmitter
-        self.receiver = receiver
-        self.ras_bandwidth = receiver.bandwidth
-        self.transmitter.power_tx(self.ras_bandwidth)
+        # self.transmitter = transmitter
+        # self.receiver = receiver
+        # self.ras_bandwidth = receiver.bandwidth
+        # self.transmitter.power_tx(self.ras_bandwidth)
         # reformat and reorganise tle array dimension?
         ## in the order of [location,grid cell,antenna pointing per grid, epochs,time,satellite]
         
@@ -491,15 +499,17 @@ class obs_sim():
         tel1_pnt: astropy object
             azimuth and elevation of the source in the telescope reference frame
         '''
-        self.pnt_ra = ra
-        self.pnt_dec = dec
+        # self.pnt_ra = ra
+        # self.pnt_dec = dec
         ant1 = self.location.flatten()[0]
         time_1d = Time(self.mjds.flatten(), format='mjd', scale='utc')
         loc1 = EarthLocation(lat=ant1.loc.lat, lon=ant1.loc.lon, height=ant1.loc.alt)
         altaz = AltAz( obstime=time_1d, location=loc1)
         skycoord_track=SkyCoord(ra,dec, unit=u.deg,frame=frame)
+        self.pnt=skycoord_track
+        self.altaz_frame=altaz
         tel1_pnt=skycoord_track.transform_to(altaz)
-        self.pnt_az, self.pnt_el = tel1_pnt.az, tel1_pnt.alt
+        self.pnt_az, self.pnt_el = tel1_pnt.az[np.newaxis,np.newaxis,:,np.newaxis,np.newaxis,np.newaxis], tel1_pnt.alt[np.newaxis,np.newaxis,:,np.newaxis,np.newaxis,np.newaxis]
         return tel1_pnt
     def load_propagation(self,nparray):
 
@@ -596,37 +606,8 @@ class obs_sim():
         ang_sep: float
             angular separation between the satellite pointing and observer in the satellite reference frame
         '''
-        result=self.sat_info
-        self.angsep=sat_frame_pointing(result,beam_el,beam_az)[0]
-        if apply_mask == True:
-            if self.elevation_mask is not None:
-                self.angsep = self.angsep[:,:,:,:,:,self.elevation_mask]
+        self.angsep=sat_frame_pointing(self.satf_az,self.satf_el,beam_el,beam_az)
         return self.angsep
-
-    def pwr_on_ground(self,gainfunc,corrections,beam_el,beam_az):
-        '''
-        Description: Calculate the power of the transmitter on the ground
-
-        Returns:
-        pfd: float
-            power flux density in dBm
-        '''
-
-
-    def g_rx(self,gainfunc):
-        '''
-        Description: Calculate the receiver gain response function
-
-        Parameters:
-        gainfunc: function
-            gain function to be used for the receiver, it should take telescope pointing and source coordinates as input (l1,b1,l2,b2)
-
-        Returns:
-        g_rx: float
-            receiver gain response function, 2d array
-        '''
-        self.g_rx=gainfunc(self.grid_az,self.grid_el,self.topo_pos_az,self.topo_pos_el)
-        return self.g_rx
 
     def create_baselines(self):
         '''
@@ -640,21 +621,23 @@ class obs_sim():
         self.bearing_D = self.bearing_D.reshape(self.location.shape)
         # self.delays = mod_tau(self.baselines*u.m)
 
-    def baselines_nearfield(self):
+    def baselines_nearfield_delays(self):
         '''
-        Description: Calculate the near field delay for the baselines
+        Description: Calculate the near field delay for the baselines using the satellite positions
+
+        returns:
+        baseline_delays: float
+            delay difference for each baseline at each instance of pointing, returns in whole simulation array format 
         '''
 
-        el=self.pnt_el[np.newaxis,:]
-        az=self.pnt_az[np.newaxis,:]
+
         lat = self.location.flatten()[0].loc.lat
         l1 = self.topo_pos_dist[0][np.newaxis,:]*u.km
-        l2 = self.topo_pos_dist*u.km
-        tau1=mod_tau(az,el,lat,self.bearing_D*u.m)
-        print(tau1.shape)
-        self.baseline_delays = baseline_nearfield_delay(l1,l2,tau=tau1)
+        tau1=mod_tau(self.pnt_az,self.pnt_el,lat,self.bearing_D*u.m)
+        self.pnt_tau = tau1
+        self.baseline_delays = baseline_nearfield_delay(l1,self.topo_pos_dist*u.km,tau=tau1)
 
         return self.baseline_delays
-
-
+    
+    def 
 
