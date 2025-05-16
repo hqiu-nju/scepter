@@ -205,8 +205,8 @@ def bw_fringe(delays,bwchan,fch1,chan_bin=100):
     """
     Calculate the fringe response for a given delay and frequency
     based on two element equation integration, assuming equal gain.
-    the function takes into the frequency settings and does a integration with 0.1 kHz resolution
-    over the channel bandwidth and number of channels
+    the function takes into the frequency settings and does a integration 
+    over the channel bandwidth and number of channel bins
     delay array must be 1d array, flatten your input and reshape the output.
 
     Args:
@@ -450,7 +450,7 @@ class receiver_info():
         return self.G_rx
 
 class obs_sim():
-    def __init__(self,skygrid,mjds):
+    def __init__(self,receiver,skygrid,mjds):
         '''
         Description: simulate observing programme
 
@@ -465,11 +465,11 @@ class obs_sim():
         skygrid: tuple
             output of the pointgen function from skynet module
         mjds: array
-            2-d mjd array of epochs and observation times using skynet.plantime function
+            mjd array of epochs and observation times using skynet.plantime function
         '''
 
         # self.transmitter = transmitter
-        # self.receiver = receiver
+        self.receiver = receiver
         # self.ras_bandwidth = receiver.bandwidth
         # self.transmitter.power_tx(self.ras_bandwidth)
         # reformat and reorganise tle array dimension?
@@ -481,6 +481,25 @@ class obs_sim():
         ### add axis for simulation over time and iterations
         self.grid_az=tel_az[np.newaxis,:,:,np.newaxis,np.newaxis,np.newaxis]
         self.grid_el=tel_el[np.newaxis,:,:,np.newaxis,np.newaxis,np.newaxis]
+    def azel_track(self,az,el):
+        '''
+        Description: set fixed azimuth and elevation tracking for the telescope
+        Parameters:
+        az: float
+            azimuth of the source (degrees)
+        el: float
+            elevation of the source (degrees)
+        '''
+        ant1 = self.location.flatten()[0]
+        time_2d = Time(self.mjds, format='mjd', scale='utc')
+        loc1 = EarthLocation(lat=ant1.loc.lat, lon=ant1.loc.lon, height=ant1.loc.alt)
+        altaz = AltAz( obstime=time_2d, location=loc1)
+        tel1_pnt = SkyCoord(az,el, unit=(u.deg,u.deg),frame=altaz)
+        self.pnt_coord=tel1_pnt
+        self.pnt_az, self.pnt_el = tel1_pnt.az[np.newaxis,np.newaxis,:,:,np.newaxis], tel1_pnt.alt[np.newaxis,np.newaxis,:,:,np.newaxis]
+        self.altaz_frame=altaz
+        return self.pnt_coord
+
     def sky_track(self,ra,dec,frame='icrs'):
 
         '''
@@ -502,14 +521,14 @@ class obs_sim():
         # self.pnt_ra = ra
         # self.pnt_dec = dec
         ant1 = self.location.flatten()[0]
-        time_1d = Time(self.mjds.flatten(), format='mjd', scale='utc')
+        time_2d = Time(self.mjds, format='mjd', scale='utc')
         loc1 = EarthLocation(lat=ant1.loc.lat, lon=ant1.loc.lon, height=ant1.loc.alt)
-        altaz = AltAz( obstime=time_1d, location=loc1)
-        skycoord_track=SkyCoord(ra,dec, unit=u.deg,frame=frame)
-        self.pnt=skycoord_track
+        altaz = AltAz( obstime=time_2d, location=loc1)
+        skycoord_track=SkyCoord(ra,dec, unit=(u.deg,u.deg),frame=frame)
+        self.pnt_coord=skycoord_track
         self.altaz_frame=altaz
         tel1_pnt=skycoord_track.transform_to(altaz)
-        self.pnt_az, self.pnt_el = tel1_pnt.az[np.newaxis,np.newaxis,:,np.newaxis,np.newaxis,np.newaxis], tel1_pnt.alt[np.newaxis,np.newaxis,:,np.newaxis,np.newaxis,np.newaxis]
+        self.pnt_az, self.pnt_el = tel1_pnt.az[np.newaxis,np.newaxis,:,:,np.newaxis], tel1_pnt.alt[np.newaxis,np.newaxis,:,:,np.newaxis]
         return tel1_pnt
     def load_propagation(self,nparray):
 
@@ -639,5 +658,22 @@ class obs_sim():
 
         return self.baseline_delays
     
-    def 
+    def sat_fringe(self,bwchan,fch1,chan_bin=100):
+        """
+        Calculate the fringe response for a given delay and frequency
+        based on two element equation integration, assuming equal gain.
+        the function takes into the frequency settings and does a integration with channel bins over the channel bandwidth
 
+        Args:
+            bwchan (quantity): channel bandwidth 
+            fch1 (quantity): channel centre frequency
+            chan_bin (int): number of channels in the band
+        Returns:
+            response (float): fringe response
+        """
+
+
+        delays= self.baseline_delays.flatten()
+        self.fringes=bw_fringe(delays,bwchan,fch1,chan_bin=chan_bin).reshape(self.baseline_delays.shape)
+
+        return self.fringes
