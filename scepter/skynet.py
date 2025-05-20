@@ -203,6 +203,7 @@ def pointgen(
             lat_range=(0 * u.deg, 90 * u.deg),
             lon_range=(0 * u.deg, 360 * u.deg),
             rnd_seed=None,
+            randome=False
             ):
         ### sampling of the sky in equal solid angle
         def sample(niters,low_lon, high_lon, low_lat, high_lat):
@@ -225,10 +226,26 @@ def pointgen(
             lat_range[0], lat_range[1], ncells_lat + 1, endpoint=True
             )
         mid_lats = 0.5 * (edge_lats[1:] + edge_lats[:-1])
+        if randome:
+            with NumpyRNGContext(rnd_seed):
+                for low_lat, mid_lat, high_lat in zip(edge_lats[:-1], mid_lats, edge_lats[1:]):
 
-        with NumpyRNGContext(rnd_seed):
+                    ncells_lon = int( (lon_range[1] - lon_range[0]) * np.cos(np.radians(mid_lat)) / step_size.to_value(u.deg) + 0.5)
+                    edge_lons = np.linspace(lon_range[0], lon_range[1], ncells_lon + 1, endpoint=True)
+                    mid_lons = 0.5 * (edge_lons[1:] + edge_lons[:-1])
+
+                    solid_angle = (edge_lons[1] - edge_lons[0]) * np.degrees(
+                        np.sin(np.radians(high_lat)) - np.sin(np.radians(low_lat))
+                        )
+                    for low_lon, mid_lon, high_lon in zip(edge_lons[:-1], mid_lons, edge_lons[1:]):
+                        cell_edges.append((low_lon, high_lon, low_lat, high_lat))
+                        cell_mids.append((mid_lon, mid_lat))
+                        solid_angles.append(solid_angle)
+                        cell_tel_az, cell_tel_el = sample(niters, low_lon, high_lon, low_lat, high_lat)
+                        tel_az.append(cell_tel_az)
+                        tel_el.append(cell_tel_el)
+        else:
             for low_lat, mid_lat, high_lat in zip(edge_lats[:-1], mid_lats, edge_lats[1:]):
-
                 ncells_lon = int( (lon_range[1] - lon_range[0]) * np.cos(np.radians(mid_lat)) / step_size.to_value(u.deg) + 0.5)
                 edge_lons = np.linspace(lon_range[0], lon_range[1], ncells_lon + 1, endpoint=True)
                 mid_lons = 0.5 * (edge_lons[1:] + edge_lons[:-1])
@@ -240,7 +257,7 @@ def pointgen(
                     cell_edges.append((low_lon, high_lon, low_lat, high_lat))
                     cell_mids.append((mid_lon, mid_lat))
                     solid_angles.append(solid_angle)
-                    cell_tel_az, cell_tel_el = sample(niters, low_lon, high_lon, low_lat, high_lat)
+                    cell_tel_az, cell_tel_el = np.linspace(low_lon,high_lon,niters), np.linspace(low_lat,high_lat,niters)
                     tel_az.append(cell_tel_az)
                     tel_el.append(cell_tel_el)
 
@@ -312,17 +329,20 @@ def plotgrid(val, grid_info,  point_az=[], point_el=[],elmin=30, elmax=85,zlabel
     fig = plt.figure(figsize=(12, 4))
     # val = pfd_avg.to_value(cnv.dB_W_m2)
     # vmin, vmax = val.min(), val.max()
-    val_norm = (val - vmin) / (vmax - vmin)
+    val_norm = matplotlib.colors.Normalize(vmin=vmin, vmax=vmax)
+    colors = cm.viridis(val_norm(val))
+    print(np.shape(colors))
     plt.bar(
         grid_info['cell_lon_low'],
         height=grid_info['cell_lat_high'] - grid_info['cell_lat_low'],
         width=grid_info['cell_lon_high'] - grid_info['cell_lon_low'],
         bottom=grid_info['cell_lat_low'],
-        color=plt.cm.viridis(val_norm),
+        color=colors,
         align='edge'
         )
     plt.scatter(point_az,point_el,c='r',s=1)
     sm = plt.cm.ScalarMappable(cmap=plt.cm.viridis, norm=plt.Normalize(vmin=vmin, vmax=vmax))
+
     cbar = plt.colorbar(sm, ax=plt.gca())
     cbar.set_label(zlabel)
     plt.ylim(elmin, elmax)

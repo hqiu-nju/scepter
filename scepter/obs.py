@@ -481,6 +481,7 @@ class obs_sim():
         ### add axis for simulation over time and iterations
         self.grid_az=tel_az[np.newaxis,:,:,np.newaxis,np.newaxis,np.newaxis]
         self.grid_el=tel_el[np.newaxis,:,:,np.newaxis,np.newaxis,np.newaxis]
+
     def azel_track(self,az,el):
         '''
         Description: set fixed azimuth and elevation tracking for the telescope
@@ -496,7 +497,7 @@ class obs_sim():
         altaz = AltAz( obstime=time_2d, location=loc1)
         tel1_pnt = SkyCoord(az,el, unit=(u.deg,u.deg),frame=altaz)
         self.pnt_coord=tel1_pnt
-        self.pnt_az, self.pnt_el = tel1_pnt.az[np.newaxis,np.newaxis,:,:,np.newaxis], tel1_pnt.alt[np.newaxis,np.newaxis,:,:,np.newaxis]
+        self.pnt_az, self.pnt_el = tel1_pnt.az, tel1_pnt.alt
         self.altaz_frame=altaz
         return self.pnt_coord
 
@@ -528,7 +529,7 @@ class obs_sim():
         self.pnt_coord=skycoord_track
         self.altaz_frame=altaz
         tel1_pnt=skycoord_track.transform_to(altaz)
-        self.pnt_az, self.pnt_el = tel1_pnt.az[np.newaxis,np.newaxis,:,:,np.newaxis], tel1_pnt.alt[np.newaxis,np.newaxis,:,:,np.newaxis]
+        self.pnt_az, self.pnt_el = tel1_pnt.az, tel1_pnt.alt
         return tel1_pnt
     def load_propagation(self,nparray):
 
@@ -611,7 +612,7 @@ class obs_sim():
         tleprop=np.load(savename,allow_pickle=True)
         self.sat_info = tleprop
 
-    def txbeam_angsep(self,beam_el,beam_az,apply_mask=True):
+    def txbeam_angsep(self,beam_el,beam_az):
         '''
         Description: Calculate the satellite pointing angle separation to the observer in the satellite reference frame
 
@@ -622,11 +623,28 @@ class obs_sim():
             beam azimuth angle in satellite reference frame
         
         Returns:
-        ang_sep: float
+        txang_sep: float
             angular separation between the satellite pointing and observer in the satellite reference frame
         '''
-        self.angsep=sat_frame_pointing(self.satf_az,self.satf_el,beam_el,beam_az)
-        return self.angsep
+        self.txangsep=sat_frame_pointing(self.satf_az,self.satf_el,beam_el,beam_az)
+        return self.txangsep
+    def sat_separation(self,mode='tracking',pnt_az=None,pnt_el=None):
+        '''
+        Description: Calculate the satellite angular separation from telescope pointing
+        Parameters:
+        mode: str
+            mode of the simulation, default is 'tracking', other options are 'allsky','pnt'
+        Returns:
+        rxang_sep: float
+            angular separation between the satellite pointing and observer in the telescope reference frame
+        '''
+        if mode == 'tracking':
+            self.rxang_sep = geometry.true_angular_distance(self.pnt_az, self.pnt_el, self.topo_pos_az*u.deg, self.topo_pos_el *u.deg)
+        elif mode == 'allsky':
+            self.rxang_sep = geometry.true_angular_distance(self.grid_az*u.deg, self.grid_el*u.deg, self.topo_pos_az*u.deg, self.topo_pos_el *u.deg)
+        elif mode == 'pnt':
+            self.rxang_sep = geometry.true_angular_distance(pnt_az*u.deg, pnt_el*u.deg, self.topo_pos_az*u.deg, self.topo_pos_el *u.deg)
+        return self.rxang_sep
 
     def create_baselines(self):
         '''
@@ -640,9 +658,14 @@ class obs_sim():
         self.bearing_D = self.bearing_D.reshape(self.location.shape)
         # self.delays = mod_tau(self.baselines*u.m)
 
-    def baselines_nearfield_delays(self):
+    def baselines_nearfield_delays(self,mode = 'tracking'):
         '''
         Description: Calculate the near field delay for the baselines using the satellite positions
+        Args:
+        mode: str
+            mode of the simulation, default is 'tracking', other options are 'allsky'
+        '''
+        '''
 
         returns:
         baseline_delays: float
@@ -652,10 +675,16 @@ class obs_sim():
 
         lat = self.location.flatten()[0].loc.lat
         l1 = self.topo_pos_dist[0][np.newaxis,:]*u.km
-        tau1=mod_tau(self.pnt_az,self.pnt_el,lat,self.bearing_D*u.m)
-        self.pnt_tau = tau1
-        self.baseline_delays = baseline_nearfield_delay(l1,self.topo_pos_dist*u.km,tau=tau1)
-
+        if mode == 'tracking':
+            tau1=mod_tau(self.pnt_az,self.pnt_el,lat,self.bearing_D*u.m)
+            self.pnt_tau = tau1
+            self.baseline_delays = baseline_nearfield_delay(l1,self.topo_pos_dist*u.km,tau=tau1)
+        elif mode == 'allsky':
+            tau1=mod_tau(self.grid_az,self.grid_el,lat,self.bearing_D*u.m)
+            self.pnt_tau = tau1
+            self.baseline_delays = baseline_nearfield_delay(l1,self.topo_pos_dist*u.km,tau=tau1)
+        else:
+            raise ValueError("Invalid mode. Choose 'tracking' or 'allsky'.")
         return self.baseline_delays
     
     def sat_fringe(self,bwchan,fch1,chan_bin=100):
@@ -677,3 +706,26 @@ class obs_sim():
         self.fringes=bw_fringe(delays,bwchan,fch1,chan_bin=chan_bin).reshape(self.baseline_delays.shape)
 
         return self.fringes
+    def fringe_signal(self,pwr,g_rx,ant1_idx=0,ant2_idx=1):
+        '''
+        Description: Calculate the power of a specifc baseline using the fringes
+        Parameters:
+        pwr: float
+            power of the signal, linear values only, use 1 for attenuation factor calculation
+        g_rx: quantity
+            receiver gain in source direction during observation (usually cnv.dBi)
+        ant1_idx: int
+            index of the first antenna in the baseline
+        ant2_idx: int
+            index of the second antenna in the baseline
+        
+        Returns:
+        pwr: float
+            power of the signal
+        '''
+        coherent_v_baselines=np.sqrt(pwr*g_rx.to(cnv.dimless)*(self.fringes**2))
+        fringe1 = coherent_v_baselines[ant1_idx]
+        fringe2 = coherent_v_baselines[ant2_idx]
+        pwr = fringe1*fringe2
+        self.fringe_pwr = pwr
+        return pwr
