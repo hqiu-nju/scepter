@@ -341,7 +341,7 @@ def plotgrid(val, grid_info,  point_az=[], point_el=[],elmin=30, elmax=85,zlabel
         align='edge'
         )
     plt.scatter(point_az,point_el,c='r',s=1)
-    sm = plt.cm.ScalarMappable(cmap=plt.cm.viridis, norm=plt.Normalize(vmin=vmin, vmax=vmax))
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(vmin=vmin, vmax=vmax))
 
     cbar = plt.colorbar(sm, ax=plt.gca())
     cbar.set_label(zlabel)
