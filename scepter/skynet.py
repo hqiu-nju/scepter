@@ -331,7 +331,7 @@ def plotgrid(val, grid_info,  point_az=[], point_el=[],elmin=30, elmax=85,zlabel
     # vmin, vmax = val.min(), val.max()
     val_norm = matplotlib.colors.Normalize(vmin=vmin, vmax=vmax)
     colors = cm.viridis(val_norm(val))
-    print(np.shape(colors))
+    # print(np.shape(colors))
     plt.bar(
         grid_info['cell_lon_low'],
         height=grid_info['cell_lat_high'] - grid_info['cell_lat_low'],
