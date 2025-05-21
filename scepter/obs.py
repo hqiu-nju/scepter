@@ -554,7 +554,7 @@ class obs_sim():
             elevation angle limit (degrees)
         '''
 
-        min_el=np.min(self.topo_pos_el,axis=(0,1,2,3,4))
+        min_el=np.mean(self.topo_pos_el,axis=(0,1,2,3,4))
         mask = min_el>el_limit
         # self.sat_info["obs_az"] = self.sat_info["obs_az"][:,:,:,:,:,mask]
         # self.sat_info["obs_el"] = self.sat_info["obs_el"][:,:,:,:,:,mask]
