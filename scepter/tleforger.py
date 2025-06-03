@@ -14,10 +14,15 @@ from astropy.constants import GM_earth, R_earth
 from cysgp4 import PyTle
 from pycraf.utils import ranged_quantity_input
 
-class NamedPyTle(PyTle):
-    def __init__(self, name, line1, line2):
-        super().__init__(name, line1, line2)
-        self.name = name
+_tle_counter = 0        
+
+def reset_tle_counter():
+    """
+    Reset the internal TLE counter back to zero.
+    Should be used for subsequent runs using same environment session to avoid overflow.
+    """
+    global _tle_counter
+    _tle_counter = 0
 
 @ranged_quantity_input(altitude = (0, 384400000, u.m),
                        inclination_deg = (-360, 360, u.deg),
@@ -38,7 +43,7 @@ def forge_tle_single(
     mm_dot: float = 0.0,
     mm_ddot: float = 0.0,
     bstar: float = 0.00
-) -> NamedPyTle:
+) -> PyTle:
     """
     Forge a TLE for a single satellite from a set of orbital parameters and a reference epoch.
 
@@ -77,8 +82,8 @@ def forge_tle_single(
 
     Returns
     -------
-        NamedPyTle
-            A modified PyTle object to also include specific name string.
+        PyTle
+            A PyTle object.
 
     Notes
     -----
@@ -167,20 +172,62 @@ def forge_tle_single(
         # Step 7. Construct final 8-character string
         return f"{sign_mantissa}{mant_int:05d}{sign_exp}{exp_digit:1.0f}"
     
+    def index_to_piece(idx: int) -> str:
+        """
+        Convert a zero-based index (0 .. (26 + 26**2 + 26**3   = 18_278)-1) into a COSPAR piece code:
+        0 -> 'A'
+        25 -> 'Z'
+        26 -> 'AA'
+        27 -> 'AB'
+        …
+        up to length == 3 letters (max idx = 18 277 -> 'ZZZ')
+        """
+        if idx < 0 or idx >= 18277:
+            raise ValueError(f"Piece index {idx} out of range (0..18277).")
+        # Work with a 1-based “n” for the usual A=1…Z=26 logic
+        n = idx + 1
+        letters = []
+        while n > 0:
+            n -= 1
+            letters.append(chr(ord('A') + (n % 26)))
+            n //= 26
+        return ''.join(reversed(letters))
+    
     # 1. Basic TLE identifiers
-    sat_number = 0           # Fake NORAD ID
+    global _tle_counter
+    _tle_counter += 1
+    sat_number = _tle_counter # Fake NORAD ID
+
+    if sat_number > 99999:
+        raise ValueError(
+            f"Cannot assign NORAD ID {sat_number:d}: exceeds 5-digit limit (max 99999)."
+        )
+
     classification = "U"
-    classification = "U"
-    int_desg = "25001A"      # Fake International Designator
     
-    # 2. Epoch calculation
-    classification = "U"    
-    int_desg = "25001A"      # Fake International Designator
-    
-    # 2. Epoch calculation
-    year = start_time.datetime.year
-    year_short = year % 100
-    int_desg = str(year_short)+"001A"      # Fake International Designator
+    year_short = start_time.datetime.year % 100
+
+    # Figure out which “launch” and which “piece” within that launch:
+    #
+    #   Each launch can hold up to 18277 satellites.
+    #   Zero-based overall index = (_tle_counter – 1).
+    total_idx = _tle_counter - 1
+    piece_idx = total_idx % 18277
+    launch_no = (total_idx // 18277) + 1
+
+    if launch_no > 999:
+        raise ValueError(
+            f"Cannot assign COSPAR launch number {launch_no}: exceeds 3 digits (max 999)."
+        )
+
+    # Convert piece index to the 1-3 letter code
+    piece_str = index_to_piece(piece_idx)  # e.g. 'A', 'B', … 'Z', 'AA', …
+
+    # Build the 8-character International Designator: "YY" + "NNN" + "PPP"
+    #   - YY = 2-digit year_short
+    #   - NNN = 3-digit, zero-padded launch number
+    #   - PPP = right-justified in 3 chars (e.g. '  A', '  Z', ' AA', 'AZ', 'ZZZ')
+    int_desg = f"{year_short:02d}{launch_no:03d}{piece_str:>3s}"
     
     # 2. Epoch calculation
     start_of_year = Time(start_time.datetime.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0))
@@ -224,7 +271,7 @@ def forge_tle_single(
     line2 += str(compute_tle_checksum(line2))
     
     # 6. Construct the full TLE string
-    tle = NamedPyTle(sat_name, line1, line2)  
+    tle = PyTle(sat_name, line1, line2)  
     return tle
 
 
@@ -305,8 +352,8 @@ def forge_tle_belt(
 
     Returns
     -------
-        List[NamedPyTle]
-            A list of NamedPyTle objects, each describing one satellite.
+        List[PyTle]
+            A list of PyTle objects, each describing one satellite.
 
     Notes
     -----
@@ -314,7 +361,7 @@ def forge_tle_belt(
         360.0 / num_sats_per_plane degrees.
         2) The function internally calls `forge_tle_single` for each satellite, 
         which computes TLE line data (NORAD ID, epoch, etc.) and returns 
-        a NamedPyTle object as defined above.
+        a PyTle object.
         3) If `belt` is not None, this function is currently a stub (`pass`) and 
         does nothing. It's a placeholder for future implementation of belt object.
     """
