@@ -705,6 +705,7 @@ class obs_sim():
         delays= self.baseline_delays.flatten()
         self.fringes=bw_fringe(delays,bwchan,fch1,chan_bin=chan_bin).reshape(self.baseline_delays.shape)
 
+
         return self.fringes
     def fringe_signal(self,pwr,g_rx,ant1_idx=0,ant2_idx=1):
         '''
