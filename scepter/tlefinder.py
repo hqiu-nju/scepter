@@ -1,3 +1,16 @@
+#!/usr/bin/env python3
+
+"""
+tlefinder.py
+
+A smart utility to find TLEs from the SKA Observatory TLE archive and propagate them to the observer location.
+For tle npz format, please contact the SKAO spectrum management team.
+
+Author: Harry Qiu <hqiu678@outlook.com>
+
+Date: 12-04-2025
+"""
+
 import glob 
 from datetime import datetime
 import cysgp4
@@ -14,7 +27,7 @@ class TLEfinder():
         obs : list of cysgp4.PyObserver object
             Observer object from cysgp4 of the observatory
         dir : String (default = './')
-            Directory where the TLEs are stored, TLEs need to be in datetime format of %Y%m%d_%H%M%S
+            Directory where the TLEs are stored, TLEs need to be in datetime format of %Y%m%d_%H%M%S in a npz file
 
 
 

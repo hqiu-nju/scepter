@@ -22,7 +22,260 @@ import cysgp4
 from pycraf import conversions as cnv
 from pycraf import protection, antenna, geometry
 from astropy import units as u, constants as const
-from .skynet import *
+from astropy.coordinates import EarthLocation,SkyCoord
+from astropy.time import Time
+from astropy.coordinates import AltAz, ICRS
+
+
+
+def sat_frame_pointing(satf_az,satf_el,beam_el,beam_az):
+    '''
+    Description: Calculate the satellite pointing angle separation to the observer in the satellite reference frame
+
+    Parameters:
+    satf_az: float
+        azimuth of the satellite in the satellite reference frame
+    satf_el: float
+        elevation of the satellite in the satellite reference frame
+    beam_el: float
+        beam elevation angle in satellite reference frame zxy, where z is the motion vector
+    beam_az: float  
+        beam azimuth angle in satellite reference frame
+    
+    Returns:
+    ang_sep: float
+        angular separation between the satellite pointing and observer in the satellite reference frame
+    delta_az: float
+        azimuth difference between the satellite pointing and observer in the satellite reference frame
+    delta_el: float
+        elevation difference between the satellite pointing and observer in the satellite reference frame
+    obs_dist: float
+        distance between the observer and the satellite
+'''
+    # tleprop = sat_info
+    # #### obtain coordinates in observation frame and satellite frame
+    # # topo_pos_az, topo_pos_el= tleprop['obs_az'], tleprop['obs_el']
+    # satf_az, satf_el, satf_dist = tleprop['sat_frame_az'], tleprop['sat_frame_el'], tleprop['sat_frame_dist']
+
+
+    #### check numpy braodcasting to fix dimensions
+
+    ang_sep=geometry.true_angular_distance(satf_az*u.deg,satf_el*u.deg,beam_az*u.deg,beam_el*u.deg)
+    delta_az=satf_az-beam_az
+    delta_el=satf_el-beam_el
+    return ang_sep,delta_az,delta_el
+
+
+
+def baseline_bearing(ref,ant):
+    """
+    calculate the bearing of antenna 2 with respect to antenna 1
+    Args:
+        ref (object): reference antenna/location PyObserver object
+        ant (object): antenna for baseline PyObserver object
+    Returns:
+        bearing: vector from antenna baseline in cartesian coordinates
+        d: baseline vector modulus or baseline length in meters
+    """
+    ant1 = ref
+    ant2 = ant
+    x1,y1,z1 = pycraf.geospatial.wgs84_to_itrf2008(ant1.loc.lon*u.deg, ant1.loc.lat*u.deg, ant1.loc.alt*u.m)
+    x2,y2,z2 = pycraf.geospatial.wgs84_to_itrf2008(ant2.loc.lon*u.deg, ant2.loc.lat*u.deg, ant2.loc.alt*u.m)
+
+
+
+    a1=np.array([x1.value,y1.value,z1.value])
+    a2=np.array([x2.value,y2.value,z2.value])
+    # print(a1,a2)
+    bearing = a2-a1
+    d = np.linalg.norm(bearing) # Calculate the distance between the antennas
+
+    
+    return bearing, d # Return the distance in meters
+
+def baseline_pairs(antennas):
+    """
+    Calculate the baseline pairs for a given set of antennas and returns a mask for the baseline distances
+    Args:
+        antennas (list): list of antenna objects
+    Returns:
+        baselines (list): list of baseline pairs
+    """
+
+    baselines=[] ### true baseline distance
+    bearings=[]
+    rabs=[] ### east-west component of the baseline distance
+    for i in range(len(antennas)):
+        # print(f"Pair: {i} and {j}")
+        ant = antennas[i]
+        ref = antennas[0]
+        # Calculate the baseline distance
+        bearing,d = baseline_bearing(ref, ant)
+        baselines.append(d)
+        bearings.append(bearing)
+
+    return np.array(bearings),np.array(baselines)
+
+def baseline_vector(d,az,el,lat):
+    """
+    calculate the effective baseline distance with a confirmed pointing angle of the reference antenna/position
+    Args:
+        d (float): distance to the antenna in meters
+        az (float): azimuth angle in radians
+        el (float): elevation angle in radians
+        lat (float): latitude of the antenna in radians
+    Returns:
+        vector: array of the effective baseline vector in cartesian coordinates x,y,z (meters)
+
+    """
+    
+    
+    return d*np.array([np.cos(lat)*np.sin(el)-np.sin(lat)*np.cos(el)*np.cos(az),
+    np.cos(el)*np.sin(az),
+    np.sin(lat)*np.sin(el)+np.cos(lat)*np.cos(el)*np.cos(az)]) # x,y,z coordinates in meters
+    
+
+def mod_tau(az,el,lat,D):
+    """
+    Calculate the delay difference from source pointing in seconds for a given angle for large arrays
+    Args:
+        baseline (quantity): Baseline length in meters etc.
+    Returns:
+        tau (quantity): delay in seconds
+    """
+    c = 3e8 *u.m/u.s  # speed of light in m/s
+    baseline = D.to(u.m) # Convert baseline to meters
+    new_bearing = baseline_vector(baseline,az,el,lat)
+    # print(new_bearing.shape)
+    D_eff = np.linalg.norm(new_bearing,axis=0)
+    # print(D_eff.shape)    
+    return D_eff/c
+
+
+
+
+def baseline_nearfield_delay(l1,l2,tau):
+    """
+    Calculate the delay difference from source pointing in seconds for a given angle
+    Args:
+        l1 (quantity): distance to the antenna 1 in distance units
+        l2 (quantity): distance to the antenna 2 in distance units
+        tau (quantity): baseline delay between two antennas in time units
+    Returns:
+        delay (quantity): delay in seconds
+    """
+    c = 3e8 *u.m/u.s  # speed of light in m/s
+    l1 = l1.to(u.m) # Convert distance to meters
+    l2 = l2.to(u.m) # Convert distance to meters
+    
+    return  (l1-l2)/c-tau
+
+def fringe_attenuation(theta, baseline, bandwidth):
+    """
+    Calculate the fringe attenuation for a given angle, baseline, frequency, and bandwidth.
+    Args:
+        theta (quantity): off phase center Angle in radians/degrees etc.
+        baseline (quantity): Baseline east-west component in meters etc.
+        bandwidth (quantity): Bandwidth in Hz etc.
+    """
+    c = 3e8  # speed of light in m/s
+    theta = theta.to(u.rad).value  # Convert angle to radians
+    baseline = baseline.to(u.m).value  # Convert baseline to meters
+    bandwidth = bandwidth.to(u.Hz).value  # Convert bandwidth to Hz
+    return np.sinc(np.sin(theta)*baseline*bandwidth/c)
+
+def fringe_response(delay,frequency):
+    """
+    Calculate the fringe response for a given delay and frequency
+    based on two element equation integration, assuming equal gain
+
+    Args:
+        delay (quantity): delay in seconds
+        frequency (quantity): frequency in Hz
+    Returns:
+        response (quantity): fringe response
+    """
+    delay = delay.to(u.s).value  # Convert delay to seconds
+    frequency = frequency.to(u.Hz).value  # Convert frequency to Hz
+
+    return np.cos(2*np.pi*frequency*delay)
+
+
+def bw_fringe(delays,bwchan,fch1,chan_bin=100):
+    """
+    Calculate the fringe response for a given delay and frequency
+    based on two element equation integration, assuming equal gain.
+    the function takes into the frequency settings and does a integration 
+    over the channel bandwidth and number of channel bins
+    delay array must be 1d array, flatten your input and reshape the output.
+
+    Args:
+        delays (array): delay array in seconds, 
+        bwchan (quantity): channel bandwidth 
+        fch1 (quantity): channel centre frequency
+        chan_bin (int): number of channels in the band
+    Returns:
+        response (float): fringe response
+    """
+    fch1 = fch1.to(u.kHz).value  # Convert frequency to kHz
+    bwchan = bwchan.to(u.kHz).value  # Convert bandwidth to kHz
+    # chan_bin=np.int32(bwchan/0.1) ### the bin number
+    freq_array= np.linspace(fch1-bwchan*0.5,fch1+bwchan*0.5,chan_bin) *u.kHz # 0.1 kHz resolution
+    delays= delays[:,np.newaxis] # add axis to delays
+    freq_array = freq_array[np.newaxis,:]
+    fringes=fringe_response(delays,freq_array)
+    return np.mean(fringes,axis=1)
+
+
+def prx_cnv(pwr,g_rx, outunit=u.W):
+    '''
+    description: Calculates the received power with the receiver gain response. 
+    Uses the observing pointing and source coordinates to determine the gain.
+
+    Parameters:
+        pwr: float
+            power of the signal (Units in dBm)
+        g_rx: float
+            receiver gain response function, 2d array, 1d array for ideal beam is also accepted (Units in dBm)
+        outunit: astropy unit
+            unit of the output power (Default in W)
+    
+    Returns:
+        p_rx: float
+            received power in linear space (Units in W)
+    '''
+
+    p_db = pwr + g_rx
+    p_rx = p_db.to(outunit) ## convert to unit needed
+    return p_rx
+
+def pfd_to_Jy(pfd):
+    '''
+    Description: quick function to convert power flux density from dBm to Jansky
+
+    Parameters:
+    pfd: float
+        power flux density in dB W, dB W/m2/Hz
+    frequency_GHz: float
+
+    Returns:
+    F_Jy: float
+        power flux density in Jansky (Jy), (1 Jy = 10^-26 W/m^2/Hz)
+    '''
+
+    # Convert W/m^2/Hz to W/m^2
+    P_W = 10 ** (pfd / 10)
+
+
+    
+    # Define the reference flux density (1 Jy = 10^-26 W/m^2/Hz)
+    S_0 = 10**-26    
+
+    # Convert W to Jy
+    F_Jy = P_W / S_0 
+    
+    return F_Jy
+
 
 class transmitter_info():
 
@@ -197,7 +450,7 @@ class receiver_info():
         return self.G_rx
 
 class obs_sim():
-    def __init__(self,transmitter,receiver,skygrid,mjds):
+    def __init__(self,receiver,skygrid,mjds):
         '''
         Description: simulate observing programme
 
@@ -212,13 +465,13 @@ class obs_sim():
         skygrid: tuple
             output of the pointgen function from skynet module
         mjds: array
-            2-d mjd array of epochs and observation times using skynet.plantime function
+            mjd array of epochs and observation times using skynet.plantime function
         '''
 
-        self.transmitter = transmitter
+        # self.transmitter = transmitter
         self.receiver = receiver
-        self.ras_bandwidth = receiver.bandwidth
-        self.transmitter.power_tx(self.ras_bandwidth)
+        # self.ras_bandwidth = receiver.bandwidth
+        # self.transmitter.power_tx(self.ras_bandwidth)
         # reformat and reorganise tle array dimension?
         ## in the order of [location,grid cell,antenna pointing per grid, epochs,time,satellite]
         
@@ -226,23 +479,99 @@ class obs_sim():
         self.mjds = mjds
         tel_az, tel_el, self.grid_info = skygrid
         ### add axis for simulation over time and iterations
-        self.tel_az=tel_az[np.newaxis,:,:,np.newaxis,np.newaxis,np.newaxis]
-        self.tel_el=tel_el[np.newaxis,:,:,np.newaxis,np.newaxis,np.newaxis]
+        self.grid_az=tel_az[np.newaxis,:,:,np.newaxis,np.newaxis,np.newaxis]
+        self.grid_el=tel_el[np.newaxis,:,:,np.newaxis,np.newaxis,np.newaxis]
+
+    def azel_track(self,az,el):
+        '''
+        Description: set fixed azimuth and elevation tracking for the telescope
+        Parameters:
+        az: float
+            azimuth of the source (degrees)
+        el: float
+            elevation of the source (degrees)
+        '''
+        ant1 = self.location.flatten()[0]
+        time_2d = Time(self.mjds, format='mjd', scale='utc')
+        loc1 = EarthLocation(lat=ant1.loc.lat, lon=ant1.loc.lon, height=ant1.loc.alt)
+        altaz = AltAz( obstime=time_2d, location=loc1)
+        tel1_pnt = SkyCoord(az,el, unit=(u.deg,u.deg),frame=altaz)
+        self.pnt_coord=tel1_pnt
+        self.pnt_az, self.pnt_el = tel1_pnt.az, tel1_pnt.alt
+        self.altaz_frame=altaz
+        return self.pnt_coord
+
+    def sky_track(self,ra,dec,frame='icrs'):
+
+        '''
+        Description: This function calculates the azimuth and elevation of a celestial ra dec source from the reference antenna location
+
+        Parameters:
+        ra: float/array
+            right ascension of the source (degrees)
+        dec: float/array
+            declination of the source (degrees)
+        frame: str/astropy object
+            frame of the source coordinates, default is ICRS
+            Note: can also input astropy alt az object for az el tracking
+        
+        Returns:
+        tel1_pnt: astropy object
+            azimuth and elevation of the source in the telescope reference frame
+        '''
+        # self.pnt_ra = ra
+        # self.pnt_dec = dec
+        ant1 = self.location.flatten()[0]
+        time_2d = Time(self.mjds, format='mjd', scale='utc')
+        loc1 = EarthLocation(lat=ant1.loc.lat, lon=ant1.loc.lon, height=ant1.loc.alt)
+        altaz = AltAz( obstime=time_2d, location=loc1)
+        skycoord_track=SkyCoord(ra,dec, unit=(u.deg,u.deg),frame=frame)
+        self.pnt_coord=skycoord_track
+        self.altaz_frame=altaz
+        tel1_pnt=skycoord_track.transform_to(altaz)
+        self.pnt_az, self.pnt_el = tel1_pnt.az, tel1_pnt.alt
+        return tel1_pnt
     def load_propagation(self,nparray):
 
         tleprop=np.load(nparray,allow_pickle=True)
+        self.sat_info = tleprop
         #### obtain coordinates in observation frame and satellite frame
         topo_pos_az, topo_pos_el, topo_pos_dist = tleprop['obs_az'], tleprop['obs_el'], tleprop['obs_dist']
         satf_az, satf_el, satf_dist = tleprop['sat_frame_az'], tleprop['sat_frame_el'] , tleprop['sat_frame_dist']
-        self.topo_pos_az = topo_pos_az[np.newaxis,np.newaxis,np.newaxis,np.newaxis,np.newaxis,:]
-        self.topo_pos_el = topo_pos_el[np.newaxis,np.newaxis,np.newaxis,np.newaxis,np.newaxis,:]
-        self.satf_az = satf_az[np.newaxis,np.newaxis,np.newaxis,:]
-        self.satf_el = satfel[np.newaxis,np.newaxis,np.newaxis,:]
-        self.satf_dist = satf_dist[np.newaxis,np.newaxis,np.newaxis,:]
 
+        self.topo_pos_az = topo_pos_az
+        self.topo_pos_el = topo_pos_el
+        self.topo_pos_dist = topo_pos_dist
+        self.satf_az = satf_az
+        self.satf_el = satf_el
+        self.satf_dist = satf_dist
 
+    def reduce_sats(self,el_limit=0):
+        '''
+        Description: This function reduces the number of satellites in the simulation by applying a limit to the elevation angle
+        Parameters:
+        el_limit: float
+            elevation angle limit (degrees)
+        '''
 
-    def populate(self,tles_list):
+        min_el=np.mean(self.topo_pos_el,axis=(0,1,2,3,4))
+        mask = min_el>el_limit
+        # self.sat_info["obs_az"] = self.sat_info["obs_az"][:,:,:,:,:,mask]
+        # self.sat_info["obs_el"] = self.sat_info["obs_el"][:,:,:,:,:,mask]
+        # self.sat_info["obs_dist"] = self.sat_info["obs_dist"][:,:,:,:,:,mask]
+        # self.sat_info["sat_frame_az"] = self.sat_info["sat_frame_az"][:,:,:,:,:,mask]
+        # self.sat_info["sat_frame_el"] = self.sat_info["sat_frame_el"][:,:,:,:,:,mask]
+        # self.sat_info["sat_frame_dist"] = self.sat_info["sat_frame_dist"][:,:,:,:,:,mask]
+
+        self.topo_pos_az = self.topo_pos_az[:,:,:,:,:,mask]
+        self.topo_pos_el = self.topo_pos_el[:,:,:,:,:,mask]
+        self.topo_pos_dist = self.topo_pos_dist[:,:,:,:,:,mask]
+        self.satf_az = self.satf_az[:,:,:,:,:,mask]
+        self.satf_el = self.satf_el[:,:,:,:,:,mask]
+        self.satf_dist = self.satf_dist[:,:,:,:,:,mask]
+        self.elevation_mask = mask
+        
+    def populate(self,tles_list,save=True, savename="satellite_info.npz"):
         '''
         Description: This function populates the observer object with satellite information
 
@@ -251,7 +580,10 @@ class obs_sim():
             list of tle objects (PyTle objects)
         mjds: array
             mjd time of observation
-
+        save: bool
+            save the satellite information to a file to avoid redoing the calculation
+        savename: str
+            name of the file to save the satellite information
         Returns:
         sat_info: cysgp4 Satellite object  
             Satellite class that stores the satellite coordinates and information to the observer object
@@ -265,6 +597,7 @@ class obs_sim():
         print('Obtaining satellite and time information, propagation for large arrays may take a while...')
         result = cysgp4.propagate_many(mjds,tles,observers=observatories,do_eci_pos=True, do_topo=True, do_obs_pos=True, do_sat_azel=True,sat_frame='zxy') 
         print('Done. Satellite coordinates obtained')
+        
         # self.eci_pos = result['eci_pos']
         topo_pos = result['topo']
         sat_azel = result['sat_azel']  ### check cysgp4 for satellite frame orientation description
@@ -273,7 +606,11 @@ class obs_sim():
         self.topo_pos_az, self.topo_pos_el, self.topo_pos_dist, _ = (topo_pos[..., i] for i in range(4))
         
         ### this means azimuth and elevation of the observer, I think the naming is a bit confusing
-        self.sat_az, self.sat_el, self.sat_dist = (sat_azel[..., i] for i in range(3))  
+        self.satf_az, self.satf_el, self.satf_dist = (sat_azel[..., i] for i in range(3))  
+        if save == True:
+            np.savez(savename,obs_az=self.topo_pos_az,obs_el=self.topo_pos_el,obs_dist=self.topo_pos_dist,sat_frame_az=self.satf_az,sat_frame_el=self.satf_el,sat_frame_dist=self.satf_dist)
+        tleprop=np.load(savename,allow_pickle=True)
+        self.sat_info = tleprop
 
     def txbeam_angsep(self,beam_el,beam_az):
         '''
@@ -286,141 +623,109 @@ class obs_sim():
             beam azimuth angle in satellite reference frame
         
         Returns:
-        ang_sep: float
+        txang_sep: float
             angular separation between the satellite pointing and observer in the satellite reference frame
         '''
-        result=self.sat_info
-        self.angsep=sat_frame_pointing(result,beam_el,beam_az)[0]
-        return self.angsep
-    def pwr_on_ground(self,gainfunc,corrections,beam_el,beam_az):
+        self.txangsep=sat_frame_pointing(self.satf_az,self.satf_el,beam_el,beam_az)
+        return self.txangsep
+    def sat_separation(self,mode='tracking',pnt_az=None,pnt_el=None):
         '''
-        Description: Calculate the power of the transmitter on the ground
-
-        Returns:
-        pfd: float
-            power flux density in dBm
-        '''
-
-
-    def g_rx(self,gainfunc):
-        '''
-        Description: Calculate the receiver gain response function
-
+        Description: Calculate the satellite angular separation from telescope pointing
         Parameters:
-        gainfunc: function
-            gain function to be used for the receiver, it should take telescope pointing and source coordinates as input (l1,b1,l2,b2)
-
+        mode: str
+            mode of the simulation, default is 'tracking', other options are 'allsky','pnt'
         Returns:
-        g_rx: float
-            receiver gain response function, 2d array
+        rxang_sep: float
+            angular separation between the satellite pointing and observer in the telescope reference frame
         '''
-        self.g_rx=gainfunc(self.tel_az,self.tel_el,self.topo_pos_az,self.topo_pos_el)
-        return self.g_rx
+        if mode == 'tracking':
+            self.rxang_sep = geometry.true_angular_distance(self.pnt_az, self.pnt_el, self.topo_pos_az*u.deg, self.topo_pos_el *u.deg)
+        elif mode == 'allsky':
+            self.rxang_sep = geometry.true_angular_distance(self.grid_az*u.deg, self.grid_el*u.deg, self.topo_pos_az*u.deg, self.topo_pos_el *u.deg)
+        elif mode == 'pnt':
+            self.rxang_sep = geometry.true_angular_distance(pnt_az*u.deg, pnt_el*u.deg, self.topo_pos_az*u.deg, self.topo_pos_el *u.deg)
+        return self.rxang_sep
+
+    def create_baselines(self):
+        '''
+        Description: Create the baseline pairs array for fringe simulation
+        '''
+        from itertools import combinations
+        antennas = self.receiver.location
+        self.baselines = combinations(range(len(antennas)), 2)
+        self.bearings, self.bearing_D = baseline_pairs(antennas)
+        # self.bearings = self.bearings.reshape(self.location.shape)
+        self.bearing_D = self.bearing_D.reshape(self.location.shape)
+        # self.delays = mod_tau(self.baselines*u.m)
+
+    def baselines_nearfield_delays(self,mode = 'tracking'):
+        '''
+        Description: Calculate the near field delay for the baselines using the satellite positions
+        Args:
+        mode: str
+            mode of the simulation, default is 'tracking', other options are 'allsky'
+        '''
+        '''
+
+        returns:
+        baseline_delays: float
+            delay difference for each baseline at each instance of pointing, returns in whole simulation array format 
+        '''
 
 
+        lat = self.location.flatten()[0].loc.lat
+        l1 = self.topo_pos_dist[0][np.newaxis,:]*u.km
+        if mode == 'tracking':
+            tau1=mod_tau(self.pnt_az,self.pnt_el,lat,self.bearing_D*u.m)
+            self.pnt_tau = tau1
+            self.baseline_delays = baseline_nearfield_delay(l1,self.topo_pos_dist*u.km,tau=tau1)
+        elif mode == 'allsky':
+            tau1=mod_tau(self.grid_az,self.grid_el,lat,self.bearing_D*u.m)
+            self.pnt_tau = tau1
+            self.baseline_delays = baseline_nearfield_delay(l1,self.topo_pos_dist*u.km,tau=tau1)
+        else:
+            raise ValueError("Invalid mode. Choose 'tracking' or 'allsky'.")
+        return self.baseline_delays
     
-   
-    
-    # def calcgain1d(self):
-    #     '''
-    #     Description: Calculate the gain of the transmitter and receiver
+    def sat_fringe(self,bwchan,fch1,chan_bin=100):
+        """
+        Calculate the fringe response for a given delay and frequency
+        based on two element equation integration, assuming equal gain.
+        the function takes into the frequency settings and does a integration with channel bins over the channel bandwidth
 
-    #     Returns:
-    #     pfd: float
-    #         power flux density in dBm
-    #     '''
-    #     self.transmitter.satgain1d(self.angsep)
-    #     self.receiver.antgain1d(tp_el,tp_az,sat_obs_az,sat_obs_el)
-
-
-def sat_frame_pointing(sat_info,beam_el,beam_az):
-    '''
-    Description: Calculate the satellite pointing angle separation to the observer in the satellite reference frame
-
-    Parameters:
-    sat_info: obs_sim object
-        sat_info from obs_sim class populate function
-    beam_el: float
-        beam elevation angle in satellite reference frame zxy, where z is the motion vector
-    beam_az: float  
-        beam azimuth angle in satellite reference frame
-    
-    Returns:
-    ang_sep: float
-        angular separation between the satellite pointing and observer in the satellite reference frame
-    delta_az: float
-        azimuth difference between the satellite pointing and observer in the satellite reference frame
-    delta_el: float
-        elevation difference between the satellite pointing and observer in the satellite reference frame
-    obs_dist: float
-        distance between the observer and the satellite
-    '''
-    result=sat_info
-    # eci_pos = result['eci_pos']
-    # topo_pos = result['topo']
-    sat_azel = result['sat_azel']  ### check cysgp4 for satellite frame orientation description
-
-    # eci_pos_x, eci_pos_y, eci_pos_z = (eci_pos[..., i] for i in range(3))
-    # topo_pos_az, topo_pos_el, topo_pos_dist, _ = (topo_pos[..., i] for i in range(4))
-    sat_az, sat_el, obs_dist = (sat_azel[..., i] for i in range(3))
-
-    #### check numpy braodcasting to fix dimensions
-
-    ang_sep=geometry.true_angular_distance(sat_az*u.deg,sat_el*u.deg,beam_az*u.deg,beam_el*u.deg)
-    delta_az=sat_az-beam_az
-    delta_el=sat_el-beam_el
-    return ang_sep,delta_az,delta_el,obs_dist
+        Args:
+            bwchan (quantity): channel bandwidth 
+            fch1 (quantity): channel centre frequency
+            chan_bin (int): number of channels in the band
+        Returns:
+            response (float): fringe response
+        """
 
 
+        delays= self.baseline_delays.flatten()
+        self.fringes=bw_fringe(delays,bwchan,fch1,chan_bin=chan_bin).reshape(self.baseline_delays.shape)
 
-
-def prx_cnv(pwr,g_rx, outunit=u.W):
-    '''
-    description: Calculates the received power with the receiver gain response. 
-    Uses the observing pointing and source coordinates to determine the gain.
-
-    Parameters:
+        return self.fringes
+    def fringe_signal(self,pwr,g_rx,ant1_idx=0,ant2_idx=1):
+        '''
+        Description: Calculate the power of a specifc baseline using the fringes
+        Parameters:
         pwr: float
-            power of the signal (Units in dBm)
-        g_rx: float
-            receiver gain response function, 2d array, 1d array for ideal beam is also accepted (Units in dBm)
-        outunit: astropy unit
-            unit of the output power (Default in W)
-    
-    Returns:
-        p_rx: float
-            received power in linear space (Units in W)
-    '''
-
-    p_db = pwr + g_rx
-    p_rx = p_db.to(outunit) ## convert to unit needed
-    return p_rx
-
-def pfd_to_Jy(P_dBm):
-    '''
-    Description: quick function to convert power flux density from dBm to Jansky
-
-    Parameters:
-    P_dBm: float
-        power flux density in dBm, dBm/m2/Hz
-    frequency_GHz: float
-
-    Returns:
-    F_Jy: float
-        power flux density in Jansky (Jy), (1 Jy = 10^-26 W/m^2/Hz)
-    '''
-
-    # Convert dBm to mW
-    P_mW = 10 ** (P_dBm / 10)
-
-    # Convert mW to W
-    P_W = P_mW / 1000
-
-    
-    # Define the reference flux density (1 Jy = 10^-26 W/m^2/Hz)
-    S_0 = 10**-26    
-
-    # Convert W to Jy
-    F_Jy = P_W / S_0 
-    
-    return F_Jy
+            power of the signal, linear values only, use 1 for attenuation factor calculation
+        g_rx: quantity
+            receiver gain in source direction during observation (usually cnv.dBi)
+        ant1_idx: int
+            index of the first antenna in the baseline
+        ant2_idx: int
+            index of the second antenna in the baseline
+        
+        Returns:
+        pwr: float
+            power of the signal
+        '''
+        coherent_v_baselines=np.sqrt(pwr*g_rx.to(cnv.dimless)*(self.fringes**2))
+        fringe1 = coherent_v_baselines[ant1_idx]
+        fringe2 = coherent_v_baselines[ant2_idx]
+        pwr = fringe1*fringe2
+        self.fringe_pwr = pwr
+        return pwr
