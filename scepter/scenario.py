@@ -4,7 +4,8 @@ scenario.py
 This module is providing supplemental function to enhance the simulation.
 
 Author: boris.sorokin <mralin@protonmail.com>
-Date: 16-04-2025
+Date of creation: 16-04-2025
+Latest amend date: 11-06-2025; Added logic to read stored data by keyword
 """
 import os
 import h5py
@@ -289,30 +290,81 @@ def store_simulation_results(
                     if unit_to_store is not None:
                         dset.attrs["unit"] = unit_to_store
 
-def read_simulation_results(filename="simulation_results.h5"):
+def read_simulation_results_keywords(
+    filename: str = "simulation_results.h5",
+    *,
+    with_info: bool = False
+):
     """
-    Read all datasets from an HDF5 file, reconstructing quantities when a unit attribute is present.
+    Inspect an HDF5 results file **without loading the data arrays**.
 
-    Each dataset in the file is loaded into memory:
-    - If the dataset has an HDF5 attribute `attrs['unit']`, the raw NumPy array is read
-      and multiplied by `astropy.units.Unit(unit_str)`, yielding an astropy.Quantity.
-    - Otherwise, the data is returned as a plain NumPy array.
+    Parameters
+    ----------
+    filename : str
+        Path to the HDF5 file produced by ``store_simulation_results``.
+    with_info : bool, optional
+        *False* (default)  → return just a list of dataset names.  
+        *True*             → return a dict {name: {'shape', 'dtype', 'unit'}}.
+
+    Returns
+    -------
+    list[str]  *or*  dict
+        • If *with_info=False*: list of dataset names.  
+        • If *with_info=True* : mapping with cheap metadata
+          (array *shape* & *dtype* are header attributes, so no data load;
+          *unit* comes from the dataset's ``attrs`` if present).
+    """
+    result = [] if not with_info else {}
+    with h5py.File(filename, "r") as f:
+        for name, dset in f.items():
+            if with_info:
+                result[name] = dict(
+                    shape=dset.shape,
+                    dtype=str(dset.dtype),
+                    unit=dset.attrs.get("unit", None),
+                )
+            else:
+                result.append(name)
+    return result
+
+def read_simulation_results(
+    filename: str = "simulation_results.h5",
+    *,
+    keywords: list[str] | set[str] | None = None
+):
+    """
+    Read selected datasets from an HDF5 results file.
+
+    Parameters
+    ----------
+    filename : str
+        Path to the HDF5 file.
+    keywords : list / set of str, optional
+        Names of the datasets to load.  
+        • *None* (default) → load **all** datasets.  
+        • Otherwise       → load only those present in *keywords*;
+          silently ignore names that are not found.
 
     Returns
     -------
     results : dict
-        Dictionary mapping each dataset name to either an astropy.Quantity (if a unit
-        attribute was found) or a NumPy array.  Keys correspond to the dataset names
-        as stored in the HDF5 file.
+        Mapping name → data.  Each value is an ``astropy.Quantity`` when a
+        ``unit`` attribute is present, otherwise a NumPy array.
     """
+    want_all = keywords is None
+    if not want_all:
+        keywords = set(keywords)
+
     results = {}
     with h5py.File(filename, "r") as f:
-        for name in f.keys():
-            dset = f[name]
-            data = dset[()]
+        for name, dset in f.items():
+            if not want_all and name not in keywords:
+                continue  # skip unrequested dataset, no I/O incurred
+
+            raw = dset[()]                   # load the (selected) data
             if "unit" in dset.attrs:
                 unit_str = dset.attrs["unit"]
-                results[name] = data * u.Unit(unit_str)
+                results[name] = raw * u.Unit(unit_str)
             else:
-                results[name] = data
+                results[name] = raw
     return results
