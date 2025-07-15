@@ -531,7 +531,17 @@ class obs_sim():
         tel1_pnt=skycoord_track.transform_to(altaz)
         self.pnt_az, self.pnt_el = tel1_pnt.az, tel1_pnt.alt
         return tel1_pnt
+
     def load_propagation(self,nparray):
+        """
+        Description: Load the satellite propagation data from a numpy array file
+        Parameters:
+        nparray: str
+            path to the numpy array file containing the satellite propagation data
+        Returns:
+        tleprop: numpy array
+            numpy array containing the satellite propagation data
+        """
 
         tleprop=np.load(nparray,allow_pickle=True)
         self.sat_info = tleprop
@@ -705,8 +715,8 @@ class obs_sim():
         delays= self.baseline_delays.flatten()
         self.fringes=bw_fringe(delays,bwchan,fch1,chan_bin=chan_bin).reshape(self.baseline_delays.shape)
 
-
         return self.fringes
+
     def fringe_signal(self,pwr,g_rx,ant1_idx=0,ant2_idx=1):
         '''
         Description: Calculate the power of a specifc baseline using the fringes

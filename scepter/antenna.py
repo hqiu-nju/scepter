@@ -13,7 +13,31 @@ from astropy import units as u
 from pycraf import conversions as cnv
 from pycraf.utils import ranged_quantity_input
 from scipy.optimize import root_scalar
+from scipy.special import j1
 
+
+def primary_beam(theta, D, wavelength):
+    """
+    Calculate the primary beam pattern of a single-dish antenna (Airy pattern), using astropy quantities.
+
+    Parameters:
+        theta (Quantity): Angle(s) from beam center (must have angular units)
+        D (Quantity): Dish diameter (must have length units)
+        wavelength (Quantity): Observing wavelength (must have length units)
+
+    Returns:
+        np.ndarray: Primary beam (normalized, max = 1)
+    """
+    # Ensure quantities have correct units
+    theta = theta.to(u.rad)
+    D = D.to(u.m)
+    wavelength = wavelength.to(u.m)
+
+    x = (np.pi * D / wavelength) * np.sin(theta.value)
+    beam = np.ones_like(x)
+    nonzero = (x != 0)
+    beam[nonzero] = (2 * j1(x[nonzero]) / x[nonzero])**2
+    return beam
 
 @ranged_quantity_input(offset_angles = (None, None, u.deg), 
                        Gm = (-500, 500, cnv.dBi), 
