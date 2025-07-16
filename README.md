@@ -30,5 +30,6 @@ Currently, 6 dimensions are used:
 1. nint, the subintegrations during an observation
 1. number of transmitter/satellites
 
-
+Github Repo: https://github.com/hqiu-nju/scepter
+Code will be moving to SKAO Gitlab in the future.
 
