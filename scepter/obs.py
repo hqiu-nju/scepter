@@ -137,7 +137,7 @@ def baseline_vector(d,az,el,lat):
 
 def mod_tau(az,el,lat,D):
     """
-    Calculate the delay difference from source pointing in seconds for a given angle for large arrays
+    Calculate the delay difference from astronomical source pointing in seconds for a given angle for large arrays
     Args:
         baseline (quantity): Baseline length in meters etc.
     Returns:
@@ -636,7 +636,7 @@ class obs_sim():
         txang_sep: float
             angular separation between the satellite pointing and observer in the satellite reference frame
         '''
-        self.txangsep=sat_frame_pointing(self.satf_az,self.satf_el,beam_el,beam_az)
+        self.txangsep,_,_=sat_frame_pointing(self.satf_az,self.satf_el,beam_el,beam_az)
         return self.txangsep
     def sat_separation(self,mode='tracking',pnt_az=None,pnt_el=None):
         '''
