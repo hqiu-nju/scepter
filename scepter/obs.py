@@ -448,6 +448,31 @@ class receiver_info():
         
         self.G_rx = G_rx.reshape(ang_sep.shape)
         return self.G_rx
+    
+    def custom_gain(self,el_source,az_source,el_receiver,az_receiver,gfunc):
+        '''
+        Description: Retrieves gain from basic gain pattern function with angular separation to pointing considered
+
+        Parameters:
+
+        el_source: float
+            elevation angle (deg) of source direction in reference to topocentric coordinates origin (0,0)
+        az_source: float
+            azimuth angle (deg) of source direction in reference to topocentric coordinates origin (0,0)
+        el_receiver: float
+            elevation angle (deg) of receiver direction in reference to topocentric coordinates origin (0,0)
+        az_receiver: float
+            azimuth angle (deg) of receiver direction in reference to topocentric coordinates origin (0,0)
+        gfunc: function
+            gain function to be used for the receiver, it should only take the directional coordinates as input
+
+        Returns:
+        G_tx: float
+            transmitter gain (dBi)
+        '''
+        G_tx=gfunc(el_source,az_source,el_receiver,az_receiver)
+        self.g_tx = G_tx
+        return G_tx
 
 class obs_sim():
     def __init__(self,receiver,skygrid,mjds):
