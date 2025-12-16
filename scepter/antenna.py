@@ -13,31 +13,7 @@ from astropy import units as u
 from pycraf import conversions as cnv
 from pycraf.utils import ranged_quantity_input
 from scipy.optimize import root_scalar
-from scipy.special import j1
 
-
-def primary_beam(theta, D, wavelength):
-    """
-    Calculate the primary beam pattern of a single-dish antenna (Airy pattern), using astropy quantities.
-
-    Parameters:
-        theta (Quantity): Angle(s) from beam center (must have angular units)
-        D (Quantity): Dish diameter (must have length units)
-        wavelength (Quantity): Observing wavelength (must have length units)
-
-    Returns:
-        np.ndarray: Primary beam (normalized, max = 1)
-    """
-    # Ensure quantities have correct units
-    theta = theta.to(u.rad)
-    D = D.to(u.m)
-    wavelength = wavelength.to(u.m)
-
-    x = (np.pi * D / wavelength) * np.sin(theta.value)
-    beam = np.ones_like(x)
-    nonzero = (x != 0)
-    beam[nonzero] = (2 * j1(x[nonzero]) / x[nonzero])**2
-    return beam
 
 @ranged_quantity_input(offset_angles = (None, None, u.deg), 
                        Gm = (-500, 500, cnv.dBi), 
@@ -167,60 +143,121 @@ def s_1528_rec1_2_pattern(offset_angles,
 
     return gains, Gm, psi_b
 
-def calculate_3dB_angle_1d(antenna_gain_func: callable = s_1528_rec1_2_pattern, 
+def calculate_beamwidth_1d(antenna_gain_func: callable = s_1528_rec1_2_pattern,
+                           level_drop: float | u.Quantity = 3.0 * cnv.dB, 
                            **antenna_pattern_kwargs) -> u.Quantity:
     """
-    Calculates the -3 dB beamwidth angle for a given antenna pattern function with radial symmetry and maximum gain in the main axis direction.
-    
+    Calculates the 1D beamwidth for a given antenna pattern function with
+    radial symmetry and maximum gain in the main axis direction, at an 
+    arbitrary level drop (default: 3 dB) from the peak.
+
     Parameters
     ----------
-    antenna_gain_func : callable
+    antenna_gain_func : callable, optional
         Function that returns the antenna gain given an angle.
+        It must accept `theta` (astropy.units.Quantity in degrees) as the
+        first positional argument and may accept additional keyword 
+        arguments passed via `antenna_pattern_kwargs`.
+        The function may return either:
+        - a single astropy.units.Quantity (gain in dBi), or
+        - a tuple/list whose first element is the gain (dBi).
+    level_drop : float or astropy.units.Quantity, optional
+        Level drop (in dB) relative to the maximum gain at boresight.
+        For a -3 dB beamwidth, use 3 or 3 * cnv.dB (default).
+        For a -15 dB beamwidth, use 15 or 15 * cnv.dB.
+        The sign is ignored (i.e. -3 and 3 give the same result).
     antenna_pattern_kwargs : dict
-        Additional keyword arguments for the antenna gain function.
-    
+        Additional keyword arguments forwarded to `antenna_gain_func`.
+
     Returns
     -------
-    theta_3dB : astropy.units.Quantity
-        The -3 dB beamwidth angle in degrees.
+    theta_bw : astropy.units.Quantity
+        The full beamwidth (2 * theta_cross) corresponding to the given
+        level drop, in degrees.
+
+    Notes
+    -----
+    - Assumes the pattern is symmetric around boresight and the main lobe
+      maximum is at theta = 0 deg.
+    - Uses a 1D root-finding (Brent's method) between 0 and 90 deg to find
+      the first crossing with the target level on one side of the main lobe,
+      then doubles that angle to obtain the full beamwidth.
     """
+    # --- Normalize level_drop to a positive dB quantity ---
+    if not isinstance(level_drop, u.Quantity):
+        level_drop = np.abs(level_drop) * cnv.dB
+    level_drop = np.abs(level_drop.value)*level_drop.unit
+
+    # --- Get maximum gain at boresight (theta = 0 deg) ---
     try:
         gain_result = antenna_gain_func(0 * u.deg, **antenna_pattern_kwargs)
+
         if isinstance(gain_result, (tuple, list)):
             Gmax_dBi = gain_result[0]
         else:
             Gmax_dBi = gain_result
+
         if not isinstance(Gmax_dBi, u.Quantity):
             Gmax_dBi = Gmax_dBi * cnv.dBi
+
         Gmax_dBi = Gmax_dBi.to(cnv.dBi)
     except Exception as e:
-        raise ValueError(f"Could not get Gmax: {e}") from e
+        raise ValueError(f"Could not get Gmax from antenna pattern: {e}") from e
 
-    G_target_dBi = Gmax_dBi - 3.0 * cnv.dB
+    # Target gain = Gmax - level_drop (e.g. Gmax - 3 dB, Gmax - 15 dB, ...)
+    G_target_dBi = Gmax_dBi - level_drop
 
-    def gain_diff(angle_deg_scalar):
+    def gain_diff(angle_deg_scalar: float) -> float:
+        """
+        Difference between gain(theta) and target level at a scalar angle (deg).
+        Used by the root-finder; returns a plain float.
+        """
         try:
             gain_val = antenna_gain_func(angle_deg_scalar * u.deg, **antenna_pattern_kwargs)
+
             if isinstance(gain_val, (tuple, list)):
                 current_gain_dBi = gain_val[0]
             else:
                 current_gain_dBi = gain_val
+
             if not isinstance(current_gain_dBi, u.Quantity):
                 current_gain_dBi = current_gain_dBi * cnv.dBi
+
             current_gain_dBi = current_gain_dBi.to(cnv.dBi)
+
             diff = (current_gain_dBi - G_target_dBi).value
+
+            # Protect the root-finder from NaNs / infs
             return diff if np.isfinite(diff) else 1e9
+
         except Exception:
+            # If pattern evaluation fails, return a large value so root-finder
+            # avoids this region.
             return 1e9
 
+    # --- Find first crossing with target level and double it ---
     try:
-        sol = root_scalar(gain_diff, bracket=[1e-9, 90.0], method='brentq')
+        # You can make this bracket configurable if нужно
+        bracket = (1e-9, 90.0)
+
+        sol = root_scalar(gain_diff, bracket=bracket, method='brentq')
+
         if not sol.converged:
-            raise RuntimeError(f"-3dB root finding failed: {sol.flag}")
-        theta_3dB = sol.root * u.deg
-        return theta_3dB
+            drop_val = level_drop.to(cnv.dB).value
+            raise RuntimeError(
+                f"Root finding for -{drop_val:.3g} dB beamwidth failed: {sol.flag}"
+            )
+
+        theta_bw = 2 * sol.root * u.deg
+        return theta_bw
+
     except Exception as e:
-        raise RuntimeError(f"Finding -3dB angle failed: {e}")
+        drop_val = level_drop.to(cnv.dB).value
+        raise RuntimeError(
+            f"Finding beamwidth for -{drop_val:.3g} dB level failed: {e}"
+        ) from e
+    
+
 # ------------------------------------------------------------------------
 #  ITU-R S.1528  |  Recommends 1-4 : circular-aperture Taylor envelope
 # ------------------------------------------------------------------------
@@ -249,7 +286,6 @@ def s_1528_rec1_4_pattern_amend(
     mu_roots: np.ndarray | None = None,
     return_extras: bool = False):
     """
-    Very-detailed (toddler-level) explanation
     -----------------------------------------
 
     *Purpose*  

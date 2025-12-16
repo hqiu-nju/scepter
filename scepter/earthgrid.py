@@ -20,7 +20,7 @@ from astropy.constants import R_earth
 from pycraf import conversions as cnv
 from pycraf.utils import ranged_quantity_input
 from pycraf import geometry, pathprof
-from scepter.antenna import calculate_3dB_angle_1d
+from scepter.antenna import calculate_beamwidth_1d
 from functools import lru_cache
 
 
@@ -38,6 +38,8 @@ def calculate_footprint_size(
     altitude: u.Quantity,
     off_nadir_angle: u.Quantity = 0 * u.deg,
     earth_model: str = 'spherical',
+    theta: None | u.Quantity = None,
+    level_drop: float | u.Quantity = 3.0 * cnv.dB, 
     **antenna_pattern_kwargs
 ) -> u.Quantity:
     """
@@ -147,7 +149,14 @@ def calculate_footprint_size(
     off_nadir_angle = off_nadir_angle.to(u.deg)
     
     try:
-        theta_3dB = calculate_3dB_angle_1d(antenna_gain_func, **antenna_pattern_kwargs)
+        if theta is None:
+            theta_3dB = calculate_beamwidth_1d(antenna_gain_func, level_drop=level_drop,
+                                               **antenna_pattern_kwargs)
+        else:
+            theta_3dB=theta
+
+
+        
     except Exception as e:
         warnings.warn(f"Finding -3dB angle failed: {e}", RuntimeWarning)
         return np.nan * u.m
@@ -348,23 +357,27 @@ def generate_hexgrid_full(point_spacing):
     
     grid_longitudes = np.concatenate([np.array([0]), np.hstack(plons), np.array([0])])
     grid_latitudes = np.concatenate([np.array([90]), np.hstack(plats), np.array([-90])])
-    return grid_longitudes, grid_latitudes, grid_spacing
+    return grid_longitudes * u.deg, grid_latitudes * u.deg, grid_spacing * u.deg
 
 @ranged_quantity_input(
+    grid_longitudes=(None,None,u.deg),
+    grid_latitudes=(None,None,u.deg),
     sat_altitude=(1, None, u.km),
     min_elevation=(0, 90, u.deg),
+    station_lat=(None,None,u.deg),
+    station_lon=(None,None,u.deg),
     strip_input_units=False,
     allow_none=True
 )
 def trunc_hexgrid_to_impactful(grid_longitudes, grid_latitudes, sat_altitude, min_elevation, 
-                               station_lat, station_lon, station_height):
+                               station_lat, station_lon, station_height=None):
     """
     Truncates a full hexagon grid to only those cells that are potentially served by
     satellites positioned up to the horizon circle (i.e. barely visible) from a given
     radio astronomy station.
     
     For a station at (station_lat, station_lon) with a specified satellite altitude,
-    the station’s horizon angle is computed as:
+    the station's horizon angle is computed as:
     
         θₕ = arccos(R_earth / (R_earth + sat_altitude))
     
@@ -405,8 +418,8 @@ def trunc_hexgrid_to_impactful(grid_longitudes, grid_latitudes, sat_altitude, mi
     # Convert station and grid cell coordinates to radians.
     station_lat_rad = station_lat.to(u.rad).value
     station_lon_rad = station_lon.to(u.rad).value
-    grid_lats_rad = np.radians(grid_latitudes)
-    grid_lons_rad = np.radians(grid_longitudes)
+    grid_lats_rad = grid_latitudes.to(u.rad).value
+    grid_lons_rad = grid_longitudes.to(u.rad).value
     
     # Compute angular separation δ (in radians) using the spherical law of cosines.
     cos_delta = (np.sin(station_lat_rad) * np.sin(grid_lats_rad) +
