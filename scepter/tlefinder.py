@@ -114,12 +114,7 @@ class TLEfinder():
         '''
         Run the propagator for the best dates
 
-        Parameters
-        ----------
-        mjds : numpy array
-            array of mjd date
-        best_tle : numpy array
-            Array of the TLEs, should be 2d array to match bestdates [n_dates,n_tles]
+
         '''
         self.satinfo = propagate_satellites_from_SKAO_database(self.obs,self.mjds,self.best_tle,geteci=geteci,getsat=getsat)
 

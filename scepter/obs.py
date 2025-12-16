@@ -137,7 +137,7 @@ def baseline_vector(d,az,el,lat):
 
 def mod_tau(az,el,lat,D):
     """
-    Calculate the delay difference from source pointing in seconds for a given angle for large arrays
+    Calculate the delay difference from astronomical source pointing in seconds for a given angle for large arrays
     Args:
         baseline (quantity): Baseline length in meters etc.
     Returns:
@@ -448,6 +448,31 @@ class receiver_info():
         
         self.G_rx = G_rx.reshape(ang_sep.shape)
         return self.G_rx
+    
+    def custom_gain(self,el_source,az_source,el_receiver,az_receiver,gfunc):
+        '''
+        Description: Retrieves gain from basic gain pattern function with angular separation to pointing considered
+
+        Parameters:
+
+        el_source: float
+            elevation angle (deg) of source direction in reference to topocentric coordinates origin (0,0)
+        az_source: float
+            azimuth angle (deg) of source direction in reference to topocentric coordinates origin (0,0)
+        el_receiver: float
+            elevation angle (deg) of receiver direction in reference to topocentric coordinates origin (0,0)
+        az_receiver: float
+            azimuth angle (deg) of receiver direction in reference to topocentric coordinates origin (0,0)
+        gfunc: function
+            gain function to be used for the receiver, it should only take the directional coordinates as input
+
+        Returns:
+        G_tx: float
+            transmitter gain (dBi)
+        '''
+        G_tx=gfunc(el_source,az_source,el_receiver,az_receiver)
+        self.g_tx = G_tx
+        return G_tx
 
 class obs_sim():
     def __init__(self,receiver,skygrid,mjds):
@@ -531,7 +556,17 @@ class obs_sim():
         tel1_pnt=skycoord_track.transform_to(altaz)
         self.pnt_az, self.pnt_el = tel1_pnt.az, tel1_pnt.alt
         return tel1_pnt
+
     def load_propagation(self,nparray):
+        """
+        Description: Load the satellite propagation data from a numpy array file
+        Parameters:
+        nparray: str
+            path to the numpy array file containing the satellite propagation data
+        Returns:
+        tleprop: numpy array
+            numpy array containing the satellite propagation data
+        """
 
         tleprop=np.load(nparray,allow_pickle=True)
         self.sat_info = tleprop
@@ -626,7 +661,7 @@ class obs_sim():
         txang_sep: float
             angular separation between the satellite pointing and observer in the satellite reference frame
         '''
-        self.txangsep=sat_frame_pointing(self.satf_az,self.satf_el,beam_el,beam_az)
+        self.txangsep,_,_=sat_frame_pointing(self.satf_az,self.satf_el,beam_el,beam_az)
         return self.txangsep
     def sat_separation(self,mode='tracking',pnt_az=None,pnt_el=None):
         '''
@@ -705,8 +740,8 @@ class obs_sim():
         delays= self.baseline_delays.flatten()
         self.fringes=bw_fringe(delays,bwchan,fch1,chan_bin=chan_bin).reshape(self.baseline_delays.shape)
 
-
         return self.fringes
+
     def fringe_signal(self,pwr,g_rx,ant1_idx=0,ant2_idx=1):
         '''
         Description: Calculate the power of a specifc baseline using the fringes
