@@ -57,17 +57,21 @@ class TLEfinder():
         best_tle_file : numpy array
             array containing tle file names
         '''
-        useddates = []
-
-
-        for i in mjd:
-            bestdate = np.argmin(np.abs(self.filedates - i))
-            useddates.append(bestdate)
-
+        # Vectorize the argmin computation for better performance
+        mjd_array = np.asarray(mjd)
+        filedates_array = np.asarray(self.filedates)
+        
+        # Compute all argmin at once using broadcasting
+        # Note: For very large datasets (len(mjd) * len(filedates) > 10^7), 
+        # consider using np.searchsorted if filedates are sorted, or 
+        # process in chunks to reduce memory usage
+        # Shape: (len(mjd), len(filedates))
+        diffs = np.abs(filedates_array[np.newaxis, :] - mjd_array[:, np.newaxis])
+        useddates = np.argmin(diffs, axis=1)
 
         useddate_idx = np.unique(useddates)
         used_tles = [self.pytles_by_date[i] for i in useddate_idx]
-        used_dates = [self.filedates[i] for i in useddate_idx]
+        used_dates = np.asarray([self.filedates[i] for i in useddate_idx])
         used_tle_files = [self.tle_files[i] for i in useddate_idx]
         check_len = np.array([len(i) for i in used_tles])
         cnts = np.unique(check_len)
@@ -98,17 +102,16 @@ class TLEfinder():
             ### remove the extra elements from the line in best_tle
             used_tles_array.append(line[remask])
         used_tles_array=np.array(used_tles_array)
-        bestdate_idx = []
-        best_tle = []
-        best_tle_file = []
-        for i in mjd:
-            bestdate = np.argmin(np.abs(used_dates - i))
-            bestdate_idx.append(bestdate)
-            best_tle.append(used_tles_array[bestdate])
-            best_tle_file.append(used_tle_files[bestdate])
+        
+        # Vectorize the second argmin computation
+        # Note: used_dates is typically much smaller after filtering
+        diffs2 = np.abs(used_dates[np.newaxis, :] - mjd_array[:, np.newaxis])
+        bestdate_idx = np.argmin(diffs2, axis=1)
+        best_tle = used_tles_array[bestdate_idx]
+        best_tle_file = np.array([used_tle_files[i] for i in bestdate_idx])
         # Find the length of the best tles and check if they are consistent
 
-        return np.array(bestdate_idx),np.array(best_tle),np.array(best_tle_file)
+        return bestdate_idx, best_tle, best_tle_file
 
     def run_propagator(self,geteci=False,getsat=True):
         '''

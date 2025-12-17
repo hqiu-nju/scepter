@@ -6,3 +6,8 @@ scepter.egg-info/top_level.txt
 notebooks/starlink_100.npz
 notebooks/oneweb_1ms.npz
 .DS_Store
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python

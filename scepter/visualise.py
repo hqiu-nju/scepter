@@ -73,14 +73,19 @@ def _s1586_cells() -> tuple[np.ndarray, ...]:
     """
     el_edges = np.arange(0, 90 + 3, 3, dtype=np.float64)
     n_rings = el_edges.size - 1
+    
+    # Pre-compute expected cell counts and validate total
+    expected = [120]*10 + [90]*6 + [72]*3 + [60]*3 + [45, 40, 36, 30, 20, 15, 9, 3]
+    total_cells = sum(expected)  # 2334
+    
+    # Pre-allocate arrays for better performance
+    az_lo = np.empty(total_cells, dtype=np.float64)
+    az_hi = np.empty(total_cells, dtype=np.float64)
+    el_lo = np.empty(total_cells, dtype=np.float64)
+    el_hi = np.empty(total_cells, dtype=np.float64)
+    cells_per_ring = np.empty(n_rings, dtype=np.int32)
 
-    az_lo: List[float] = []
-    az_hi: List[float] = []
-    el_lo: List[float] = []
-    el_hi: List[float] = []
-    cells_per_ring: List[int] = []
-
-    total = 0
+    idx = 0
     for i in range(n_rings):
         el0 = float(el_edges[i])
         el1 = float(el_edges[i + 1])
@@ -88,24 +93,24 @@ def _s1586_cells() -> tuple[np.ndarray, ...]:
         if step is None or (360 % step) != 0:
             raise RuntimeError(f"Bad azimuth step at ring starting {el0}°.")
         n = 360 // step
-        cells_per_ring.append(n)
+        cells_per_ring[i] = n
         az_edges = np.arange(n + 1, dtype=np.float64) * step
-        for j in range(n):
-            az_lo.append(float(az_edges[j]))
-            az_hi.append(float(az_edges[j + 1]))
-            el_lo.append(el0)
-            el_hi.append(el1)
-        total += n
+        
+        # Vectorized assignment instead of loop appends
+        az_lo[idx:idx+n] = az_edges[:-1]
+        az_hi[idx:idx+n] = az_edges[1:]
+        el_lo[idx:idx+n] = el0
+        el_hi[idx:idx+n] = el1
+        idx += n
 
     # Guardrail against accidental changes: row counts must match the table.
-    expected = [120]*10 + [90]*6 + [72]*3 + [60]*3 + [45, 40, 36, 30, 20, 15, 9, 3]
-    if (cells_per_ring != expected) or (total != 2334):
+    if not np.array_equal(cells_per_ring, expected) or idx != total_cells:
         raise RuntimeError("S.1586 ring/cell construction mismatch.")
 
     return (
-        np.array(az_lo), np.array(az_hi),
-        np.array(el_lo), np.array(el_hi),
-        el_edges, np.array(cells_per_ring),
+        az_lo, az_hi,
+        el_lo, el_hi,
+        el_edges, cells_per_ring,
     )
 
 
@@ -251,8 +256,10 @@ def _subset_indices_from_grid_info(gi: np.ndarray) -> np.ndarray:
 
     el_lo_clip = gi["cell_lat_low"].astype(float)
     ring_low = np.minimum(np.floor(el_lo_clip / 3.0) * 3.0, 87.0).astype(int)
-    ring_idx = np.array([ring_to_idx[int(rl)] for rl in ring_low], int)
-    step = np.array([_S1586_AZ_STEPS[int(rl)] for rl in ring_low], int)
+    # Vectorized lookup using numpy's vectorize for dictionary lookup
+    # All keys should exist due to clamping, but provide defaults for safety
+    ring_idx = np.array([ring_to_idx.get(int(rl), 0) for rl in ring_low], dtype=int)
+    step = np.array([_S1586_AZ_STEPS.get(int(rl), 3) for rl in ring_low], dtype=int)
     n_in_ring = cells_per_ring[ring_idx]
 
     az_lo = gi["cell_lon_low"].astype(float)
