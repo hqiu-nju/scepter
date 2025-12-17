@@ -1363,7 +1363,7 @@ class receiver_info():
     obs_sim : Main observation simulation class
     pycraf.antenna.ras_pattern : Underlying antenna pattern function
     """
-    def __init__(self,d_rx,eta_a_rx,pyobs,freq,bandwidth,tsys=20*u.k):
+    def __init__(self,d_rx,eta_a_rx,pyobs,freq,bandwidth,tsys=20*u.K):
         """
         Initialize receiver information object.
         
