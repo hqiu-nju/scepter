@@ -2117,19 +2117,62 @@ class obs_sim():
         self.sat_info = tleprop
 
     def txbeam_angsep(self,beam_el,beam_az):
-        '''
-        Description: Calculate the satellite pointing angle separation to the observer in the satellite reference frame
-
-        Parameters:
-        beam_el: float
-            beam elevation angle in satellite reference frame zxy, where z is the motion vector
-        beam_az: float  
-            beam azimuth angle in satellite reference frame
+        """
+        Calculate angular separation in satellite transmitter reference frame.
         
-        Returns:
-        txang_sep: float
-            angular separation between the satellite pointing and observer in the satellite reference frame
-        '''
+        Computes the angular separation between the satellite's beam pointing
+        direction and the observer's position, as measured in the satellite's
+        body-fixed reference frame. This determines the transmitter antenna
+        gain towards the observer.
+        
+        Parameters
+        ----------
+        beam_el : float
+            Beam elevation angle in satellite reference frame (degrees)
+            ZXY convention: Z = velocity vector
+        beam_az : float
+            Beam azimuth angle in satellite reference frame (degrees)
+        
+        Returns
+        -------
+        txangsep : astropy.Quantity
+            Angular separation between beam and observer (degrees)
+            Shape matches simulation dimensions
+        
+        Attributes Set
+        --------------
+        txangsep : astropy.Quantity
+            Stored angular separations
+        
+        Notes
+        -----
+        Uses satellite frame coordinates (satf_az, satf_el) set by populate()
+        or load_propagation().
+        
+        The satellite frame (ZXY):
+        - Z-axis: Velocity vector (orbital motion direction)
+        - X-axis: Perpendicular to velocity in orbital plane
+        - Y-axis: Roughly radial (toward/away from Earth)
+        
+        This is used to determine transmitter gain G_tx(θ) from the
+        transmitter_info.satgain1d or custom_gain methods.
+        
+        Examples
+        --------
+        >>> sim = obs_sim(receiver, skygrid, mjds)
+        >>> sim.populate(tles)
+        >>> 
+        >>> # Nadir-pointing beam (toward Earth)
+        >>> sep_nadir = sim.txbeam_angsep(beam_el=-90, beam_az=0)
+        >>> 
+        >>> # Forward-pointing beam
+        >>> sep_forward = sim.txbeam_angsep(beam_el=0, beam_az=0)
+        
+        See Also
+        --------
+        sat_frame_pointing : Underlying calculation
+        transmitter_info.satgain1d : Calculate gain from separation
+        """
         self.txangsep,_,_=sat_frame_pointing(self.satf_az,self.satf_el,beam_el,beam_az)
         return self.txangsep
     def sat_separation(self,mode='tracking',pnt_az=None,pnt_el=None):
@@ -2227,9 +2270,61 @@ class obs_sim():
         return self.rxang_sep
 
     def create_baselines(self):
-        '''
-        Description: Create the baseline pairs array for fringe simulation
-        '''
+        """
+        Initialize baseline arrays for interferometric array observations.
+        
+        Calculates all baseline pairs, vectors, and lengths for the antenna
+        array. This is required before performing interferometric fringe
+        calculations. The method computes physical baselines in ITRF2008
+        coordinates from the observer locations.
+        
+        Attributes Set
+        --------------
+        baselines : itertools.combinations object
+            All unique antenna pairs (i, j) where i < j
+        bearings : array
+            Baseline vectors in ITRF2008 coordinates (meters)
+            Shape: [n_antennas, 3] for [X, Y, Z] components
+        bearing_D : array
+            Baseline lengths (meters)
+            Reshaped to match simulation dimensions
+        
+        Notes
+        -----
+        This method must be called before:
+        - baselines_nearfield_delays()
+        - sat_fringe()
+        - fringe_signal()
+        
+        The baseline calculations use the reference antenna (first in the array)
+        as the origin. All baselines are measured from this reference.
+        
+        Baseline pairs are generated using itertools.combinations to avoid
+        duplicate baselines (i.e., only (i,j) not (j,i) for i < j).
+        
+        Examples
+        --------
+        >>> # Setup interferometric array
+        >>> observers = [PyObserver(...) for _ in range(4)]  # 4 antennas
+        >>> receiver = receiver_info(..., pyobs=np.array(observers), ...)
+        >>> sim = obs_sim(receiver, skygrid, mjds)
+        >>> sim.populate(tles)
+        >>> 
+        >>> # Calculate baselines
+        >>> sim.create_baselines()
+        >>> print(f"Number of antennas: {len(observers)}")
+        >>> print(f"Baseline lengths: {sim.bearing_D}")
+        >>> 
+        >>> # Continue with fringe calculations
+        >>> sim.baselines_nearfield_delays(mode='tracking')
+        >>> sim.sat_fringe(bwchan=10*u.MHz, fch1=1420*u.MHz)
+        
+        See Also
+        --------
+        baseline_pairs : Underlying calculation
+        baselines_nearfield_delays : Calculate geometric delays
+        sat_fringe : Calculate fringe patterns
+        """
         from itertools import combinations
         antennas = self.receiver.location
         self.baselines = combinations(range(len(antennas)), 2)
@@ -2239,18 +2334,85 @@ class obs_sim():
         # self.delays = mod_tau(self.baselines*u.m)
 
     def baselines_nearfield_delays(self,mode = 'tracking'):
-        '''
-        Description: Calculate the near field delay for the baselines using the satellite positions
-        Args:
-        mode: str
-            mode of the simulation, default is 'tracking', other options are 'allsky'
-        '''
-        '''
-
-        returns:
-        baseline_delays: float
-            delay difference for each baseline at each instance of pointing, returns in whole simulation array format 
-        '''
+        """
+        Calculate near-field geometric delays for all baselines.
+        
+        Computes the differential time delays between antennas in an
+        interferometric array when observing satellites. Accounts for both
+        far-field geometric delays and near-field wavefront curvature effects.
+        
+        This is essential for accurate interferometric observations of satellites,
+        where the near-field corrections can be significant due to the finite
+        distance to the source.
+        
+        Parameters
+        ----------
+        mode : str, optional
+            Observation mode (default: 'tracking')
+            Options:
+            - 'tracking': Use telescope pointing from sky_track or azel_track
+            - 'allsky': Use sky grid pointings
+        
+        Returns
+        -------
+        baseline_delays : array
+            Geometric delays for each baseline (seconds)
+            Shape: matches simulation dimensions
+            [locations, grid_cells, pointings, epochs, times, satellites]
+        
+        Attributes Set
+        --------------
+        pnt_tau : astropy.Quantity
+            Far-field geometric delays for the pointing direction
+        baseline_delays : array
+            Total delays including near-field corrections
+        
+        Notes
+        -----
+        The calculation proceeds in two steps:
+        1. Far-field delay: τ_ff = (D · s) / c
+           where D is baseline vector, s is source unit vector
+        2. Near-field correction: τ_nf = (|r1 - r_sat| - |r2 - r_sat|) / c
+           where r1, r2 are antenna positions, r_sat is satellite position
+        
+        Near-field effects are significant when:
+            D² / (8 * d_sat) ≳ λ
+        where D = baseline, d_sat = satellite distance, λ = wavelength
+        
+        For LEO satellites (500-2000 km) and baselines >100 m, near-field
+        corrections are typically important.
+        
+        The method uses:
+        - Observer location (latitude) for coordinate transformations
+        - Satellite distances from propagation data
+        - Pointing direction (from mode parameter)
+        - Baseline vectors (from create_baselines)
+        
+        Examples
+        --------
+        >>> # Setup and calculate delays
+        >>> sim = obs_sim(receiver, skygrid, mjds)
+        >>> sim.populate(tles)
+        >>> sim.sky_track(ra=0, dec=45)
+        >>> sim.create_baselines()
+        >>> 
+        >>> # Calculate near-field delays
+        >>> delays = sim.baselines_nearfield_delays(mode='tracking')
+        >>> print(f"Delay range: {delays.min():.2e} to {delays.max():.2e} seconds")
+        >>> 
+        >>> # Typical delay for 1 km baseline, 500 km satellite
+        >>> # Expected: ~10 nanoseconds to ~10 microseconds
+        >>> 
+        >>> # All-sky mode
+        >>> delays_allsky = sim.baselines_nearfield_delays(mode='allsky')
+        
+        See Also
+        --------
+        create_baselines : Initialize baseline arrays
+        baseline_nearfield_delay : Underlying delay calculation
+        mod_tau : Far-field geometric delay
+        sat_fringe : Use delays to calculate fringes
+        """
 
 
         lat = self.location.flatten()[0].loc.lat
@@ -2269,16 +2431,85 @@ class obs_sim():
     
     def sat_fringe(self,bwchan,fch1,chan_bin=100):
         """
-        Calculate the fringe response for a given delay and frequency
-        based on two element equation integration, assuming equal gain.
-        the function takes into the frequency settings and does a integration with channel bins over the channel bandwidth
-
-        Args:
-            bwchan (quantity): channel bandwidth 
-            fch1 (quantity): channel centre frequency
-            chan_bin (int): number of channels in the band
-        Returns:
-            response (float): fringe response
+        Calculate fringe patterns for satellite observations.
+        
+        Computes the bandwidth-averaged fringe response for all baselines,
+        satellites, and time steps. Integrates the fringe response across
+        the observing bandwidth to account for bandwidth smearing effects.
+        
+        This method must be called after baselines_nearfield_delays() to
+        use the computed geometric delays.
+        
+        Parameters
+        ----------
+        bwchan : astropy.Quantity
+            Channel bandwidth for integration (Hz, kHz, MHz)
+        fch1 : astropy.Quantity
+            Channel center frequency (Hz, kHz, MHz)
+        chan_bin : int, optional
+            Number of frequency bins for bandwidth integration (default: 100)
+            Higher values give more accurate results but slower computation
+        
+        Returns
+        -------
+        fringes : array
+            Fringe amplitude patterns (dimensionless, range: -1 to +1)
+            Shape matches simulation dimensions
+            Positive values: constructive interference
+            Negative values: destructive interference
+        
+        Attributes Set
+        --------------
+        fringes : array
+            Computed fringe patterns
+        
+        Notes
+        -----
+        The fringe response is:
+            F(τ, f) = <cos(2π f τ)>_bandwidth
+        where τ is the geometric delay, and the average is over the
+        channel bandwidth.
+        
+        Bandwidth smearing reduces fringe amplitude when:
+            Δf * τ ≳ 1
+        where Δf is the channel bandwidth.
+        
+        For satellite observations:
+        - Near-field delays can be large (microseconds)
+        - Wide bandwidths cause significant smearing
+        - Narrow channels preserve fringe amplitude better
+        
+        This method flattens the delay array, computes fringes efficiently,
+        then reshapes to the original dimensions.
+        
+        Examples
+        --------
+        >>> # Calculate fringes for L-band observation
+        >>> sim = obs_sim(receiver, skygrid, mjds)
+        >>> sim.populate(tles)
+        >>> sim.sky_track(ra=0, dec=45)
+        >>> sim.create_baselines()
+        >>> sim.baselines_nearfield_delays(mode='tracking')
+        >>> 
+        >>> # Compute fringe patterns
+        >>> fringes = sim.sat_fringe(
+        ...     bwchan=10*u.MHz,
+        ...     fch1=1420*u.MHz,
+        ...     chan_bin=100
+        ... )
+        >>> print(f"Fringe amplitude range: {fringes.min():.3f} to {fringes.max():.3f}")
+        >>> 
+        >>> # Narrow band (less smearing)
+        >>> fringes_narrow = sim.sat_fringe(bwchan=100*u.kHz, fch1=1420*u.MHz)
+        >>> 
+        >>> # Wide band (more smearing)
+        >>> fringes_wide = sim.sat_fringe(bwchan=100*u.MHz, fch1=1420*u.MHz)
+        
+        See Also
+        --------
+        baselines_nearfield_delays : Calculate delays (must run first)
+        bw_fringe : Underlying bandwidth integration
+        fringe_signal : Combine fringes with power and gain
         """
 
 
@@ -2288,22 +2519,93 @@ class obs_sim():
         return self.fringes
 
     def fringe_signal(self,pwr,g_rx,ant1_idx=0,ant2_idx=1):
-        '''
-        Description: Calculate the power of a specifc baseline using the fringes
-        Parameters:
-        pwr: float
-            power of the signal, linear values only, use 1 for attenuation factor calculation
-        g_rx: quantity
-            receiver gain in source direction during observation (usually cnv.dBi)
-        ant1_idx: int
-            index of the first antenna in the baseline
-        ant2_idx: int
-            index of the second antenna in the baseline
+        """
+        Calculate interferometric power for a specific baseline.
         
-        Returns:
-        pwr: float
-            power of the signal
-        '''
+        Combines incident power, receiver gain, and fringe patterns to compute
+        the correlated power for a two-element baseline. This represents the
+        actual interferometric signal that would be measured by a correlator.
+        
+        The calculation assumes:
+        - Equal effective collecting areas
+        - Coherent integration
+        - Two-element correlation (can extend to more baselines)
+        
+        Parameters
+        ----------
+        pwr : float or array
+            Incident power at the receivers (linear units, not dB)
+            Can be dimensionless for relative calculations (use 1.0)
+            Or actual power values from link budget
+        g_rx : astropy.Quantity
+            Receiver antenna gain in source direction (dBi or dimless)
+            From receiver_info.antgain1d() or custom_gain()
+        ant1_idx : int, optional
+            Index of first antenna in baseline (default: 0)
+        ant2_idx : int, optional
+            Index of second antenna in baseline (default: 1)
+        
+        Returns
+        -------
+        pwr : array
+            Correlated power for the baseline
+            Shape matches simulation dimensions
+            Units: same as input power (if pwr=1, gives fringe attenuation factor)
+        
+        Attributes Set
+        --------------
+        fringe_pwr : array
+            Stored correlated power
+        
+        Notes
+        -----
+        The correlated power is:
+            P_corr = √(P₁ * G₁ * F²) * √(P₂ * G₂ * F²)
+                   = P * G * F²
+        where:
+        - P: incident power (assumed equal for both antennas)
+        - G: antenna gain (from g_rx)
+        - F: fringe amplitude (from sat_fringe)
+        
+        For equal antennas (typical case):
+            P_corr = P * G * F²
+        
+        The squared fringe term (F²) represents the correlation coefficient.
+        
+        Usage scenarios:
+        1. Attenuation factor: Set pwr=1 to get relative response
+        2. Absolute power: Use actual power values from link budget
+        3. Multiple baselines: Call repeatedly with different indices
+        
+        Examples
+        --------
+        >>> # Complete interferometric RFI calculation
+        >>> sim = obs_sim(receiver, skygrid, mjds)
+        >>> sim.populate(tles)
+        >>> sim.sky_track(ra=0, dec=45)
+        >>> 
+        >>> # Setup interferometry
+        >>> sim.create_baselines()
+        >>> sim.baselines_nearfield_delays(mode='tracking')
+        >>> sim.sat_fringe(bwchan=10*u.MHz, fch1=1420*u.MHz)
+        >>> 
+        >>> # Calculate receiver gain
+        >>> g_rx = receiver.antgain1d(sim.pnt_az, sim.pnt_el,
+        ...                           sim.topo_pos_az, sim.topo_pos_el)
+        >>> 
+        >>> # Get correlated power for baseline 0-1
+        >>> power_01 = sim.fringe_signal(pwr=1.0, g_rx=g_rx, ant1_idx=0, ant2_idx=1)
+        >>> 
+        >>> # Other baselines
+        >>> power_02 = sim.fringe_signal(pwr=1.0, g_rx=g_rx, ant1_idx=0, ant2_idx=2)
+        >>> power_12 = sim.fringe_signal(pwr=1.0, g_rx=g_rx, ant1_idx=1, ant2_idx=2)
+        
+        See Also
+        --------
+        sat_fringe : Calculate fringe patterns (must run first)
+        receiver_info.antgain1d : Calculate receiver gains
+        prx_cnv : Calculate incident power
+        """
         coherent_v_baselines=np.sqrt(pwr*g_rx.to(cnv.dimless)*(self.fringes**2))
         fringe1 = coherent_v_baselines[ant1_idx]
         fringe2 = coherent_v_baselines[ant2_idx]
