@@ -304,8 +304,8 @@ def baseline_pairs(antennas):
     - Array sensitivity
     
     Performance notes:
-    - Uses vectorized operations where possible for efficiency
     - Pre-allocates arrays to minimize memory operations
+    - Vectorized baseline length calculation using np.linalg.norm
     
     Examples
     --------
@@ -329,21 +329,21 @@ def baseline_pairs(antennas):
     # Pre-allocate arrays for better performance
     bearings = np.empty((n_antennas, 3), dtype=np.float64)
     
-    # Vectorize coordinate conversion - convert all antennas at once
+    # Convert reference antenna coordinates
     ref = antennas[0]
     x1, y1, z1 = pycraf.geospatial.wgs84_to_itrf2008(
         ref.loc.lon*u.deg, ref.loc.lat*u.deg, ref.loc.alt*u.m
     )
     ref_coords = np.array([x1.value, y1.value, z1.value])
     
-    # Convert all antenna positions
+    # Convert all antenna positions and compute bearing vectors
     for i, ant in enumerate(antennas):
         x2, y2, z2 = pycraf.geospatial.wgs84_to_itrf2008(
             ant.loc.lon*u.deg, ant.loc.lat*u.deg, ant.loc.alt*u.m
         )
         bearings[i] = np.array([x2.value, y2.value, z2.value]) - ref_coords
     
-    # Vectorized calculation of baseline lengths
+    # Vectorized calculation of baseline lengths from bearing vectors
     baselines = np.linalg.norm(bearings, axis=1)
 
     return bearings, baselines
@@ -2112,7 +2112,7 @@ class obs_sim():
         expect computation times of several minutes.
         
         Performance optimization:
-        - Results are stored in memory and only saved to disk once
+        - Results are stored efficiently in memory
         - Set verbose=False to suppress progress messages
         - Use load_propagation() to reuse saved results
         
@@ -2156,18 +2156,27 @@ class obs_sim():
         ### this means azimuth and elevation of the observer, I think the naming is a bit confusing
         self.satf_az, self.satf_el, self.satf_dist = (sat_azel[..., i] for i in range(3))  
         
-        # Store in structured array format
-        self.sat_info = {
-            'obs_az': self.topo_pos_az,
-            'obs_el': self.topo_pos_el,
-            'obs_dist': self.topo_pos_dist,
-            'sat_frame_az': self.satf_az,
-            'sat_frame_el': self.satf_el,
-            'sat_frame_dist': self.satf_dist
-        }
-        
         if save:
-            np.savez(savename, **self.sat_info)
+            # Save to file for later reuse
+            np.savez(savename, 
+                     obs_az=self.topo_pos_az,
+                     obs_el=self.topo_pos_el,
+                     obs_dist=self.topo_pos_dist,
+                     sat_frame_az=self.satf_az,
+                     sat_frame_el=self.satf_el,
+                     sat_frame_dist=self.satf_dist)
+            # Load back to ensure sat_info format matches load_propagation
+            self.sat_info = np.load(savename, allow_pickle=True)
+        else:
+            # Store in memory with compatible format
+            self.sat_info = {
+                'obs_az': self.topo_pos_az,
+                'obs_el': self.topo_pos_el,
+                'obs_dist': self.topo_pos_dist,
+                'sat_frame_az': self.satf_az,
+                'sat_frame_el': self.satf_el,
+                'sat_frame_dist': self.satf_dist
+            }
 
     def txbeam_angsep(self,beam_el,beam_az):
         """
