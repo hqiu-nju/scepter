@@ -194,15 +194,19 @@ def pointgen_S_1586_1(
         s1586_el_edges_deg = np.arange(0, 90 + 3, 3, dtype=np.float64)
         n_rings = s1586_el_edges_deg.size - 1
 
-        # Accumulators for per-cell boundaries
-        cell_az_low_list: list[float] = []
-        cell_az_high_list: list[float] = []
-        cell_el_low_list: list[float] = []
-        cell_el_high_list: list[float] = []
-        calculated_cells_per_ring: list[int] = []
-        n_total_cells = 0
+        # Pre-compute expected counts and total cells
+        expected_counts = [120]*10 + [90]*6 + [72]*3 + [60]*3 + [45, 40, 36, 30, 20, 15, 9, 3]
+        n_total_cells = sum(expected_counts)  # 2334
+        
+        # Pre-allocate arrays for better performance
+        cell_az_low = np.empty(n_total_cells, dtype=np.float64)
+        cell_az_high = np.empty(n_total_cells, dtype=np.float64)
+        cell_el_low = np.empty(n_total_cells, dtype=np.float64)
+        cell_el_high = np.empty(n_total_cells, dtype=np.float64)
+        calculated_cells_per_ring = np.empty(n_rings, dtype=np.int32)
 
         # Build each ring
+        idx = 0
         for i in range(n_rings):
             el_low = float(s1586_el_edges_deg[i])
             el_high = float(s1586_el_edges_deg[i + 1])
@@ -220,30 +224,27 @@ def pointgen_S_1586_1(
 
             # Cells in this ring and its azimuth edges
             n_cells_in_ring = 360 // az_step_deg
-            calculated_cells_per_ring.append(n_cells_in_ring)
+            calculated_cells_per_ring[i] = n_cells_in_ring
             az_edges_deg = np.arange(n_cells_in_ring + 1, dtype=np.float64) * az_step_deg
 
-            # Per-cell boundaries for this ring
-            for j in range(n_cells_in_ring):
-                cell_az_low_list.append(float(az_edges_deg[j]))
-                cell_az_high_list.append(float(az_edges_deg[j + 1]))
-                cell_el_low_list.append(el_low)
-                cell_el_high_list.append(el_high)
-
-            n_total_cells += n_cells_in_ring
+            # Vectorized assignment instead of loop appends
+            cell_az_low[idx:idx+n_cells_in_ring] = az_edges_deg[:-1]
+            cell_az_high[idx:idx+n_cells_in_ring] = az_edges_deg[1:]
+            cell_el_low[idx:idx+n_cells_in_ring] = el_low
+            cell_el_high[idx:idx+n_cells_in_ring] = el_high
+            idx += n_cells_in_ring
 
         # Verification against Table 1
-        expected_counts = [120]*10 + [90]*6 + [72]*3 + [60]*3 + [45, 40, 36, 30, 20, 15, 9, 3]
-        if calculated_cells_per_ring != expected_counts:
+        if not np.array_equal(calculated_cells_per_ring, expected_counts):
             raise RuntimeError("Implementation error: per-ring counts do not match S.1586-1 Table 1.")
-        if n_total_cells != 2334:
-            raise RuntimeError(f"Implementation error: total cells ({n_total_cells}) != expected 2334.")
+        if idx != n_total_cells:
+            raise RuntimeError(f"Implementation error: total cells ({idx}) != expected 2334.")
 
         # Convert to broadcastable arrays (1, N)
-        cell_az_low_bc  = np.asarray(cell_az_low_list,  dtype=np.float64)[np.newaxis, :]
-        cell_az_high_bc = np.asarray(cell_az_high_list, dtype=np.float64)[np.newaxis, :]
-        cell_el_low_bc  = np.asarray(cell_el_low_list,  dtype=np.float64)[np.newaxis, :]
-        cell_el_high_bc = np.asarray(cell_el_high_list, dtype=np.float64)[np.newaxis, :]
+        cell_az_low_bc  = cell_az_low[np.newaxis, :]
+        cell_az_high_bc = cell_az_high[np.newaxis, :]
+        cell_el_low_bc  = cell_el_low[np.newaxis, :]
+        cell_el_high_bc = cell_el_high[np.newaxis, :]
 
         return cell_az_low_bc, cell_az_high_bc, cell_el_low_bc, cell_el_high_bc, n_total_cells
 

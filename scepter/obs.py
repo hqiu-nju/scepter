@@ -101,20 +101,19 @@ def baseline_pairs(antennas):
     Returns:
         baselines (list): list of baseline pairs
     """
-
-    baselines=[] ### true baseline distance
-    bearings=[]
-    rabs=[] ### east-west component of the baseline distance
-    for i in range(len(antennas)):
-        # print(f"Pair: {i} and {j}")
-        ant = antennas[i]
-        ref = antennas[0]
+    n_antennas = len(antennas)
+    # Pre-allocate arrays for better performance
+    baselines = np.empty(n_antennas, dtype=np.float64)  ### true baseline distance
+    bearings = np.empty((n_antennas, 3), dtype=np.float64)
+    
+    ref = antennas[0]
+    for i, ant in enumerate(antennas):
         # Calculate the baseline distance
-        bearing,d = baseline_bearing(ref, ant)
-        baselines.append(d)
-        bearings.append(bearing)
+        bearing, d = baseline_bearing(ref, ant)
+        baselines[i] = d
+        bearings[i] = bearing
 
-    return np.array(bearings),np.array(baselines)
+    return bearings, baselines
 
 def baseline_vector(d,az,el,lat):
     """
