@@ -62,6 +62,9 @@ class TLEfinder():
         filedates_array = np.asarray(self.filedates)
         
         # Compute all argmin at once using broadcasting
+        # Note: For very large datasets (len(mjd) * len(filedates) > 10^7), 
+        # consider using np.searchsorted if filedates are sorted, or 
+        # process in chunks to reduce memory usage
         # Shape: (len(mjd), len(filedates))
         diffs = np.abs(filedates_array[np.newaxis, :] - mjd_array[:, np.newaxis])
         useddates = np.argmin(diffs, axis=1)
@@ -101,6 +104,7 @@ class TLEfinder():
         used_tles_array=np.array(used_tles_array)
         
         # Vectorize the second argmin computation
+        # Note: used_dates is typically much smaller after filtering
         diffs2 = np.abs(used_dates[np.newaxis, :] - mjd_array[:, np.newaxis])
         bestdate_idx = np.argmin(diffs2, axis=1)
         best_tle = used_tles_array[bestdate_idx]

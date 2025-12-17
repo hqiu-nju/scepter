@@ -257,8 +257,9 @@ def _subset_indices_from_grid_info(gi: np.ndarray) -> np.ndarray:
     el_lo_clip = gi["cell_lat_low"].astype(float)
     ring_low = np.minimum(np.floor(el_lo_clip / 3.0) * 3.0, 87.0).astype(int)
     # Vectorized lookup using numpy's vectorize for dictionary lookup
-    ring_idx = np.vectorize(ring_to_idx.get)(ring_low).astype(int)
-    step = np.vectorize(_S1586_AZ_STEPS.get)(ring_low).astype(int)
+    # All keys should exist due to clamping, but provide defaults for safety
+    ring_idx = np.array([ring_to_idx.get(int(rl), 0) for rl in ring_low], dtype=int)
+    step = np.array([_S1586_AZ_STEPS.get(int(rl), 3) for rl in ring_low], dtype=int)
     n_in_ring = cells_per_ring[ring_idx]
 
     az_lo = gi["cell_lon_low"].astype(float)
