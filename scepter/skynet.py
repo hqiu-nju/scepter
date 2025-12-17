@@ -579,15 +579,20 @@ def pointgen(
 
 def gridmatch(az,el,grid_info):
     ### get the grid for a fixed list of az and el pointings
-    grid_indx=[]
-    for i,j,k,l in zip(grid_info['cell_lon_low'],grid_info['cell_lon_high'],grid_info['cell_lat_low'],grid_info['cell_lat_high']):
-        azmask=(az >= i) * (az <= j) 
-        elmask=(el >= k) * (el <= l)
-        mask=azmask & elmask
-        grid_indx.append(mask)
-    grid_indx=np.array(grid_indx)
-    used_grids=np.where(grid_indx.sum(1)>0)[0]
-    return used_grids,grid_indx[used_grids]
+    # Vectorized approach: broadcast comparisons for all grids at once
+    cell_lon_low = grid_info['cell_lon_low'][:, np.newaxis]  # (n_grids, 1)
+    cell_lon_high = grid_info['cell_lon_high'][:, np.newaxis]
+    cell_lat_low = grid_info['cell_lat_low'][:, np.newaxis]
+    cell_lat_high = grid_info['cell_lat_high'][:, np.newaxis]
+    
+    # Broadcast comparisons: (n_grids, n_points)
+    azmask = (az >= cell_lon_low) & (az <= cell_lon_high)
+    elmask = (el >= cell_lat_low) & (el <= cell_lat_high)
+    grid_indx = azmask & elmask
+    
+    # Find grids that have at least one match
+    used_grids = np.where(grid_indx.sum(axis=1) > 0)[0]
+    return used_grids, grid_indx[used_grids]
 
 def plantime(epochs,cadence,trange,tint,startdate=cysgp4.PyDateTime()):
     '''
