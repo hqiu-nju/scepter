@@ -304,7 +304,7 @@ def baseline_pairs(antennas):
     - Array sensitivity
     
     Performance notes:
-    - Pre-allocates arrays to minimize memory operations
+    - Pre-allocates bearing vectors array to minimize memory operations
     - Vectorized baseline length calculation using np.linalg.norm
     
     Examples
@@ -326,7 +326,7 @@ def baseline_pairs(antennas):
     pycraf.geospatial.wgs84_to_itrf2008 : Coordinate conversion
     """
     n_antennas = len(antennas)
-    # Pre-allocate arrays for better performance
+    # Pre-allocate bearing vectors array for better performance
     bearings = np.empty((n_antennas, 3), dtype=np.float64)
     
     # Convert reference antenna coordinates
@@ -2146,37 +2146,34 @@ class obs_sim():
         if verbose:
             print('Done. Satellite coordinates obtained')
         
-        # self.eci_pos = result['eci_pos']
+        # Extract coordinate arrays from propagation result
         topo_pos = result['topo']
         sat_azel = result['sat_azel']  ### check cysgp4 for satellite frame orientation description
 
-        # eci_pos_x, eci_pos_y, eci_pos_z = (eci_pos[..., i] for i in range(3))
+        # Store topocentric coordinates
         self.topo_pos_az, self.topo_pos_el, self.topo_pos_dist, _ = (topo_pos[..., i] for i in range(4))
         
-        ### this means azimuth and elevation of the observer, I think the naming is a bit confusing
+        # Store satellite frame coordinates (azimuth and elevation of the observer)
         self.satf_az, self.satf_el, self.satf_dist = (sat_azel[..., i] for i in range(3))  
+        
+        # Create satellite info structure
+        sat_info_dict = {
+            'obs_az': self.topo_pos_az,
+            'obs_el': self.topo_pos_el,
+            'obs_dist': self.topo_pos_dist,
+            'sat_frame_az': self.satf_az,
+            'sat_frame_el': self.satf_el,
+            'sat_frame_dist': self.satf_dist
+        }
         
         if save:
             # Save to file for later reuse
-            np.savez(savename, 
-                     obs_az=self.topo_pos_az,
-                     obs_el=self.topo_pos_el,
-                     obs_dist=self.topo_pos_dist,
-                     sat_frame_az=self.satf_az,
-                     sat_frame_el=self.satf_el,
-                     sat_frame_dist=self.satf_dist)
-            # Load back to ensure sat_info format matches load_propagation
+            np.savez(savename, **sat_info_dict)
+            # Load back to ensure sat_info format matches load_propagation (NpzFile type)
             self.sat_info = np.load(savename, allow_pickle=True)
         else:
-            # Store in memory with compatible format
-            self.sat_info = {
-                'obs_az': self.topo_pos_az,
-                'obs_el': self.topo_pos_el,
-                'obs_dist': self.topo_pos_dist,
-                'sat_frame_az': self.satf_az,
-                'sat_frame_el': self.satf_el,
-                'sat_frame_dist': self.satf_dist
-            }
+            # Store as dict in memory (compatible with dictionary-like access)
+            self.sat_info = sat_info_dict
 
     def txbeam_angsep(self,beam_el,beam_az):
         """
