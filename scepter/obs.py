@@ -187,13 +187,65 @@ def sat_frame_pointing(satf_az,satf_el,beam_el,beam_az):
 
 def baseline_bearing(ref,ant):
     """
-    calculate the bearing of antenna 2 with respect to antenna 1
-    Args:
-        ref (object): reference antenna/location PyObserver object
-        ant (object): antenna for baseline PyObserver object
-    Returns:
-        bearing: vector from antenna baseline in cartesian coordinates
-        d: baseline vector modulus or baseline length in meters
+    Calculate bearing vector and distance between two antennas.
+    
+    Computes the baseline vector from a reference antenna to another antenna
+    in ITRF2008 Earth-Centered Earth-Fixed (ECEF) Cartesian coordinates. This
+    is a fundamental calculation for radio interferometry.
+    
+    Parameters
+    ----------
+    ref : cysgp4.PyObserver
+        Reference antenna/location (baseline origin)
+        Must have .loc attributes: lon (degrees), lat (degrees), alt (meters)
+    ant : cysgp4.PyObserver
+        Target antenna for baseline measurement
+        Must have .loc attributes: lon (degrees), lat (degrees), alt (meters)
+    
+    Returns
+    -------
+    bearing : numpy.ndarray, shape (3,)
+        Baseline vector in ITRF2008 Cartesian coordinates [X, Y, Z] (meters)
+        Points from reference antenna to target antenna
+    d : float
+        Baseline length (meters)
+        Euclidean distance between the two antennas
+    
+    Notes
+    -----
+    ITRF2008 (International Terrestrial Reference Frame 2008):
+    - Earth-centered, Earth-fixed coordinate system
+    - Origin: Earth's center of mass
+    - Z-axis: Earth's rotation axis (toward North pole)
+    - X-axis: Intersection of equatorial plane and prime meridian
+    - Y-axis: 90° East of X-axis
+    
+    The conversion from WGS84 geodetic coordinates (lon, lat, alt) to
+    ITRF2008 Cartesian coordinates accounts for:
+    - Earth's ellipsoidal shape (WGS84 ellipsoid)
+    - Local radius of curvature
+    - Altitude above ellipsoid
+    
+    Examples
+    --------
+    >>> from cysgp4 import PyObserver
+    >>> 
+    >>> # VLA-like baseline (New Mexico)
+    >>> ref = PyObserver(lon=-107.618, lat=34.079, alt=2124)
+    >>> ant = PyObserver(lon=-107.617, lat=34.079, alt=2124)  # ~1km east
+    >>> 
+    >>> bearing, distance = baseline_bearing(ref, ant)
+    >>> print(f"Baseline vector: {bearing} m")
+    >>> print(f"Baseline length: {distance:.1f} m")
+    >>> 
+    >>> # East-West component
+    >>> print(f"East-West: {bearing[0]:.1f} m")
+    
+    See Also
+    --------
+    baseline_pairs : Calculate all baselines in an array
+    baseline_vector : Project baseline onto source direction
+    pycraf.geospatial.wgs84_to_itrf2008 : Coordinate transformation
     """
     ant1 = ref
     ant2 = ant
@@ -285,15 +337,71 @@ def baseline_pairs(antennas):
 
 def baseline_vector(d,az,el,lat):
     """
-    calculate the effective baseline distance with a confirmed pointing angle of the reference antenna/position
-    Args:
-        d (float): distance to the antenna in meters
-        az (float): azimuth angle in radians
-        el (float): elevation angle in radians
-        lat (float): latitude of the antenna in radians
-    Returns:
-        vector: array of the effective baseline vector in cartesian coordinates x,y,z (meters)
-
+    Calculate effective baseline projection for a given pointing direction.
+    
+    Projects a physical baseline vector onto the direction of an astronomical
+    source, accounting for the local horizon coordinate system. This is the
+    effective baseline that contributes to interferometric fringes for a
+    source at the specified azimuth and elevation.
+    
+    The projection transforms from a baseline length and observer coordinates
+    to a 3D effective baseline vector in the local topocentric frame.
+    
+    Parameters
+    ----------
+    d : float
+        Physical baseline length (meters)
+    az : float
+        Source azimuth angle (radians)
+        Measured from North through East
+    el : float
+        Source elevation angle (radians)
+        Measured from horizon (0) to zenith (π/2)
+    lat : float
+        Observer's latitude (radians)
+        North positive, range: -π/2 to π/2
+    
+    Returns
+    -------
+    vector : numpy.ndarray, shape (3,)
+        Effective baseline vector in topocentric Cartesian coordinates (meters)
+        Components: [x, y, z] where:
+        - x: North component
+        - y: East component
+        - z: Zenith component
+    
+    Notes
+    -----
+    The transformation accounts for:
+    - Source direction (az, el)
+    - Observer's latitude (affects coordinate rotation)
+    - Baseline length
+    
+    The effective baseline determines:
+    - Fringe frequency (longer baseline → faster fringes)
+    - Spatial resolution (longer baseline → finer resolution)
+    - UV coverage point
+    
+    For a source at the zenith (el = π/2), the effective baseline equals
+    the physical baseline length in the zenith direction.
+    
+    Examples
+    --------
+    >>> # 1 km baseline, source at 45° elevation, due south, mid-latitude
+    >>> import numpy as np
+    >>> vec = baseline_vector(
+    ...     d=1000,                    # 1 km baseline
+    ...     az=np.radians(180),        # South
+    ...     el=np.radians(45),         # 45° elevation
+    ...     lat=np.radians(30)         # 30° N latitude
+    ... )
+    >>> print(f"Effective baseline: {vec}")
+    >>> print(f"Magnitude: {np.linalg.norm(vec):.1f} m")
+    
+    See Also
+    --------
+    mod_tau : Calculate geometric delay from baseline
+    baseline_nearfield_delay : Account for near-field effects
     """
     
     
@@ -304,11 +412,79 @@ def baseline_vector(d,az,el,lat):
 
 def mod_tau(az,el,lat,D):
     """
-    Calculate the delay difference from astronomical source pointing in seconds for a given angle for large arrays
-    Args:
-        baseline (quantity): Baseline length in meters etc.
-    Returns:
-        tau (quantity): delay in seconds
+    Calculate geometric delay for astronomical source pointing.
+    
+    Computes the differential time delay between antenna elements in an
+    interferometric array when observing a distant astronomical source.
+    This is the classical "far-field" delay calculation for radio interferometry.
+    
+    The delay arises because wavefronts from a distant source arrive at
+    different antennas at slightly different times due to the geometric
+    path difference.
+    
+    Parameters
+    ----------
+    az : float or array-like
+        Source azimuth angle (radians)
+    el : float or array-like
+        Source elevation angle (radians)
+    lat : float
+        Observer latitude (radians)
+    D : astropy.Quantity
+        Baseline length (meters or compatible units)
+        Will be converted to meters internally
+    
+    Returns
+    -------
+    tau : astropy.Quantity
+        Geometric time delay (seconds)
+        Shape matches input arrays (supports broadcasting)
+    
+    Notes
+    -----
+    The calculation:
+    1. Projects baseline onto source direction using baseline_vector
+    2. Computes effective baseline length D_eff
+    3. Calculates delay: τ = D_eff / c
+    
+    For a source at angle θ from the baseline direction:
+        τ = (D/c) * sin(θ)
+    
+    This is the "far-field" approximation, valid when:
+    - Source distance >> baseline length (astronomical sources)
+    - Wavefronts are effectively planar
+    
+    For satellites (near-field), use baseline_nearfield_delay instead.
+    
+    Typical delays:
+    - 1 km baseline, zenith source: ~3.3 μs
+    - 10 km baseline, 30° from zenith: ~16.7 μs
+    - 1000 km baseline (VLBI): ~3.3 ms
+    
+    Examples
+    --------
+    >>> import numpy as np
+    >>> from astropy import units as u
+    >>> 
+    >>> # Simple interferometer
+    >>> delay = mod_tau(
+    ...     az=np.radians(180),        # South
+    ...     el=np.radians(60),         # 60° elevation
+    ...     lat=np.radians(30),        # 30° N
+    ...     D=1000*u.m                 # 1 km baseline
+    ... )
+    >>> print(f"Delay: {delay.to(u.us)}")
+    >>> 
+    >>> # Array of source positions
+    >>> az_array = np.linspace(0, 2*np.pi, 100)
+    >>> el_array = np.ones(100) * np.radians(45)
+    >>> delays = mod_tau(az_array, el_array, np.radians(30), 5000*u.m)
+    
+    See Also
+    --------
+    baseline_vector : Baseline projection calculation
+    baseline_nearfield_delay : Near-field delay corrections for satellites
+    fringe_response : Convert delays to fringe patterns
     """
     c = 3e8 *u.m/u.s  # speed of light in m/s
     baseline = D.to(u.m) # Convert baseline to meters
@@ -323,13 +499,73 @@ def mod_tau(az,el,lat,D):
 
 def baseline_nearfield_delay(l1,l2,tau):
     """
-    Calculate the delay difference from source pointing in seconds for a given angle
-    Args:
-        l1 (quantity): distance to the antenna 1 in distance units
-        l2 (quantity): distance to the antenna 2 in distance units
-        tau (quantity): baseline delay between two antennas in time units
-    Returns:
-        delay (quantity): delay in seconds
+    Calculate near-field delay corrections for satellite observations.
+    
+    Computes the differential delay for interferometric observations of
+    near-field sources (satellites) where the wavefront curvature must be
+    considered. This corrects the far-field geometric delay for the finite
+    distance to the source.
+    
+    For distant astronomical sources, wavefronts are effectively planar and
+    the delay is purely geometric. For satellites in Low Earth Orbit (LEO),
+    wavefronts have significant curvature, causing path length differences
+    that depend on the actual distances to each antenna.
+    
+    Parameters
+    ----------
+    l1 : astropy.Quantity
+        Distance from satellite to reference antenna (km, m, or compatible)
+    l2 : astropy.Quantity
+        Distance from satellite to target antenna (km, m, or compatible)
+    tau : astropy.Quantity
+        Far-field geometric delay (seconds)
+        Typically from mod_tau()
+    
+    Returns
+    -------
+    delay : astropy.Quantity
+        Total delay including near-field corrections (seconds)
+        delay = (l1 - l2)/c - tau
+    
+    Notes
+    -----
+    The total delay consists of:
+    1. Path length difference: (l1 - l2)/c
+       Direct time difference due to different distances
+    2. Geometric correction: -tau
+       Adjusts for the far-field approximation
+    
+    For satellites at ~500 km altitude with baselines of ~1-10 km:
+    - Path length difference: ~0.01-0.1 μs
+    - Corrections can be significant for long baselines
+    
+    The near-field effect becomes important when:
+        baseline^2 / (8 * satellite_distance) ≈ wavelength
+    
+    For LEO satellites (500-2000 km) and baselines >100 m, near-field
+    corrections are usually necessary for accurate interferometry.
+    
+    Examples
+    --------
+    >>> from astropy import units as u
+    >>> 
+    >>> # LEO satellite observation
+    >>> l1 = 550*u.km  # Distance to antenna 1
+    >>> l2 = 551*u.km  # Distance to antenna 2 (1 km farther)
+    >>> tau = 3.33*u.us  # Far-field delay estimate
+    >>> 
+    >>> delay = baseline_nearfield_delay(l1, l2, tau)
+    >>> print(f"Corrected delay: {delay.to(u.us)}")
+    >>> 
+    >>> # Compare with far-field approximation
+    >>> farfield_delay = tau
+    >>> nearfield_delay = (l1 - l2) / (3e8 * u.m/u.s)
+    >>> correction = nearfield_delay - farfield_delay - delay
+    
+    See Also
+    --------
+    mod_tau : Calculate far-field geometric delay
+    obs_sim.baselines_nearfield_delays : Apply to full simulation
     """
     c = 3e8 *u.m/u.s  # speed of light in m/s
     l1 = l1.to(u.m) # Convert distance to meters
@@ -339,11 +575,81 @@ def baseline_nearfield_delay(l1,l2,tau):
 
 def fringe_attenuation(theta, baseline, bandwidth):
     """
-    Calculate the fringe attenuation for a given angle, baseline, frequency, and bandwidth.
-    Args:
-        theta (quantity): off phase center Angle in radians/degrees etc.
-        baseline (quantity): Baseline east-west component in meters etc.
-        bandwidth (quantity): Bandwidth in Hz etc.
+    Calculate fringe attenuation due to finite bandwidth.
+    
+    Computes the amplitude reduction of interferometric fringes caused by
+    bandwidth smearing. When a source is offset from the phase center, the
+    geometric delay varies across the observing bandwidth, causing partial
+    cancellation of the fringe signal.
+    
+    This effect is critical for wide-field interferometric observations and
+    for understanding sensitivity loss away from the pointing center.
+    
+    Parameters
+    ----------
+    theta : astropy.Quantity
+        Angular offset from phase center (radians, degrees, or compatible)
+    baseline : astropy.Quantity
+        Baseline length (meters or compatible)
+        Can be the projected baseline in the direction of interest
+    bandwidth : astropy.Quantity
+        Observing bandwidth (Hz or compatible)
+    
+    Returns
+    -------
+    attenuation : float or array
+        Fringe amplitude attenuation factor (dimensionless)
+        Range: 0 to 1, where 1 = no attenuation
+        Shape matches input arrays
+    
+    Notes
+    -----
+    The attenuation follows a sinc function:
+        A(θ) = sinc(sin(θ) * D * Δf / c)
+    where:
+    - θ: angular offset
+    - D: baseline length
+    - Δf: bandwidth
+    - c: speed of light
+    
+    Physical interpretation:
+    - At phase center (θ=0): A = 1 (no attenuation)
+    - First null at: sin(θ) = c / (D * Δf)
+    - Attenuation increases with: larger θ, longer baseline, wider bandwidth
+    
+    This is analogous to the "chromatic aberration" of interferometers.
+    
+    Practical implications:
+    - Limits usable field of view
+    - Reduces sensitivity to off-axis sources
+    - Important for satellite RFI (often offset from phase center)
+    - Can be compensated by "w-projection" in imaging
+    
+    Examples
+    --------
+    >>> from astropy import units as u
+    >>> 
+    >>> # Sensitivity at 10° from phase center
+    >>> atten = fringe_attenuation(
+    ...     theta=10*u.deg,
+    ...     baseline=1000*u.m,
+    ...     bandwidth=100*u.MHz
+    ... )
+    >>> print(f"Attenuation: {atten:.2%}")
+    >>> 
+    >>> # Field of view estimate (first null)
+    >>> theta_null = np.arcsin(3e8 / (1000 * 100e6))
+    >>> print(f"First null at: {np.degrees(theta_null):.1f}°")
+    >>> 
+    >>> # Compare narrow vs wide band
+    >>> angles = np.linspace(0, 20, 100) * u.deg
+    >>> atten_narrow = fringe_attenuation(angles, 1*u.km, 10*u.MHz)
+    >>> atten_wide = fringe_attenuation(angles, 1*u.km, 100*u.MHz)
+    
+    See Also
+    --------
+    bw_fringe : Bandwidth-integrated fringe response
+    fringe_response : Single-frequency fringe calculation
     """
     c = 3e8  # speed of light in m/s
     theta = theta.to(u.rad).value  # Convert angle to radians
@@ -353,14 +659,84 @@ def fringe_attenuation(theta, baseline, bandwidth):
 
 def fringe_response(delay,frequency):
     """
-    Calculate the fringe response for a given delay and frequency
-    based on two element equation integration, assuming equal gain
-
-    Args:
-        delay (quantity): delay in seconds
-        frequency (quantity): frequency in Hz
-    Returns:
-        response (quantity): fringe response
+    Calculate single-frequency fringe response for interferometry.
+    
+    Computes the fringe amplitude for a two-element interferometer at a
+    single frequency, assuming equal antenna gains. This is the fundamental
+    response of an interferometer to a point source.
+    
+    The fringe pattern oscillates as a function of the geometric delay,
+    with the frequency of oscillation determined by the observing frequency.
+    
+    Parameters
+    ----------
+    delay : astropy.Quantity
+        Geometric delay between antenna elements (seconds)
+        Can be scalar or array
+    frequency : astropy.Quantity
+        Observing frequency (Hz or compatible)
+        Can be scalar or array
+    
+    Returns
+    -------
+    response : float or array
+        Fringe amplitude (dimensionless)
+        Range: -1 to +1
+        - +1: Constructive interference (in phase)
+        - -1: Destructive interference (180° out of phase)
+        -  0: 90° phase difference
+        Shape matches broadcasted input arrays
+    
+    Notes
+    -----
+    The fringe response is:
+        R(τ, f) = cos(2π f τ)
+    where:
+    - τ: geometric delay (time difference between signal arrivals)
+    - f: observing frequency
+    
+    This assumes:
+    - Point source
+    - Equal antenna gains
+    - No noise
+    - Monochromatic signal
+    
+    Physical interpretation:
+    - Fringes oscillate as Earth rotates (changing delay)
+    - Fringe rate: dR/dt depends on source geometry
+    - Fringe spacing: Δτ = 1/f
+    
+    For realistic observations:
+    - Use bw_fringe() for finite bandwidth effects
+    - Include antenna gains from receiver_info
+    - Add system noise and atmospheric effects
+    
+    Examples
+    --------
+    >>> from astropy import units as u
+    >>> import numpy as np
+    >>> 
+    >>> # Single fringe calculation
+    >>> response = fringe_response(
+    ...     delay=1*u.us,
+    ...     frequency=1.4*u.GHz
+    ... )
+    >>> print(f"Fringe amplitude: {response:.3f}")
+    >>> 
+    >>> # Fringe pattern vs delay
+    >>> delays = np.linspace(0, 10, 1000) * u.us
+    >>> fringes = fringe_response(delays, 1420*u.MHz)
+    >>> # Plot shows oscillation with period 1/f ≈ 0.7 μs
+    >>> 
+    >>> # Multi-frequency response
+    >>> freqs = np.linspace(1.4, 1.5, 100) * u.GHz
+    >>> response_vs_freq = fringe_response(1*u.us, freqs)
+    
+    See Also
+    --------
+    bw_fringe : Bandwidth-integrated fringe response
+    fringe_attenuation : Bandwidth smearing effects
+    obs_sim.sat_fringe : Apply to satellite observations
     """
     delay = delay.to(u.s).value  # Convert delay to seconds
     frequency = frequency.to(u.Hz).value  # Convert frequency to Hz
@@ -522,18 +898,78 @@ def prx_cnv(pwr,g_rx, outunit=u.W):
     return p_rx
 
 def pfd_to_Jy(pfd):
-    '''
-    Description: quick function to convert power flux density from dBm to Jansky
-
-    Parameters:
-    pfd: float
-        power flux density in dB W, dB W/m2/Hz
-    frequency_GHz: float
-
-    Returns:
-    F_Jy: float
-        power flux density in Jansky (Jy), (1 Jy = 10^-26 W/m^2/Hz)
-    '''
+    """
+    Convert power flux density from dB scale to Jansky units.
+    
+    Converts power flux density (PFD) from logarithmic decibel units
+    (dBW/m²/Hz) to linear Jansky units (Jy), the standard unit in radio
+    astronomy for flux density measurements.
+    
+    The Jansky is defined as:
+        1 Jy = 10^-26 W/m²/Hz
+    
+    This conversion is essential for comparing satellite interference levels
+    with astronomical source strengths and sensitivity limits.
+    
+    Parameters
+    ----------
+    pfd : float or array-like
+        Power flux density in dB scale (dBW, dBW/m²/Hz)
+        Can be scalar or numpy array
+    
+    Returns
+    -------
+    F_Jy : float or array-like
+        Power flux density in Jansky (Jy)
+        Shape matches input
+    
+    Notes
+    -----
+    Conversion steps:
+    1. Convert from dB to linear: P_W = 10^(pfd/10)
+    2. Convert to Jansky: F_Jy = P_W / 10^-26
+    
+    Typical flux density scales in radio astronomy:
+    - Sun: ~10^6 Jy (extremely bright)
+    - Jupiter: ~1000 Jy
+    - Bright radio sources (Cas A, Cyg A): ~1000-10000 Jy
+    - Typical quasars: ~1-10 Jy
+    - Detection limit for SKA: ~10^-6 Jy (1 μJy)
+    
+    Satellite interference context:
+    - LEO satellites: Can exceed 10^6 Jy at radio telescope
+    - Acceptable RFI: Typically <0.1 Jy for most observations
+    - Continuum observations: More tolerant than spectral line
+    
+    Examples
+    --------
+    >>> # Convert satellite power flux density
+    >>> pfd_satellite = -100  # dBW/m²/Hz
+    >>> flux = pfd_to_Jy(pfd_satellite)
+    >>> print(f"Flux density: {flux:.2e} Jy")
+    >>> 
+    >>> # Array of values
+    >>> import numpy as np
+    >>> pfds = np.array([-100, -110, -120, -130])  # dBW/m²/Hz
+    >>> fluxes = pfd_to_Jy(pfds)
+    >>> print(f"Fluxes: {fluxes}")
+    >>> 
+    >>> # Compare with astronomical source
+    >>> pfd_sat = -95  # dBW/m²/Hz
+    >>> flux_sat = pfd_to_Jy(pfd_sat)
+    >>> flux_casa = 10000  # Jy, Cassiopeia A
+    >>> print(f"Satellite is {flux_sat/flux_casa:.2e} times Cas A")
+    
+    See Also
+    --------
+    prx_cnv : Calculate received power with antenna gain
+    transmitter_info.fspl : Calculate power flux density at distance
+    
+    References
+    ----------
+    - 1 Jansky = 10^-26 W/m²/Hz (definition)
+    - ITU-R RA.769: Protection criteria for radio astronomy
+    """
 
     # Convert W/m^2/Hz to W/m^2
     P_W = 10 ** (pfd / 10)
@@ -1417,13 +1853,68 @@ class obs_sim():
 
     def load_propagation(self,nparray):
         """
-        Description: Load the satellite propagation data from a numpy array file
-        Parameters:
-        nparray: str
-            path to the numpy array file containing the satellite propagation data
-        Returns:
-        tleprop: numpy array
-            numpy array containing the satellite propagation data
+        Load pre-computed satellite propagation data from file.
+        
+        Loads satellite position and coordinate data that was previously saved
+        by the populate() method. This avoids expensive recomputation of
+        satellite propagation for repeated analyses of the same scenario.
+        
+        Parameters
+        ----------
+        nparray : str
+            Path to numpy .npz file containing satellite propagation data
+            File should be created by populate() method with save=True
+        
+        Returns
+        -------
+        tleprop : numpy structured array
+            Loaded propagation data containing all position and coordinate arrays
+        
+        Attributes Set
+        --------------
+        sat_info : numpy structured array
+            Complete propagation dataset
+        topo_pos_az : array
+            Topocentric azimuth angles (degrees)
+        topo_pos_el : array
+            Topocentric elevation angles (degrees)
+        topo_pos_dist : array
+            Slant distances to satellites (km)
+        satf_az : array
+            Observer azimuth in satellite frame (degrees)
+        satf_el : array
+            Observer elevation in satellite frame (degrees)
+        satf_dist : array
+            Observer distance in satellite frame (km)
+        
+        Notes
+        -----
+        The loaded data must match the simulation configuration:
+        - Same observer locations
+        - Same time array (mjds)
+        - Same satellite constellation (TLEs)
+        
+        Mismatched configurations will lead to incorrect results or errors.
+        
+        The file format is numpy's compressed .npz format with named arrays:
+        - obs_az, obs_el, obs_dist: topocentric coordinates
+        - sat_frame_az, sat_frame_el, sat_frame_dist: satellite frame
+        
+        Examples
+        --------
+        >>> # First run: compute and save
+        >>> sim1 = obs_sim(receiver, skygrid, mjds)
+        >>> sim1.populate(tles, save=True, savename='constellation.npz')
+        >>> 
+        >>> # Later runs: load from file
+        >>> sim2 = obs_sim(receiver, skygrid, mjds)
+        >>> sim2.load_propagation('constellation.npz')
+        >>> # Continue with analysis...
+        >>> sim2.sky_track(ra=0, dec=45)
+        
+        See Also
+        --------
+        populate : Compute and save propagation data
         """
 
         tleprop=np.load(nparray,allow_pickle=True)
@@ -1440,12 +1931,84 @@ class obs_sim():
         self.satf_dist = satf_dist
 
     def reduce_sats(self,el_limit=0):
-        '''
-        Description: This function reduces the number of satellites in the simulation by applying a limit to the elevation angle
-        Parameters:
-        el_limit: float
-            elevation angle limit (degrees)
-        '''
+        """
+        Filter satellites by elevation angle threshold.
+        
+        Reduces the satellite dataset by removing satellites that never rise
+        above a specified elevation limit. This improves computational efficiency
+        by excluding satellites that are below the horizon or at low elevations
+        where they have minimal impact or are not visible to the telescope.
+        
+        The method applies a time-averaged elevation mask, retaining only
+        satellites whose mean elevation exceeds the threshold across all
+        observation times, grid cells, and pointings.
+        
+        Parameters
+        ----------
+        el_limit : float, optional
+            Minimum mean elevation angle threshold (degrees)
+            Default: 0° (horizon)
+            Common values: 10-20° to avoid low-elevation issues
+        
+        Attributes Modified
+        -------------------
+        topo_pos_az : array
+            Filtered azimuth positions
+        topo_pos_el : array
+            Filtered elevation positions
+        topo_pos_dist : array
+            Filtered distances
+        satf_az : array
+            Filtered satellite frame azimuth
+        satf_el : array
+            Filtered satellite frame elevation
+        satf_dist : array
+            Filtered satellite frame distances
+        elevation_mask : array (new)
+            Boolean mask indicating retained satellites
+        
+        Notes
+        -----
+        Benefits of elevation filtering:
+        - Reduces memory usage (fewer satellites to track)
+        - Speeds up computation (fewer calculations)
+        - Removes satellites with low antenna gain (below horizon)
+        - Avoids atmospheric effects at low elevations
+        
+        The threshold is applied to the *mean* elevation across:
+        - All time steps
+        - All observer locations
+        - All sky grid cells
+        - All pointing directions
+        
+        A satellite is retained if its mean elevation exceeds el_limit.
+        
+        Considerations:
+        - Higher thresholds (>20°) may exclude rising/setting passes
+        - 0° keeps only satellites above horizon sometime during observation
+        - Negative values keep all satellites (no filtering)
+        - For RFI analysis, consider main beam response (typically >10°)
+        
+        Examples
+        --------
+        >>> # Remove satellites below horizon
+        >>> sim = obs_sim(receiver, skygrid, mjds)
+        >>> sim.populate(tles)
+        >>> print(f"Initial satellites: {sim.topo_pos_az.shape[-1]}")
+        >>> sim.reduce_sats(el_limit=0)
+        >>> print(f"After filtering: {sim.topo_pos_az.shape[-1]}")
+        >>> 
+        >>> # More aggressive filtering
+        >>> sim.reduce_sats(el_limit=15)  # Only above 15° mean elevation
+        >>> 
+        >>> # Check which satellites were kept
+        >>> kept_fraction = sim.elevation_mask.sum() / len(sim.elevation_mask)
+        >>> print(f"Retained {kept_fraction:.1%} of satellites")
+        
+        See Also
+        --------
+        populate : Generate satellite propagation data
+        """
 
         min_el=np.mean(self.topo_pos_el,axis=(0,1,2,3,4))
         mask = min_el>el_limit
@@ -1570,15 +2133,91 @@ class obs_sim():
         self.txangsep,_,_=sat_frame_pointing(self.satf_az,self.satf_el,beam_el,beam_az)
         return self.txangsep
     def sat_separation(self,mode='tracking',pnt_az=None,pnt_el=None):
-        '''
-        Description: Calculate the satellite angular separation from telescope pointing
-        Parameters:
-        mode: str
-            mode of the simulation, default is 'tracking', other options are 'allsky','pnt'
-        Returns:
-        rxang_sep: float
-            angular separation between the satellite pointing and observer in the telescope reference frame
-        '''
+        """
+        Calculate angular separation between telescope pointing and satellites.
+        
+        Computes the angular distance from the telescope's pointing direction
+        to each satellite at each time step. This is crucial for determining
+        antenna gain towards satellites and assessing RFI impact.
+        
+        Supports multiple observation modes with different pointing strategies.
+        
+        Parameters
+        ----------
+        mode : str, optional
+            Observation mode (default: 'tracking')
+            Options:
+            - 'tracking': Telescope tracks celestial source (use sky_track or azel_track)
+            - 'allsky': Survey mode using sky grid pointings
+            - 'pnt': Custom pointing specified by pnt_az and pnt_el
+        pnt_az : float or array, optional
+            Azimuth for custom pointing (degrees)
+            Required if mode='pnt'
+        pnt_el : float or array, optional
+            Elevation for custom pointing (degrees)
+            Required if mode='pnt'
+        
+        Returns
+        -------
+        rxang_sep : astropy.Quantity
+            Angular separation between pointing and satellites (degrees)
+            Shape: matches simulation dimensions
+            [locations, grid_cells, pointings, epochs, times, satellites]
+        
+        Attributes Set
+        --------------
+        rxang_sep : astropy.Quantity
+            Computed angular separations
+        
+        Notes
+        -----
+        Angular separation determines:
+        - Receiver antenna gain G_rx(θ)
+        - Main beam vs sidelobe response
+        - Sensitivity to satellite RFI
+        - Whether satellite is in field of view
+        
+        Typical antenna patterns:
+        - Main beam: 0-3° from boresight (high gain)
+        - Near sidelobes: 3-10° (medium gain)
+        - Far sidelobes: >10° (low gain, but many satellites)
+        
+        The calculation uses spherical trigonometry to account for the
+        curved celestial sphere, providing accurate separations even for
+        large angles.
+        
+        Mode details:
+        'tracking': Uses self.pnt_az and self.pnt_el set by sky_track or azel_track
+        'allsky': Uses grid_az and grid_el for all-sky survey
+        'pnt': Uses user-provided pnt_az and pnt_el
+        
+        Examples
+        --------
+        >>> # Tracking mode: follow a source
+        >>> sim = obs_sim(receiver, skygrid, mjds)
+        >>> sim.populate(tles)
+        >>> sim.sky_track(ra=0, dec=45)
+        >>> separations = sim.sat_separation(mode='tracking')
+        >>> print(f"Separation range: {separations.min():.1f} to {separations.max():.1f}")
+        >>> 
+        >>> # All-sky survey mode
+        >>> separations = sim.sat_separation(mode='allsky')
+        >>> 
+        >>> # Custom pointing
+        >>> separations = sim.sat_separation(mode='pnt', pnt_az=180, pnt_el=60)
+        >>> 
+        >>> # Find satellites in main beam (within 2°)
+        >>> in_beam = separations < 2*u.deg
+        >>> n_in_beam = in_beam.sum()
+        >>> print(f"{n_in_beam} satellite-time instances in main beam")
+        
+        See Also
+        --------
+        sky_track : Set celestial tracking
+        azel_track : Set fixed Az/El pointing
+        receiver_info.antgain1d : Calculate gain from separations
+        pycraf.geometry.true_angular_distance : Underlying calculation
+        """
         if mode == 'tracking':
             self.rxang_sep = geometry.true_angular_distance(self.pnt_az, self.pnt_el, self.topo_pos_az*u.deg, self.topo_pos_el *u.deg)
         elif mode == 'allsky':
