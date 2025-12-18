@@ -14,6 +14,19 @@ from pycraf import conversions as cnv
 from pycraf.utils import ranged_quantity_input
 from scipy.optimize import root_scalar
 
+# ---------------------------------------------------------------------------
+# Optional acceleration flag: we check for Numba **once** at module import to
+# avoid repeated import attempts.  Functions can then branch on `_HAVE_NUMBA`
+# (cheap boolean) without altering their public API.
+# ---------------------------------------------------------------------------
+try:  # pragma: no cover - optional dependency
+    from numba import njit
+
+    _HAVE_NUMBA = True
+except ImportError:  # pragma: no cover - optional dependency
+    njit = None
+    _HAVE_NUMBA = False
+
 
 @ranged_quantity_input(offset_angles = (None, None, u.deg), 
                        Gm = (-500, 500, cnv.dBi), 
@@ -26,16 +39,17 @@ from scipy.optimize import root_scalar
                        strip_input_units=True,
                        allow_none=True)
 
-def s_1528_rec1_2_pattern(offset_angles, 
-                          axis: str = 'major', 
-                          Gm: float = None, 
-                          LN: float =-15*cnv.dB, 
-                          LF: float = 1.8*cnv.dBi, 
-                          LB: float = None, 
-                          D: float = 1.0*u.m, 
-                          wavelength: float = (10.7*u.GHz).to(u.m, equivalencies=u.spectral()), 
+def s_1528_rec1_2_pattern(offset_angles,
+                          axis: str = 'major',
+                          Gm: float = None,
+                          LN: float =-15*cnv.dB,
+                          LF: float = 1.8*cnv.dBi,
+                          LB: float = None,
+                          D: float = 1.0*u.m,
+                          wavelength: float = (10.7*u.GHz).to(u.m, equivalencies=u.spectral()),
                           z: float = 1.0,
-                          return_extras: bool = False):
+                          return_extras: bool = False,
+                          use_numba: bool | None = None):
     """
     Calculate the antenna radiation pattern for ITU-R Recommendation S.1528-0 recommends 1.2.
 
@@ -63,6 +77,12 @@ def s_1528_rec1_2_pattern(offset_angles,
             Ratio of major axis to minor axis for elliptical beams. Default is 1.0 (circular beam).
         return_extras: bool, optional
             Whether Gm and psi_b should be returned. Default is false.
+        use_numba : bool or None, optional
+            When *True*, use a small cached ``numba.njit`` helper for the
+            piecewise evaluation provided Numba is installed.  When *False* the
+            code uses the NumPy fallback even if Numba is available.  The
+            default (*None*) keeps the previous behaviour: auto-enable only when
+            Numba was importable at module load (``_HAVE_NUMBA``).
         
         Default values allow to recreate Figure 1 from ITU-R Recommendation S.1528-0
     Returns
@@ -78,16 +98,27 @@ def s_1528_rec1_2_pattern(offset_angles,
 
     Notes
     -----
-    The piecewise gain equations are based on ITU-R Recommendation S.1528-0  recommends 1.2. 
+    The piecewise gain equations are based on ITU-R Recommendation S.1528-0  recommends 1.2.
     For further details, see the ITU recommendation: https://www.itu.int/rec/R-REC-S.1528-0-200106-I/en.
+
+    Performance notes
+    -----------------
+    The function is fully vectorised with NumPy for typical scientific use.
+    For very large angle grids (O(10⁵) elements) you can set ``use_numba=True``
+    to evaluate the piecewise regions via a small ``numba.njit`` helper.  The
+    public API and numerical behaviour remain unchanged; if Numba is
+    unavailable the routine silently falls back to the NumPy path.  Leaving the
+    flag as ``None`` keeps the default auto-enable behaviour when Numba was
+    importable at module load.
     """
     if Gm is None:
         efficiency = .60
         Gm = 10*np.log10(efficiency * ((np.pi*D/wavelength)**2))   
         
     
-    # Ensure offset_angles is a numpy array for elementwise operations. Also applying abs function as offset angles are assumed to be only positive
-    offset_angles = np.abs(np.asarray(offset_angles))
+    # Ensure offset_angles is a numpy array for elementwise operations. Also
+    # applying abs function as offset angles are assumed to be only positive
+    offset_angles = np.abs(np.ascontiguousarray(np.asarray(offset_angles, dtype=float)))
     
     # Compute ψb (one-half the 3 dB beamwidth in degrees)
     psi_b_major = np.sqrt(1200) / (D/wavelength)  # Major axis beamwidth
@@ -121,25 +152,72 @@ def s_1528_rec1_2_pattern(offset_angles,
     if LB is None:
         LB = (np.max(15+LN+0.25*Gm+5*np.log10(z),0))
 
-    # Create masks for each condition
-    mask1 = offset_angles <= a * psi_b
-    mask2 = (offset_angles > a * psi_b) & (offset_angles <= 0.5 * b * psi_b)
-    mask3 = (offset_angles > 0.5 * b * psi_b) & (offset_angles <= b * psi_b)
-    mask4 = (offset_angles > b * psi_b) & (offset_angles <= Y)
-    mask5 = (offset_angles > Y) & (offset_angles <= 90)
-    mask6 = (offset_angles > 90) & (offset_angles <= 180)
+    # Pre-compute scalar thresholds so both NumPy and (optional) Numba paths
+    # work from the same constants.  Keeping them as plain floats means we do
+    # not need to worry about units inside the fast path.
+    a_psi_b = a * psi_b
+    half_b_psi_b = 0.5 * b * psi_b
+    b_psi_b = b * psi_b
+    ninety = 90.0
+    one_eighty = 180.0
 
-    
-    # Initialize the gains array with NaN values
+    # Initialise the gains array with NaN values; the fast path overwrites
+    # every element, while the NumPy path fills regions via boolean masks.
     gains = np.full_like(offset_angles, np.nan, dtype=np.float64)
 
-    # # Apply the piecewise equations using masks
-    gains[mask1] = (Gm - 3 * (offset_angles[mask1] / psi_b)**alpha)
-    gains[mask2] = (Gm + LN + 20 * np.log10(z))
-    gains[mask3] = (Gm + LN)
-    gains[mask4] = (X - 25 * np.log10(offset_angles[mask4]))
-    gains[mask5] = LF
-    gains[mask6] = LB
+    # Optional acceleration: fast, compiled scalar loop with identical
+    # branching logic.  The availability check happens once at module import
+    # (``_HAVE_NUMBA``), so the runtime branch is a cheap boolean test.
+    use_numba = _HAVE_NUMBA if use_numba is None else bool(use_numba)
+
+    if use_numba and _HAVE_NUMBA:
+        @njit(cache=True, fastmath=True, nogil=True)
+        def _piecewise_gain(angles, a_psi_b, half_b_psi_b, b_psi_b,
+                            Y, ninety, one_eighty, psi_b, alpha,
+                            Gm, LN, LF, LB, X, z):
+            out = np.empty_like(angles)
+            for idx in range(angles.size):
+                ang = angles[idx]
+                if ang <= a_psi_b:
+                    out[idx] = Gm - 3.0 * (ang / psi_b) ** alpha
+                elif ang <= half_b_psi_b:
+                    out[idx] = Gm + LN + 20.0 * np.log10(z)
+                elif ang <= b_psi_b:
+                    out[idx] = Gm + LN
+                elif ang <= Y:
+                    out[idx] = X - 25.0 * np.log10(ang)
+                elif ang <= ninety:
+                    out[idx] = LF
+                elif ang <= one_eighty:
+                    out[idx] = LB
+                else:
+                    out[idx] = np.nan
+            return out
+
+        # Flatten for Numba (1-D contiguous), then reshape back.
+        gains_flat = _piecewise_gain(
+            offset_angles.ravel().astype(np.float64), a_psi_b,
+            half_b_psi_b, b_psi_b, Y, ninety, one_eighty, psi_b,
+            alpha, Gm, LN, LF, LB, X, z,
+        )
+        gains = gains_flat.reshape(offset_angles.shape)
+
+    if np.isnan(gains).any():
+        # Create masks for each condition
+        mask1 = offset_angles <= a_psi_b
+        mask2 = (offset_angles > a_psi_b) & (offset_angles <= half_b_psi_b)
+        mask3 = (offset_angles > half_b_psi_b) & (offset_angles <= b_psi_b)
+        mask4 = (offset_angles > b_psi_b) & (offset_angles <= Y)
+        mask5 = (offset_angles > Y) & (offset_angles <= ninety)
+        mask6 = (offset_angles > ninety) & (offset_angles <= one_eighty)
+
+        # Apply the piecewise equations using masks
+        gains[mask1] = (Gm - 3 * (offset_angles[mask1] / psi_b)**alpha)
+        gains[mask2] = (Gm + LN + 20 * np.log10(z))
+        gains[mask3] = (Gm + LN)
+        gains[mask4] = (X - 25 * np.log10(offset_angles[mask4]))
+        gains[mask5] = LF
+        gains[mask6] = LB
 
     return gains, Gm, psi_b
 
@@ -284,7 +362,8 @@ def s_1528_rec1_4_pattern_amend(
     Gmax: float | None = None,
     l: int = 4,
     mu_roots: np.ndarray | None = None,
-    return_extras: bool = False):
+    return_extras: bool = False,
+    use_numba: bool | None = None):
     """
     -----------------------------------------
 
@@ -357,6 +436,12 @@ def s_1528_rec1_4_pattern_amend(
         omitted.
     return_extras : bool, optional
         If *True*, also return a dict with A, σ, μᵢ and the u-array.
+    use_numba : bool or None, optional
+        When *True*, use a tiny cached ``numba.njit`` helper for the Taylor
+        product provided Numba is installed.  When *False* the code uses the
+        NumPy fallback even if Numba is available.  The default (*None*) keeps
+        the previous behaviour: auto-enable only when Numba was importable at
+        module load (``_HAVE_NUMBA``).
 
     Returns
     -------
@@ -412,17 +497,13 @@ def s_1528_rec1_4_pattern_amend(
 
     # ---------------------------------------------------------------
     # 5. Product Π_{i=1}^{l-1}[…]
-    #    We keep a tiny, optional Numba JIT inside the function so the
-    #    outer namespace stays clean.  If Numba is not installed, we
-    #    fall back to vectorised NumPy (still fast for O(10⁴) points).
+    #    We keep a tiny, optional Numba JIT, enabled only when Numba was
+    #    imported at module load (``_HAVE_NUMBA``) and the caller does not
+    #    explicitly disable it via ``use_numba=False``.
     # ---------------------------------------------------------------
-    try:
-        from numba import njit                      # extremely cheap import
-        have_numba = True
-    except ImportError:                             # pragma: no cover
-        have_numba = False
+    use_numba = _HAVE_NUMBA if use_numba is None else bool(use_numba)
 
-    if have_numba:
+    if use_numba and _HAVE_NUMBA:
         @njit(cache=True, fastmath=True, nogil=True)
         def _prod_numba(u_flat, pi2sig2, A, l, mu):
             """Fast loop in C/LLVM: computes the Taylor product."""
