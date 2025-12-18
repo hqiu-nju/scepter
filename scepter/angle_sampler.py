@@ -593,6 +593,76 @@ class JointAngleSampler:
     smooth_truncate: float = 3.0
 
     # --------------------------
+    # Internal helpers (no state mutation)
+    # --------------------------
+
+    def _pmf_2d(self) -> np.ndarray:
+        """
+        Recover the joint probability mass function from the stored CDF.
+
+        Notes
+        -----
+        * The CDF is kept flattened (beta-major). A quick diff is enough
+          to reconstruct the PMF without allocating intermediate histograms.
+        * Lazily cached on the frozen instance to avoid repeated diff/reshape
+          work when multiple stats/plots are requested in quick succession.
+        """
+
+        cached = getattr(self, "_pmf_cache", None)
+        if cached is not None:
+            return cached
+
+        # Use prepend to keep dtype stable and avoid an explicit concat.
+        pmf_flat = np.diff(self.cdf.astype(np.float64, copy=False), prepend=0.0)
+        pmf_2d = pmf_flat.reshape(-1, self.n_alpha)
+        total = pmf_2d.sum(dtype=np.float64)
+        if not np.isfinite(total) or total <= 0.0:
+            raise ValueError("Sampler CDF produces a non-positive PMF.")
+
+        pmf_norm = pmf_2d / total
+        object.__setattr__(self, "_pmf_cache", pmf_norm)
+        return pmf_norm
+
+    def sampler_statistics(self) -> Dict[str, np.ndarray]:
+        """
+        Fast access to 1D marginal densities derived from the sampler only.
+
+        Returns
+        -------
+        dict
+            "beta_centers" : bin centers for β in degrees
+            "beta_density" : probability density per β bin (normalized by width)
+            "alpha_centers": bin centers for α in degrees
+            "alpha_density": probability density per α bin (normalized by width)
+
+        This avoids drawing random samples purely to inspect the current
+        distribution, which keeps the latency low when statistics are queried
+        repeatedly (e.g., extracting α/β curves in a UI loop).
+        """
+
+        pmf = self._pmf_2d()
+
+        beta_edges_f = self.beta_edges.astype(np.float64, copy=False)
+        alpha_edges_f = self.alpha_edges.astype(np.float64, copy=False)
+
+        beta_widths = np.diff(beta_edges_f)
+        alpha_widths = np.diff(alpha_edges_f)
+
+        beta_centers = 0.5 * (beta_edges_f[:-1] + beta_edges_f[1:])
+        alpha_centers = 0.5 * (alpha_edges_f[:-1] + alpha_edges_f[1:])
+
+        # Marginals: sum over the opposite axis, then normalize by bin width
+        beta_marginal = pmf.sum(axis=1) / beta_widths
+        alpha_marginal = pmf.sum(axis=0) / alpha_widths
+
+        return {
+            "beta_centers": beta_centers,
+            "beta_density": beta_marginal,
+            "alpha_centers": alpha_centers,
+            "alpha_density": alpha_marginal,
+        }
+
+    # --------------------------
     # Construction
     # --------------------------
 
@@ -1230,3 +1300,136 @@ class JointAngleSampler:
         plt.show()
 
         return metrics
+
+    def show_sampler_only(
+        self,
+        *,
+        save_prefix: Optional[str] = None,
+        plot_beta_bins: Optional[int] = None,
+        plot_alpha_bins: Optional[int] = None,
+    ) -> Dict[str, np.ndarray]:
+        """
+        Visualize the sampler's own α/β distributions without real-data input.
+
+        This is a lightweight companion to :meth:`show_comparison` and relies
+        solely on the stored histogram, so it can be used even when the
+        original dataset is unavailable (e.g., downstream deployment).
+
+        Parameters
+        ----------
+        save_prefix : str, optional
+            If provided, figures are also saved as ``<prefix>_beta_1d.png``,
+            ``<prefix>_alpha_1d.png`` and ``<prefix>_joint_heatmap.png``.
+        plot_beta_bins : int, optional
+            Optional override for how many β bins to display. Defaults to the
+            sampler resolution.
+        plot_alpha_bins : int, optional
+            Optional override for how many α bins to display. Defaults to the
+            sampler resolution.
+
+        Returns
+        -------
+        dict
+            The same payload as :meth:`sampler_statistics` for programmatic use.
+        """
+
+        if plt is None:
+            raise RuntimeError("matplotlib is required for show_sampler_only().")
+
+        stats = self.sampler_statistics()
+
+        beta_centers = stats["beta_centers"]
+        alpha_centers = stats["alpha_centers"]
+        beta_density = stats["beta_density"]
+        alpha_density = stats["alpha_density"]
+        beta_widths = np.diff(self.beta_edges.astype(np.float64, copy=False))
+        alpha_widths = np.diff(self.alpha_edges.astype(np.float64, copy=False))
+        beta_probs = beta_density * beta_widths
+        alpha_probs = alpha_density * alpha_widths
+
+        # Optionally re-bin for cleaner plots without touching the underlying PMF.
+        n_beta_plot = int(plot_beta_bins) if plot_beta_bins else beta_centers.size
+        n_alpha_plot = int(plot_alpha_bins) if plot_alpha_bins else alpha_centers.size
+
+        if n_beta_plot != beta_centers.size:
+            beta_edges_plot = np.linspace(self.beta_range[0], self.beta_range[1], n_beta_plot + 1)
+            beta_weights, _ = np.histogram(beta_centers, bins=beta_edges_plot, weights=beta_probs)
+            beta_widths_plot = np.diff(beta_edges_plot)
+            beta_centers_plot = 0.5 * (beta_edges_plot[:-1] + beta_edges_plot[1:])
+            beta_total = beta_weights.sum()
+            beta_density_plot = beta_weights / (beta_widths_plot * beta_total if beta_total > 0 else 1.0)
+        else:
+            beta_centers_plot = beta_centers
+            beta_density_plot = beta_density
+
+        if n_alpha_plot != alpha_centers.size:
+            alpha_edges_plot = np.linspace(self.alpha_range[0], self.alpha_range[1], n_alpha_plot + 1)
+            alpha_weights, _ = np.histogram(alpha_centers, bins=alpha_edges_plot, weights=alpha_probs)
+            alpha_widths_plot = np.diff(alpha_edges_plot)
+            alpha_centers_plot = 0.5 * (alpha_edges_plot[:-1] + alpha_edges_plot[1:])
+            alpha_total = alpha_weights.sum()
+            alpha_density_plot = alpha_weights / (alpha_widths_plot * alpha_total if alpha_total > 0 else 1.0)
+        else:
+            alpha_centers_plot = alpha_centers
+            alpha_density_plot = alpha_density
+
+        # 1D beta
+        fig1 = plt.figure(figsize=(12, 4))
+        ax1 = fig1.add_subplot(1, 1, 1)
+        ax1.bar(
+            beta_centers_plot,
+            beta_density_plot,
+            width=(self.beta_range[1] - self.beta_range[0]) / beta_centers_plot.size,
+            align="center",
+            alpha=0.7,
+            label="sampler β",
+        )
+        ax1.set_xlabel(r"$\beta$ [deg]")
+        ax1.set_ylabel("density")
+        ax1.set_title("Sampler β distribution")
+        ax1.legend()
+        fig1.tight_layout()
+        if save_prefix:
+            fig1.savefig(f"{save_prefix}_beta_1d.png", dpi=200)
+
+        # 1D alpha
+        fig2 = plt.figure(figsize=(12, 4))
+        ax2 = fig2.add_subplot(1, 1, 1)
+        ax2.bar(
+            alpha_centers_plot,
+            alpha_density_plot,
+            width=(self.alpha_range[1] - self.alpha_range[0]) / alpha_centers_plot.size,
+            align="center",
+            alpha=0.7,
+            label="sampler α",
+        )
+        ax2.set_xlabel(r"$\alpha$ [deg]")
+        ax2.set_ylabel("density")
+        ax2.set_title("Sampler α distribution")
+        ax2.legend()
+        fig2.tight_layout()
+        if save_prefix:
+            fig2.savefig(f"{save_prefix}_alpha_1d.png", dpi=200)
+
+        # Joint heatmap (non-comparative)
+        pmf = self._pmf_2d()
+        fig3 = plt.figure(figsize=(10, 6))
+        ax3 = fig3.add_subplot(1, 1, 1)
+        im = ax3.imshow(
+            pmf.T,
+            origin="lower",
+            aspect="auto",
+            extent=[self.beta_range[0], self.beta_range[1], self.alpha_range[0], self.alpha_range[1]],
+            cmap="magma",
+        )
+        ax3.set_xlabel(r"$\beta$ [deg]")
+        ax3.set_ylabel(r"$\alpha$ [deg]")
+        ax3.set_title("Sampler joint PMF (β, α)")
+        fig3.colorbar(im, ax=ax3, label="probability")
+        fig3.tight_layout()
+        if save_prefix:
+            fig3.savefig(f"{save_prefix}_joint_heatmap.png", dpi=200)
+
+        plt.show()
+
+        return stats
