@@ -1,0 +1,25 @@
+name: scepter-dev-full
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - conda-build
+  - cysgp4
+  - pycraf
+  - ipykernel
+  - "ipywidgets>=7.0,<8.0"
+  - tqdm
+  - seaborn
+  - ipympl
+  # Optional visualization stack
+  - trame
+  - trame-jupyter-extension
+  - jupyter-server-proxy
+  - trame-vtk
+  - trame-vuetify
+  # Optional accelerators and GPU-enabled visualization support
+  - numba
+  - "cuda-version>=12.0"
+  - pyvista
+  - plotly
+  - python-kaleido
