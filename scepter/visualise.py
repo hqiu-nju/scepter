@@ -6,6 +6,7 @@ visualise.py
 from __future__ import annotations
 
 from functools import lru_cache
+import importlib.util
 from typing import Any, Sequence, Dict, Tuple, List
 import warnings
 from astropy import units as u
@@ -52,6 +53,19 @@ _S1586_AZ_STEPS: Dict[int, int] = {
     57: 6, 60: 6, 63: 6,
     66: 8, 69: 9, 72: 10, 75: 12, 78: 18, 81: 24, 84: 40, 87: 120,
 }
+
+# Pre-built azimuth step array for fast / JITted paths (ring order: 0..27° → 87–90°)
+_S1586_AZ_STEPS_ARR = np.array([_S1586_AZ_STEPS[e] for e in range(0, 90, 3)], dtype=np.int64)
+
+# Optional numba acceleration (safe no-op decorator when missing)
+_HAS_NUMBA = importlib.util.find_spec("numba") is not None
+if _HAS_NUMBA:
+    from numba import njit  # type: ignore
+else:
+    def njit(*args, **kwargs):  # type: ignore
+        def _decorator(func):
+            return func
+        return _decorator
 
 
 @lru_cache(maxsize=1)
@@ -249,22 +263,50 @@ def _subset_indices_from_grid_info(gi: np.ndarray) -> np.ndarray:
     idx : ndarray of int
         Index into the 2334 reference grid for each subset row.
     """
+    el_lo_clip = gi["cell_lat_low"].astype(np.float64)
+    az_lo = gi["cell_lon_low"].astype(np.float64)
     _, _, _, _, el_edges, cells_per_ring = _s1586_cells()
-    ring_lows = el_edges[:-1].astype(int)
-    ring_to_idx = {rl: i for i, rl in enumerate(ring_lows)}
-    offsets = np.concatenate([[0], np.cumsum(cells_per_ring[:-1])])
 
-    el_lo_clip = gi["cell_lat_low"].astype(float)
-    ring_low = np.minimum(np.floor(el_lo_clip / 3.0) * 3.0, 87.0).astype(int)
-    # Vectorized lookup using numpy's vectorize for dictionary lookup
-    # All keys should exist due to clamping, but provide defaults for safety
-    ring_idx = np.array([ring_to_idx.get(int(rl), 0) for rl in ring_low], dtype=int)
-    step = np.array([_S1586_AZ_STEPS.get(int(rl), 3) for rl in ring_low], dtype=int)
+    # Fast numba path when available (particularly useful for large subsets)
+    if _HAS_NUMBA:
+        return _subset_indices_from_grid_info_numba(
+            el_lo_clip, az_lo, _S1586_AZ_STEPS_ARR, cells_per_ring.astype(np.int64)
+        )
+
+    # Pure-numpy fallback
+    ring_idx = np.clip((np.floor(el_lo_clip / 3.0)).astype(int), 0, len(el_edges) - 2)
+    step = _S1586_AZ_STEPS_ARR[ring_idx]
     n_in_ring = cells_per_ring[ring_idx]
-
-    az_lo = gi["cell_lon_low"].astype(float)
+    offsets = np.concatenate([[0], np.cumsum(cells_per_ring[:-1])])
     az_bin = np.floor(az_lo / step).astype(int) % n_in_ring
     return offsets[ring_idx] + az_bin
+
+
+@njit(cache=True)
+def _subset_indices_from_grid_info_numba(
+    el_lo_clip: np.ndarray,
+    az_lo: np.ndarray,
+    step_per_ring: np.ndarray,
+    cells_per_ring: np.ndarray,
+) -> np.ndarray:
+    """Numba-accelerated mapping of subset grid_info rows to canonical indices."""
+    n = el_lo_clip.shape[0]
+    out = np.empty(n, dtype=np.int64)
+
+    offsets = np.empty(cells_per_ring.size + 1, dtype=np.int64)
+    offsets[0] = 0
+    for i in range(cells_per_ring.size - 1):
+        offsets[i + 1] = offsets[i] + cells_per_ring[i]
+    offsets[-1] = offsets[-2] + cells_per_ring[-1]
+
+    for i in range(n):
+        ring_idx = int(min(np.floor(el_lo_clip[i] / 3.0), 29.0))
+        step = step_per_ring[ring_idx]
+        n_in_ring = cells_per_ring[ring_idx]
+        az_bin = int(np.floor(az_lo[i] / step)) % n_in_ring
+        out[i] = offsets[ring_idx] + az_bin
+
+    return out
 
 
 # -----------------------------------------------------------------------------
@@ -1443,7 +1485,7 @@ def plot_hemisphere_2D(
         sm = plt.cm.ScalarMappable(norm=norm, cmap=cmap_obj)
         sm.set_array([])
         cbar = fig.colorbar(sm, ax=ax, pad=0.02, fraction=0.046)
-        cbar.set_label("Power" + (f" {unit}" if (mode == "power" and unit is not None) else "Data loss [%]"))
+        cbar.set_label(cbar_title)
 
     fig.tight_layout()
     if show:

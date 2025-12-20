@@ -5,8 +5,12 @@ This module provides functions related to gridding and geometric calculations
 on the Earth's surface, particularly relevant for satellite communications 
 and spectrum management.
 
-It includes routines for calculating the -3 dB antenna footprint on Earth as well 
+It includes routines for calculating the -3 dB antenna footprint on Earth as well
 as functions to generate a full hexagon grid on the globe.
+
+Numba is used as an optional accelerator for computational hotspots when
+available. When numba is not installed, the pure-Python implementations are used
+with identical numerical behavior.
 
 Author: boris.sorokin <mralin@protonmail.com>
 Hexgrid functions are partially based on code developed by Benjamin Winkel, MPIfR
@@ -14,6 +18,8 @@ Date: 01-04-2025
 """
 
 import warnings
+from functools import lru_cache
+
 import numpy as np
 from astropy import units as u
 from astropy.constants import R_earth
@@ -21,7 +27,91 @@ from pycraf import conversions as cnv
 from pycraf.utils import ranged_quantity_input
 from pycraf import geometry, pathprof
 from scepter.antenna import calculate_beamwidth_1d
-from functools import lru_cache
+
+try:  # Optional acceleration if numba is installed
+    from numba import njit
+
+    HAS_NUMBA = True
+except ImportError:  # pragma: no cover - exercised only when numba is absent
+    HAS_NUMBA = False
+
+    def njit(*args, **kwargs):  # type: ignore[override]
+        """Fallback decorator used when numba is unavailable."""
+
+        def wrapper(func):
+            return func
+
+        return wrapper
+
+
+def _spherical_central_angle_scalar_impl(R_eff_m: float, R_sat_m: float, alpha_rad: float) -> float:
+    """Compute the central angle (SOE) for scalar inputs.
+
+    This helper is defined once and then optionally compiled with numba.  The logic
+    mirrors the original cached Python implementation to ensure numerical parity
+    while allowing optional acceleration when numba is available.
+    """
+
+    OS_sq = R_sat_m ** 2
+    OE_sq = R_eff_m ** 2
+    two_OS_OE = 2 * R_sat_m * R_eff_m
+
+    cos_alpha = np.cos(alpha_rad)
+    sin_alpha = np.sin(alpha_rad)
+
+    term_under_sqrt = OE_sq - OS_sq * sin_alpha ** 2
+    if term_under_sqrt < -1e-11 * OE_sq:
+        return np.nan
+    sqrt_term = np.sqrt(max(term_under_sqrt, 0.0))
+
+    slant_range_SE = R_sat_m * cos_alpha - sqrt_term
+    if slant_range_SE < 0:
+        return np.nan
+
+    SE_sq = slant_range_SE ** 2
+    cos_SOE = (OS_sq + OE_sq - SE_sq) / two_OS_OE
+    cos_SOE = np.clip(cos_SOE, -1.0, 1.0)
+    return float(np.arccos(cos_SOE))
+
+
+if HAS_NUMBA:
+    _spherical_central_angle_scalar = njit(cache=True)(_spherical_central_angle_scalar_impl)
+else:
+    _spherical_central_angle_scalar = lru_cache(maxsize=32)(_spherical_central_angle_scalar_impl)
+
+
+def _compute_impact_mask_impl(
+    grid_lons_rad: np.ndarray,
+    grid_lats_rad: np.ndarray,
+    station_lat_rad: float,
+    station_lon_rad: float,
+    theta_h: float,
+    gamma: float,
+) -> np.ndarray:
+    """Vectorized mask computation for impactful grid cells.
+
+    The implementation is written to be numba-friendly while remaining readable
+    when executed in pure Python.
+    """
+
+    sin_station_lat = np.sin(station_lat_rad)
+    cos_station_lat = np.cos(station_lat_rad)
+
+    sin_grid_lat = np.sin(grid_lats_rad)
+    cos_grid_lat = np.cos(grid_lats_rad)
+
+    delta_lon = grid_lons_rad - station_lon_rad
+    cos_delta = (sin_station_lat * sin_grid_lat) + (cos_station_lat * cos_grid_lat * np.cos(delta_lon))
+    cos_delta = np.clip(cos_delta, -1.0, 1.0)
+    delta = np.arccos(cos_delta)
+
+    return (delta <= (theta_h + gamma)) & (delta <= (np.pi / 2))
+
+
+if HAS_NUMBA:
+    _compute_impact_mask = njit(cache=True)(_compute_impact_mask_impl)
+else:
+    _compute_impact_mask = _compute_impact_mask_impl
 
 
 # -----------------------------------------------------------------------------
@@ -76,9 +166,9 @@ def calculate_footprint_size(
 
     def _calculate_spherical_central_angle(R_eff, R_sat, alpha_from_nadir):
         """
-        Calculates the central angle (SOE) between the satellite, Earth's center, 
+        Calculates the central angle (SOE) between the satellite, Earth's center,
         and the edge of the antenna beam for a given ray angle from nadir.
-        
+
         Parameters
         ----------
         R_eff : astropy.units.Quantity
@@ -87,60 +177,18 @@ def calculate_footprint_size(
             Distance from Earth's center to the satellite (Earth radius + altitude).
         alpha_from_nadir : astropy.units.Quantity
             Ray angle from the nadir direction.
-            
+
         Returns
         -------
         angle_SOE : astropy.units.Quantity
             Central angle in radians corresponding to the edge of the antenna beam.
             Returns np.nan * u.rad if the ray does not intersect Earth.
         """
-        # --- Internal Cached Function  ---
-        @lru_cache(maxsize=16)
-        def _calc_spherical_central_angle_cached(R_eff_m, R_sat_m, alpha_rad):
-            """
-            Internal cached function to compute the central angle (in radians) using
-            scalar values for the effective Earth radius, satellite distance, and ray angle.
-            
-            Parameters
-            ----------
-            R_eff_m : float
-                Effective Earth radius in meters.
-            R_sat_m : float
-                Satellite distance from Earth's center in meters.
-            alpha_rad : float
-                Ray angle from nadir in radians.
-                
-            Returns
-            -------
-            angle_SOE : float
-                Central angle in radians. Returns np.nan if the ray does not intersect Earth.
-            """
-            OS_sq = R_sat_m ** 2
-            OE_sq = R_eff_m ** 2
-            two_OS_OE = 2 * R_sat_m * R_eff_m
 
-            cos_alpha = np.cos(alpha_rad)
-            sin_alpha = np.sin(alpha_rad)
-            
-            term_under_sqrt = OE_sq - OS_sq * sin_alpha ** 2
-            if term_under_sqrt < -1e-11 * OE_sq:
-                return np.nan
-            sqrt_term = np.sqrt(max(term_under_sqrt, 0.0))
-            
-            slant_range_SE = R_sat_m * cos_alpha - sqrt_term
-            if slant_range_SE < 0:
-                return np.nan
-            
-            SE_sq = slant_range_SE ** 2
-            cos_SOE = (OS_sq + OE_sq - SE_sq) / two_OS_OE
-            cos_SOE = np.clip(cos_SOE, -1.0, 1.0)
-            return np.arccos(cos_SOE)
-        
-        # Convert quantities to float values in consistent units.
         R_eff_m = R_eff.to(u.m).value
         R_sat_m = R_sat.to(u.m).value
         alpha_rad = alpha_from_nadir.to(u.rad).value
-        angle = _calc_spherical_central_angle_cached(R_eff_m, R_sat_m, alpha_rad)
+        angle = _spherical_central_angle_scalar(R_eff_m, R_sat_m, alpha_rad)
         return angle * u.rad
     
     if not callable(antenna_gain_func):
@@ -415,32 +463,32 @@ def trunc_hexgrid_to_impactful(grid_longitudes, grid_latitudes, sat_altitude, mi
         Boolean mask that, when applied to grid_longitudes and grid_latitudes, retains only
         those grid cells that are impactful.
     """
-    # Convert station and grid cell coordinates to radians.
-    station_lat_rad = station_lat.to(u.rad).value
-    station_lon_rad = station_lon.to(u.rad).value
+    # Convert station and grid cell coordinates to radians (floating-point
+    # values for compatibility with both Python and numba code paths).
+    station_lat_rad = float(station_lat.to(u.rad).value)
+    station_lon_rad = float(station_lon.to(u.rad).value)
     grid_lats_rad = grid_latitudes.to(u.rad).value
     grid_lons_rad = grid_longitudes.to(u.rad).value
-    
-    # Compute angular separation δ (in radians) using the spherical law of cosines.
-    cos_delta = (np.sin(station_lat_rad) * np.sin(grid_lats_rad) +
-                 np.cos(station_lat_rad) * np.cos(grid_lats_rad) *
-                 np.cos(grid_lons_rad - station_lon_rad))
-    cos_delta = np.clip(cos_delta, -1.0, 1.0)
-    delta = np.arccos(cos_delta)
-    
+
     # Compute the horizon angle (θₕ) for the station:
     R_earth_m = R_earth.to(u.m).value
     sat_alt_m = sat_altitude.to(u.m).value
     theta_h = np.arccos(R_earth_m / (R_earth_m + sat_alt_m))
-    
-    min_elev_rad = min_elevation.to(u.rad).value
-    
+
+    min_elev_rad = float(min_elevation.to(u.rad).value)
+
     # Simplify the margin γ using trigonometric identities:
     # γ = π/2 - βₘₐₓ - min_elevation = arccos((R_earth * cos(min_elevation))/(R_earth + sat_altitude)) - min_elevation
     gamma = np.arccos((R_earth_m * np.cos(min_elev_rad)) / (R_earth_m + sat_alt_m)) - min_elev_rad
-    
+
     # A cell is impactful if its angular separation δ is less than or equal to (θₕ + γ)
-    # and is on the near side of Earth (δ <= π/2).
-    mask = (delta <= (theta_h + gamma)) & (delta <= np.pi/2)
-    
-    return mask
+    # and is on the near side of Earth (δ <= π/2). The calculation is routed through
+    # a shared helper so that numba can optionally accelerate the vectorized math.
+    return _compute_impact_mask(
+        grid_lons_rad,
+        grid_lats_rad,
+        station_lat_rad,
+        station_lon_rad,
+        theta_h,
+        gamma,
+    )
