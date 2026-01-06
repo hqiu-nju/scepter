@@ -41,11 +41,11 @@ except ImportError:  # pragma: no cover - optional dependency
 
 def s_1528_rec1_2_pattern(offset_angles,
                           axis: str = 'major',
-                          Gm: float = None,
+                          Gm: float | None = None,
                           LN: float =-15*cnv.dB,
                           LF: float = 1.8*cnv.dBi,
                           LB: float = None,
-                          D: float = 1.0*u.m,
+                          D: float | None = None,
                           wavelength: float = (10.7*u.GHz).to(u.m, equivalencies=u.spectral()),
                           z: float = 1.0,
                           return_extras: bool = False,
@@ -111,9 +111,25 @@ def s_1528_rec1_2_pattern(offset_angles,
     flag as ``None`` keeps the default auto-enable behaviour when Numba was
     importable at module load.
     """
-    if Gm is None:
-        efficiency = .60
-        Gm = 10*np.log10(efficiency * ((np.pi*D/wavelength)**2))   
+
+    efficiency = 0.60
+
+    if (Gm is None) and (D is None):
+        # 1) None provided -> default D=1 m, compute Gm
+        D = 1.0 * u.m
+        Gm = 10.0 * np.log10(efficiency * (np.pi * (D / wavelength))**2)
+
+    elif Gm is None:
+        # 2) D provided -> compute Gm
+        Gm = 10.0 * np.log10(efficiency * (np.pi * (D / wavelength))**2)
+
+    elif D is None:
+        # 3) Gm provided -> compute D (effective diameter)
+        D = (wavelength / np.pi) * np.sqrt((10.0**(0.1 * Gm)) / efficiency)
+
+    else:
+        # Both provided -> keep them (optionally validate consistency)
+        pass
         
     
     # Ensure offset_angles is a numpy array for elementwise operations. Also
@@ -315,7 +331,6 @@ def calculate_beamwidth_1d(antenna_gain_func: callable = s_1528_rec1_2_pattern,
 
     # --- Find first crossing with target level and double it ---
     try:
-        # You can make this bracket configurable if нужно
         bracket = (1e-9, 90.0)
 
         sol = root_scalar(gain_diff, bracket=bracket, method='brentq')
