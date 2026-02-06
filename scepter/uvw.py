@@ -520,7 +520,12 @@ def enu_to_uvw(hour_angle, declination, baseline_enu):
     w = cos_dec * cos_H * E - cos_dec * sin_H * N + sin_dec * U
     
     # Stack into UVW array
+    # Remove any singleton dimensions that were added by broadcasting
     baseline_uvw = np.stack([u, v, w], axis=-1)
+    
+    # Squeeze out singleton dimensions if baseline_enu was 1D
+    if baseline_enu.ndim == 1:
+        baseline_uvw = np.squeeze(baseline_uvw)
     
     return baseline_uvw
 
@@ -1000,9 +1005,10 @@ def compute_uvw_array(antennas, ra_deg, dec_deg, obs_times):
     
     # Get number of antennas and determine output shape
     n_antennas = len(antennas)
-    is_time_array = hasattr(obs_times, '__len__')
+    # Check if obs_times is scalar or array using astropy's isscalar
+    is_time_scalar = obs_times.isscalar
     
-    if is_time_array:
+    if not is_time_scalar:
         n_times = len(obs_times)
         uvw_all = np.zeros((n_antennas, n_times, 3))
     else:
