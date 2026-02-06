@@ -111,8 +111,8 @@ Usage Examples
     >>> from scepter import uvw
     >>> 
     >>> # Define two antennas
-    >>> ref = PyObserver(lon=21.443, lat=-30.713, alt=1000)
-    >>> ant = PyObserver(lon=21.444, lat=-30.713, alt=1000)
+    >>> ref = PyObserver(21.443, -30.713, 1.0)  # lon, lat (deg), alt (km)
+    >>> ant = PyObserver(21.444, -30.713, 1.0)
     >>> 
     >>> # Observe a source at RA=0°, Dec=-30°
     >>> times = Time(['2024-01-01T00:00:00', '2024-01-01T01:00:00'])
@@ -613,8 +613,8 @@ def compute_uvw_from_observers(ref_observer, ant_observer, ra_deg, dec_deg, obs_
     >>> from scepter import uvw
     >>> 
     >>> # Define two antennas (e.g., VLA-like in New Mexico)
-    >>> ref = PyObserver(lon=-107.618, lat=34.079, alt=2124)
-    >>> ant = PyObserver(lon=-107.617, lat=34.079, alt=2124)
+    >>> ref = PyObserver(-107.618, 34.079, 2.124)  # lon, lat (deg), alt (km)
+    >>> ant = PyObserver(-107.617, 34.079, 2.124)
     >>> 
     >>> # Observe Cygnus A (RA=19h59m, Dec=+40°44')
     >>> ra = (19 + 59/60) * 15  # Convert hours to degrees
@@ -935,9 +935,9 @@ def compute_uvw_array(antennas, ra_deg, dec_deg, obs_times):
     >>> from scepter import uvw
     >>> 
     >>> # Create 3-antenna array
-    >>> ant1 = PyObserver(lon=21.443, lat=-30.713, alt=1000)  # Reference
-    >>> ant2 = PyObserver(lon=21.444, lat=-30.713, alt=1000)  # ~100m E
-    >>> ant3 = PyObserver(lon=21.443, lat=-30.714, alt=1000)  # ~100m N
+    >>> ant1 = PyObserver(21.443, -30.713, 1.0)  # Reference (lon, lat deg, alt km)
+    >>> ant2 = PyObserver(21.444, -30.713, 1.0)  # ~100m E
+    >>> ant3 = PyObserver(21.443, -30.714, 1.0)  # ~100m N
     >>> antennas = [ant1, ant2, ant3]
     >>> 
     >>> # Single observation time
