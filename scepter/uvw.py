@@ -520,12 +520,20 @@ def enu_to_uvw(hour_angle, declination, baseline_enu):
     w = cos_dec * cos_H * E - cos_dec * sin_H * N + sin_dec * U
     
     # Stack into UVW array
-    # Remove any singleton dimensions that were added by broadcasting
     baseline_uvw = np.stack([u, v, w], axis=-1)
     
-    # Squeeze out singleton dimensions if baseline_enu was 1D
-    if baseline_enu.ndim == 1:
-        baseline_uvw = np.squeeze(baseline_uvw)
+    # Handle broadcasting artifacts: when baseline_enu is 1D, broadcasting with
+    # hour_angle arrays may create extra singleton dimensions. Remove them.
+    if baseline_enu.ndim == 1 and baseline_uvw.ndim > 2:
+        # Squeeze out singleton dimensions except the last one (which is the 3-component UVW)
+        baseline_uvw = baseline_uvw.squeeze()
+        # Ensure output is at least 1D with last dimension being 3
+        if baseline_uvw.ndim == 1 and baseline_uvw.shape[0] == 3:
+            # Single UVW coordinate - keep as (3,)
+            pass
+        elif baseline_uvw.ndim == 1:
+            # This shouldn't happen, but safeguard
+            baseline_uvw = baseline_uvw.reshape(-1, 3)
     
     return baseline_uvw
 
