@@ -11,3 +11,8 @@ __pycache__/
 *.pyo
 *.pyd
 .Python
+docs/_build/
+.venv-docs/
+.mplconfig/
+.conda-docs/
+.conda-pkgs/

@@ -26,6 +26,25 @@ All packages are pulled from `conda-forge`, including CUDA-enabled builds where 
 
 GitHub Copilot users can refer to `.github/copilot-instructions.md` for project-specific guidance to keep suggestions consistent with the codebase. Agents and collaborators can consult `AGENTS.md` for repository-wide instructions on environment updates and testing expectations.
 
+## Documentation
+
+Read the Docs content lives in `docs/`, with the hosted build configured through `.readthedocs.yaml`.
+
+To build the documentation locally from the lite environment:
+
+```bash
+conda activate scepter-dev
+sphinx-build -b html docs docs/_build/html
+```
+
+To refresh an older local environment before building:
+
+```bash
+conda env update -n scepter-dev -f environment.yml
+conda activate scepter-dev
+sphinx-build -b html docs docs/_build/html
+```
+
 ### Simulation Example Figure
 
 ![Simulation Grid](./notebooks/example.png)
@@ -50,4 +69,3 @@ Currently, 6 dimensions are used:
 
 Github Repo: https://github.com/hqiu-nju/scepter
 Code will be moving to SKAO Gitlab in the future.
-

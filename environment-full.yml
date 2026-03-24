@@ -11,6 +11,9 @@ dependencies:
   - tqdm
   - seaborn
   - ipympl
+  # Documentation tooling
+  - sphinx
+  - sphinx-rtd-theme
   # Optional visualization stack
   - trame
   - trame-jupyter-extension
