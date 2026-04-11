@@ -1,18 +1,59 @@
-scepter.egg-info/dependency_links.txt
-scepter.egg-info/PKG-INFO
-scepter.egg-info/requires.txt
-scepter.egg-info/SOURCES.txt
-scepter.egg-info/top_level.txt
-notebooks/starlink_100.npz
-notebooks/oneweb_1ms.npz
-.DS_Store
+# Python
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
 .Python
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Testing
+.pytest-tmp/
+.pytest_cache/
+htmlcov/
+.coverage
+*.cover
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Build artefacts
+*.so
+*.whl
+
+# Data files not tracked
+notebooks/starlink_100.npz
+notebooks/oneweb_1ms.npz
+
+# Simulation outputs
+*.h5
+!scepter/tests/*.h5
+
+# Benchmark logs
+benchmark_*_log.txt
+
+# Documentation builds
 docs/_build/
 .venv-docs/
 .mplconfig/
 .conda-docs/
 .conda-pkgs/
+CLAUDE.md

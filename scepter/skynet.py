@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
 
 """
-skynet.py
+Sky-grid generation helpers for SCEPTer workflows.
 
-This is the module for generating the sky grid
+Authors
+-------
+- Hao Qiu <https://github.com/hqiu-nju>
+- Boris Sorokin <boris.sorokin@skao.int> AKA Mralin <mralin@protonmail.com>
 
-Author: Harry Qiu <hqiu678@outlook.com>
-Collaborator: Boris Sorokin <mralin@protonmail.com>
-Date: 12-03-2024
+This module remains part of the GPLv3-licensed SCEPTer project. The author
+attribution above does not change the project-wide license.
+
+Notes
+-----
+Boris Sorokin contributed the S.1586 point-generation work in this module.
 """
 
 import cysgp4

@@ -1,0 +1,21 @@
+# Files to include in source distributions (sdist).
+
+include LICENSE
+include AUTHORS.md
+include THIRD_PARTY_NOTICES.md
+include CHANGELOG.md
+include README.md
+include requirements.txt
+include pytest.ini
+
+# Bundled data files
+recursive-include scepter/data *.geojson *.svg *.ico *.jpg
+
+# Exclude test fixtures, notebooks, and development-only files
+prune scepter/tests
+prune notebooks
+prune .pytest-tmp
+prune .github
+exclude CLAUDE.md
+exclude CODEX.md
+exclude AGENTS.md

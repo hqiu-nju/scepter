@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 
 """
-tlefinder.py
+TLE archive discovery helpers for SCEPTer workflows.
 
-A smart utility to find TLEs from the SKA Observatory TLE archive and propagate them to the observer location.
-For tle npz format, please contact the SKAO spectrum management team.
+Authors
+-------
+- Hao Qiu <https://github.com/hqiu-nju>
 
-Author: Harry Qiu <hqiu678@outlook.com>
+This module remains part of the GPLv3-licensed SCEPTer project. The author
+attribution above does not change the project-wide license.
 
-Date: 12-04-2025
+Notes
+-----
+For TLE NPZ format support, please contact the SKAO spectrum management team.
 """
 
 import glob 
