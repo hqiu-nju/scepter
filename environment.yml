@@ -11,3 +11,6 @@ dependencies:
   - tqdm
   - seaborn
   - ipympl
+  # Documentation tooling
+  - sphinx
+  - sphinx-rtd-theme
