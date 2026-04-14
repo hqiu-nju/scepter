@@ -1429,7 +1429,14 @@ def _resolve_bandwidth_view_context(
         else:
             bandwidth_label = f"over {reference_bandwidth_mhz * 1e6:g} Hz"
 
-    offset_db = 10.0 * math.log10(float(target_bandwidth_mhz) / float(source_bandwidth_mhz))
+    _src_bw = float(source_bandwidth_mhz)
+    _tgt_bw = float(target_bandwidth_mhz)
+    if _src_bw <= 0.0 or not math.isfinite(_src_bw) or _tgt_bw <= 0.0 or not math.isfinite(_tgt_bw):
+        raise ValueError(
+            "source_bandwidth_mhz and target_bandwidth_mhz must be finite and > 0 "
+            f"(got source={_src_bw!r}, target={_tgt_bw!r})."
+        )
+    offset_db = 10.0 * math.log10(_tgt_bw / _src_bw)
     return {
         **metadata,
         "view_mode": str(view_mode),
@@ -3937,7 +3944,19 @@ def _render_beam_cap_sizing_analysis(
     if not enabled_keys:
         raise RuntimeError("Enable at least one beam-cap policy.")
     nco_override = int(params.get("nco_override", 0) or 0)
-    nco_from_file = int(root_attrs.get("nco", 1) or 1)
+    # UEMR runs store ``nco="n/a"`` because the concept doesn't apply.
+    # The beam-cap sizing recipe has no meaning on a UEMR output — refuse
+    # rather than silently coercing the sentinel into a misleading 1.
+    _nco_raw = root_attrs.get("nco", 1)
+    if isinstance(_nco_raw, (bytes, bytearray)):
+        _nco_raw = _nco_raw.decode("utf-8", errors="replace")
+    _uemr_flag = bool(root_attrs.get("uemr_mode", False))
+    if _uemr_flag or (isinstance(_nco_raw, str) and not _nco_raw.strip().isdigit()):
+        raise RuntimeError(
+            "Beam-cap sizing is not applicable to UEMR (isotropic per-satellite) "
+            "runs — they have no beam library. Pick a different postprocess recipe."
+        )
+    nco_from_file = int(_nco_raw or 1)
     _beam_group_prefix = f"system_{int(system_index)}/" if system_index is not None else ""
     result = nbeam.run_beam_cap_sizing(
         filename,

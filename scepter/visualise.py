@@ -2944,7 +2944,23 @@ def plot_hemisphere_2D(
         ax.set_ylabel("Elevation [deg]")
         ax.set_aspect(360 / 90)
 
-        if (draw_guides is True) or (draw_guides is None and projection.lower() == "rect"):
+        # Ensure the lower elevation bound is visibly ticked — the default
+        # MaxNLocator picks round values (20, 30, ...) and silently hides
+        # the operational-range minimum (e.g. 15°), which is the most
+        # load-bearing number on this axis.
+        _y_lo, _y_hi = ax.get_ylim()
+        _auto_ticks = [float(t) for t in ax.get_yticks() if _y_lo <= float(t) <= _y_hi]
+        if not _auto_ticks or abs(_auto_ticks[0] - _y_lo) > 1e-6:
+            _auto_ticks = [float(_y_lo)] + [t for t in _auto_ticks if t > _y_lo + 1e-6]
+            ax.set_yticks(_auto_ticks)
+
+        # Matplotlib's rectangular projection already renders clean native
+        # axes (spines + ticks + labels) matching the Plotly rectangular
+        # layout. The arrow-guides only make sense for the polar projection;
+        # drawing them on top of the native rectangular axes produces a
+        # duplicated "arrow + spine" look. Require draw_guides=True to
+        # explicitly opt in on rect.
+        if draw_guides is True:
             def _axis_arrow(x0, y0, x1, y1, label):
                 """Draw one rectangular guide axis with optional directional arrow."""
                 ax.plot([x0, x1], [y0, y1], color=guide_color,

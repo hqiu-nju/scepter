@@ -242,6 +242,15 @@ For consistent high-quality changes, read the contributor guidance:
 When making dependency changes, keep `environment.yml`, `environment-full.yml`,
 `requirements.txt`, and `setup.py` aligned.
 
+## Development tooling
+
+Large portions of the simulation pipeline, GUI, and test infrastructure
+were co-developed with AI coding assistants — primarily **OpenAI Codex**
+and **Anthropic Claude** — under human direction and review. The
+repository-wide rules those assistants are expected to follow are
+defined in `AGENTS.md`. All merged code is reviewed for correctness,
+ITU-R compliance, and numerical accuracy before release.
+
 ## License
 
 SCEPTer is distributed under the **GNU General Public License v3.0 or later**

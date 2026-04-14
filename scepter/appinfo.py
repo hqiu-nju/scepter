@@ -4,7 +4,7 @@ from __future__ import annotations
 
 APP_NAME = "SCEPTer"
 GUI_APP_NAME = "SCEPTer GUI"
-APP_VERSION = "0.25.0"
+APP_VERSION = "0.25.1"
 APP_VERSION_TAG = f"v{APP_VERSION}"
 GUI_WINDOW_TITLE_BASE = f"{GUI_APP_NAME} {APP_VERSION_TAG}"
 
@@ -13,7 +13,7 @@ ABOUT_TEXT = (
     f"{GUI_APP_NAME} {APP_VERSION_TAG}\n\n"
     "SCEPTer — simulating satellite constellation emission patterns for radio telescopes.\n\n"
     "This desktop GUI and the maintained workflow notebooks share the same "
-    "simulation and post-processing capabilities for the v0.25.0 release.\n\n"
+    "simulation and post-processing capabilities for the v0.25.1 release.\n\n"
     "Authors / contacts:\n"
     "  • Boris Sorokin <boris.sorokin@skao.int>  <mralin@protonmail.com>\n"
     "  • Hao (Harry) Qiu (GitHub: https://github.com/hqiu-nju)\n\n"

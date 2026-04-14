@@ -21,6 +21,19 @@ The `scepter.gpu_accel` module includes additional attribution:
 
 - Boris Sorokin `<boris.sorokin@skao.int>` AKA Mralin `<mralin@protonmail.com>`
 
+## AI coding assistants
+
+Substantial parts of the codebase were co-developed with AI coding
+assistants working under human direction:
+
+- **OpenAI Codex** — pair-programming and code generation
+- **Anthropic Claude** — pair-programming, code review, and documentation
+
+The assistants are not copyright holders; all contributions were
+authored, reviewed, and accepted by the human lead developers listed
+above. The repository-wide code-quality rules those assistants are
+expected to meet are defined in `AGENTS.md`.
+
 ## License
 
 This attribution file does not change the project-wide GPLv3 licence.  See

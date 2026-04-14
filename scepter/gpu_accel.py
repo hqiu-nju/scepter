@@ -3305,6 +3305,21 @@ class GpuM2101PatternContext:
 
 
 @dataclass(slots=True)
+class GpuIsotropicPatternContext:
+    """Isotropic transmit pattern for UEMR-style unwanted-emission sources.
+
+    Models leakage from internal satellite circuitry: omnidirectional radiator
+    with Gtx(θ, φ) = 0 dBi (linear gain = 1.0) in every direction. The whole
+    satellite contributes a single EIRP = Ptx; there is no beam steering, no
+    sidelobes, and no LUT. Used when the radiator is internal to the chassis
+    rather than coupled to a directive antenna.
+    """
+
+    session: "GpuScepterSession" = field(repr=False, compare=False)
+    wavelength_m: float = 0.1
+
+
+@dataclass(slots=True)
 class GpuRasPatternContext:
     """
     Compact RAS receive-pattern parameters for repeated GPU evaluation.
@@ -10747,12 +10762,30 @@ def get_pattern_eval_mode() -> str:
     return _s1528_pattern_eval_mode
 
 
+def _evaluate_isotropic_pattern_cp(
+    context: GpuIsotropicPatternContext,
+    theta_deg: Any,
+    phi_deg: Any | None = None,
+) -> Any:
+    """Isotropic pattern evaluation — returns 0 dB (Gtx = 0 dBi) at every angle.
+
+    The output matches ``theta_deg`` in shape and dtype so it can substitute
+    for any S.1528 / S.1528 Rec 1.2 result in the dispatcher. ``phi_deg`` is
+    accepted for call-site symmetry but is unused.
+    """
+    del context, phi_deg
+    theta_cp = _to_cupy_array(theta_deg, dtype=cp.float32)
+    return cp.zeros_like(theta_cp)
+
+
 def _evaluate_s1528_pattern_cp(
-    context: GpuS1528PatternContext | GpuS1528Rec12PatternContext,
+    context: GpuS1528PatternContext | GpuS1528Rec12PatternContext | GpuIsotropicPatternContext,
     theta_deg: Any,
     phi_deg: Any | None = None,
 ) -> Any:
     """S.1528 pattern evaluation — dispatches to Rec 1.2 or Rec 1.4 based on context type."""
+    if isinstance(context, GpuIsotropicPatternContext):
+        return _evaluate_isotropic_pattern_cp(context, theta_deg, phi_deg=phi_deg)
     if isinstance(context, GpuS1528Rec12PatternContext):
         # Rec 1.2: use LUT if available, else direct piecewise kernel
         if context.d_gain_lut is not None:
@@ -10847,6 +10880,8 @@ def _pattern_peak_gain_linear(pattern_context: Any) -> float:
         )
         gm_db = g_emax_db + 10.0 * math.log10(float(n_elements))
         return float(10.0 ** (gm_db / 10.0))
+    if isinstance(pattern_context, GpuIsotropicPatternContext):
+        return 1.0
     raise TypeError(
         f"Unsupported transmit pattern for peak-gain lookup: {type(pattern_context).__name__}"
     )
@@ -10876,6 +10911,9 @@ def _evaluate_normalised_pattern_cp(
         gain_db_cp = _evaluate_s1528_rec12_pattern_cp(pattern_context, theta_deg_cp)
         lin_cp = cp.power(cp.float32(10.0), gain_db_cp.astype(cp.float32, copy=False) * cp.float32(0.1))
         return lin_cp * cp.float32(float(inv_gmax_lin))
+    if isinstance(pattern_context, GpuIsotropicPatternContext):
+        theta_cp = _to_cupy_array(theta_deg_cp, dtype=cp.float32)
+        return cp.full(theta_cp.shape, cp.float32(float(inv_gmax_lin)), dtype=cp.float32)
     raise TypeError(
         f"Unsupported transmit pattern for normalised evaluation: {type(pattern_context).__name__}"
     )
@@ -10932,10 +10970,13 @@ def _build_peak_pfd_k_lut_cp(
             "_build_peak_pfd_k_lut_cp expects an axisymmetric pattern; "
             "route M.2101 contexts through _build_peak_pfd_k_lut_2d_cp."
         )
-    if not isinstance(pattern_context, (GpuS1528PatternContext, GpuS1528Rec12PatternContext)):
+    if not isinstance(
+        pattern_context,
+        (GpuS1528PatternContext, GpuS1528Rec12PatternContext, GpuIsotropicPatternContext),
+    ):
         raise TypeError(
-            "Surface-PFD cap LUT requires an S.1528 / S.1528 Rec 1.2 pattern "
-            f"context; got {type(pattern_context).__name__}."
+            "Surface-PFD cap LUT requires an S.1528 / S.1528 Rec 1.2 / "
+            f"isotropic pattern context; got {type(pattern_context).__name__}."
         )
 
     earth_r = float(earth_radius_m)
@@ -12269,55 +12310,357 @@ def _accumulate_beamforming_collapsed_power_cp(
     orbit_r_2d = cp.broadcast_to(orbit_r_broadcast, (time_count, sat_count)).copy()
 
     kernel = _get_beamforming_collapsed_kernel()
-    prx_per_sat = kernel(
+    # base_per_sat = power AT the antenna site WITHOUT receive gain. This is
+    # the "isotropic-RX" reference power: PFD × A_iso. Keep it cleanly
+    # separate from the receive-gain-multiplied per-sat Prx so we don't have
+    # to "divide out" Grx later (the previous code did that — fragile when
+    # Grx is small in deep sidelobes).
+    base_per_sat = kernel(
         range_m, sat_elevation_deg, orbit_r_2d, earth_r,
         wavelength, atm_lin,
         cp.float32(float(collapsed_baseline_eirp_dbw_hz)),
         freq_term_db, ras_bw_hz,
     )
 
-    # Apply RAS receive gain if available
-    if ras_pattern_context is not None and telescope_azimuth_deg is not None and telescope_elevation_deg is not None:
+    # The S.1586 sky-cell scan is the telescope's own strategy and is
+    # independent of which satellite system is on the transmit side. We
+    # therefore ALWAYS compute per-(t, sky, sat) Grx when pointings carry
+    # a real sky axis (N_sky > 1). Using `tel_az[:, 0]` was a bug —
+    # see CHANGELOG / CLAUDE.md note on per-sky-cell Grx.
+    sky_count = 1
+    grx_per_sky_sat = None  # (T, N_sky, S) when computed
+    grx_lin_2d = None       # (T, S) for the legacy single-pointing path
+    if (
+        ras_pattern_context is not None
+        and telescope_azimuth_deg is not None
+        and telescope_elevation_deg is not None
+    ):
         tel_az = _to_cupy_array(telescope_azimuth_deg, dtype=cp.float32)
         tel_el = _to_cupy_array(telescope_elevation_deg, dtype=cp.float32)
-        # For collapsed mode, use sky cell 0 (single pointing)
-        if tel_az.ndim >= 2:
-            tel_az_use = tel_az[:, 0] if tel_az.shape[1] > 0 else cp.zeros(time_count, dtype=cp.float32)
-            tel_el_use = tel_el[:, 0] if tel_el.shape[1] > 0 else cp.zeros(time_count, dtype=cp.float32)
-        else:
-            tel_az_use = tel_az
-            tel_el_use = tel_el
-        # Angular distance between RAS pointing and each satellite
         d2r = cp.float32(0.017453292519943295)
         sat_az_rad = sat_topo_cp[:, :, 0] * d2r
         sat_el_rad = sat_elevation_deg * d2r
-        tel_az_rad = (tel_az_use[:, None] * d2r) if tel_az_use.ndim == 1 else tel_az_use * d2r
-        tel_el_rad = (tel_el_use[:, None] * d2r) if tel_el_use.ndim == 1 else tel_el_use * d2r
-        cos_gamma = (
-            cp.sin(tel_el_rad) * cp.sin(sat_el_rad)
-            + cp.cos(tel_el_rad) * cp.cos(sat_el_rad)
-            * (cp.cos(tel_az_rad) * cp.cos(sat_az_rad) + cp.sin(tel_az_rad) * cp.sin(sat_az_rad))
-        )
-        cp.clip(cos_gamma, cp.float32(-1), cp.float32(1), out=cos_gamma)
-        grx_offset_deg = cp.arccos(cos_gamma) * cp.float32(57.29577951308232)
-        grx_db = _evaluate_ras_pattern_cp(ras_pattern_context, grx_offset_deg)
-        grx_lin = cp.power(cp.float32(10.0), grx_db * cp.float32(0.1))
-        prx_per_sat = prx_per_sat * grx_lin
+        if tel_az.ndim >= 2:
+            sky_count = int(tel_az.shape[1])
+        if sky_count > 1:
+            # Per-(t, sky, sat) γ
+            tel_az_rad = (tel_az * d2r)[:, :, None]
+            tel_el_rad = (tel_el * d2r)[:, :, None]
+            sat_az_3 = sat_az_rad[:, None, :]
+            sat_el_3 = sat_el_rad[:, None, :]
+            cos_gamma = (
+                cp.sin(tel_el_rad) * cp.sin(sat_el_3)
+                + cp.cos(tel_el_rad) * cp.cos(sat_el_3)
+                * cp.cos(tel_az_rad - sat_az_3)
+            )
+            cp.clip(cos_gamma, cp.float32(-1), cp.float32(1), out=cos_gamma)
+            grx_offset_deg = cp.arccos(cos_gamma) * cp.float32(57.29577951308232)
+            grx_db = _evaluate_ras_pattern_cp(ras_pattern_context, grx_offset_deg)
+            grx_per_sky_sat = cp.power(cp.float32(10.0), grx_db * cp.float32(0.1))
+        else:
+            # Legacy: single-pointing case (ndim < 2 or N_sky == 1).
+            tel_az_use = tel_az[:, 0] if tel_az.ndim >= 2 else tel_az
+            tel_el_use = tel_el[:, 0] if tel_el.ndim >= 2 else tel_el
+            tel_az_rad = (tel_az_use[:, None] * d2r) if tel_az_use.ndim == 1 else tel_az_use * d2r
+            tel_el_rad = (tel_el_use[:, None] * d2r) if tel_el_use.ndim == 1 else tel_el_use * d2r
+            cos_gamma = (
+                cp.sin(tel_el_rad) * cp.sin(sat_el_rad)
+                + cp.cos(tel_el_rad) * cp.cos(sat_el_rad)
+                * cp.cos(tel_az_rad - sat_az_rad)
+            )
+            cp.clip(cos_gamma, cp.float32(-1), cp.float32(1), out=cos_gamma)
+            grx_offset_deg = cp.arccos(cos_gamma) * cp.float32(57.29577951308232)
+            grx_db = _evaluate_ras_pattern_cp(ras_pattern_context, grx_offset_deg)
+            grx_lin_2d = cp.power(cp.float32(10.0), grx_db * cp.float32(0.1))
 
-    # Sum across satellites
-    prx_total = cp.sum(prx_per_sat, axis=1)  # shape: (T,)
     pfd_scale = cp.float32(4.0 * float(np.pi) / (float(wavelength_m) ** 2))
-
     result: dict[str, Any] = {}
-    if include_prx_total:
-        result["Prx_total_W"] = prx_total[:, None, None]  # (T, 1, 1) for compat
-    if include_epfd:
-        result["EPFD_W_m2"] = (prx_total * pfd_scale)[:, None, None]
+
+    # Sky-aware aggregations: per-(t, sky) Prx_total and EPFD when N_sky > 1,
+    # collapsed (T, 1, 1) for the legacy single-pointing path. Layout
+    # matches the directive kernel's writer contract: (T, 1, N_sky) so the
+    # cell axis stays size-1 (collapsed power has no per-cell dependence).
+    if grx_per_sky_sat is not None:
+        prx_per_sky_sat = base_per_sat[:, None, :] * grx_per_sky_sat   # (T, N_sky, S)
+        prx_total_t_sky = cp.sum(prx_per_sky_sat, axis=2)              # (T, N_sky)
+        if include_prx_total:
+            result["Prx_total_W"] = prx_total_t_sky[:, None, :]        # (T, 1, N_sky)
+        if include_epfd:
+            result["EPFD_W_m2"] = (prx_total_t_sky * pfd_scale)[:, None, :]
+    else:
+        prx_per_sat_2d = base_per_sat
+        if grx_lin_2d is not None:
+            prx_per_sat_2d = prx_per_sat_2d * grx_lin_2d
+        prx_total_t = cp.sum(prx_per_sat_2d, axis=1)                   # (T,)
+        if include_prx_total:
+            result["Prx_total_W"] = prx_total_t[:, None, None]
+        if include_epfd:
+            result["EPFD_W_m2"] = (prx_total_t * pfd_scale)[:, None, None]
+
     if include_total_pfd:
-        # PFD = power without Grx × pfd_scale
-        pfd_per_sat = prx_per_sat / cp.maximum(grx_lin if ras_pattern_context is not None else cp.float32(1.0), cp.float32(1e-30))
-        pfd_total = cp.sum(pfd_per_sat, axis=1) * pfd_scale
+        # PFD at the antenna site does NOT involve receive gain — sum the
+        # gain-free per-sat contribution and scale. Independent of sky
+        # pointing direction, so always (T, 1, 1).
+        pfd_total = cp.sum(base_per_sat, axis=1) * pfd_scale
         result["PFD_total_RAS_STATION_W_m2"] = pfd_total[:, None, None]
+    return result
+
+
+def _accumulate_uemr_power_cp(
+    *,
+    uemr_pattern_context: "GpuIsotropicPatternContext",
+    ras_pattern_context: "GpuRasPatternContext | None",
+    atmosphere_lut_context: "GpuAtmosphereLutContext | None",
+    sat_topo: Any,
+    telescope_azimuth_deg: Any | None,
+    telescope_elevation_deg: Any | None,
+    observer_alt_km: float,
+    bandwidth_mhz: float,
+    power_input_quantity: str,
+    target_pfd_dbw_m2_channel: float | None,
+    satellite_ptx_dbw_channel: float | None,
+    satellite_eirp_dbw_channel: float | None,
+    eirp_slab_fraction_lin: float = 1.0,
+    visibility_elev_threshold_deg: float = 0.0,
+    include_epfd: bool = True,
+    include_prx_total: bool = True,
+    include_per_satellite_prx: bool = False,
+    include_total_pfd: bool = False,
+    include_per_satellite_pfd: bool = False,
+) -> dict[str, Any]:
+    """Compute per-satellite power / PFD / EPFD for a UEMR-mode system.
+
+    UEMR (unwanted emissions from internal circuitry) radiates isotropically,
+    Gtx = 0 dBi in every direction, with no beam mechanics. Each visible
+    satellite contributes
+
+        PFD_s   = EIRP_channel · atm(el) / (4π · d²)
+        Prx_s   = EIRP_channel · (λ / 4π d)² · atm(el) · Grx(γ)
+        EPFD_s  = Prx_s · (4π / λ²)
+
+    and the per-time totals are the sums over satellites.
+
+    Parameters
+    ----------
+    uemr_pattern_context
+        Isotropic pattern context — only its ``wavelength_m`` is consumed.
+    ras_pattern_context
+        RAS receive pattern. Used to weight Prx / EPFD by Grx(γ) where γ is
+        the angle between each satellite and the telescope pointing.
+    sat_topo
+        ``(T, S, 3)`` array of (az_deg, el_deg, range_km) in the RAS-station
+        topocentric frame.
+    telescope_azimuth_deg, telescope_elevation_deg
+        RAS pointing either as ``(T,)`` or ``(T, N_sky)`` device tensors. Only
+        the first sky-cell is consumed (UEMR is direction-agnostic; the
+        receive-side Grx is the only place pointing matters).
+    eirp_slab_fraction_lin
+        Per-slab linear scaling applied to EIRP_channel. The caller (scenario
+        pipeline) multiplies in the in-band fraction of the transmit
+        spectrum for the current spectral slab so the emission mask can
+        shape UEMR power across frequency. Default ``1.0`` (no mask).
+
+    Returns
+    -------
+    dict
+        Result arrays keyed the same as ``_accumulate_ras_power_cp`` but
+        shaped ``(T, 1, 1)`` to broadcast into the writer's
+        ``(T, N_sky, N_cell)`` layout. Per-satellite fields have shape
+        ``(T, S)``.
+    """
+    import math as _math
+
+    if not isinstance(uemr_pattern_context, GpuIsotropicPatternContext):
+        raise TypeError(
+            "_accumulate_uemr_power_cp requires a GpuIsotropicPatternContext; "
+            f"got {type(uemr_pattern_context).__name__}."
+        )
+
+    quantity = str(power_input_quantity).strip().lower()
+    if quantity not in {"target_pfd", "satellite_ptx", "satellite_eirp"}:
+        raise ValueError(
+            "power_input_quantity must be 'target_pfd', 'satellite_ptx', or "
+            f"'satellite_eirp'; got {power_input_quantity!r}."
+        )
+    bandwidth_value = float(bandwidth_mhz)
+    if not np.isfinite(bandwidth_value) or bandwidth_value <= 0.0:
+        raise ValueError("bandwidth_mhz must be finite and > 0.")
+
+    sat_topo_cp = _to_cupy_array(sat_topo, dtype=cp.float32)
+    if sat_topo_cp.ndim != 3 or sat_topo_cp.shape[2] != 3:
+        raise ValueError(
+            "sat_topo must have shape (T, S, 3); got "
+            f"{tuple(sat_topo_cp.shape)!r}."
+        )
+    time_count, sat_count = int(sat_topo_cp.shape[0]), int(sat_topo_cp.shape[1])
+    wavelength_m = float(uemr_pattern_context.wavelength_m)
+    range_m = sat_topo_cp[..., 2] * cp.float32(1000.0)
+    sat_el_deg = sat_topo_cp[..., 1]
+    sat_az_deg = sat_topo_cp[..., 0]
+    # Radio-horizon aware visibility: use the same threshold the rest of
+    # the pipeline applies (can be slightly negative when use_radio_horizon
+    # extends visibility via tropospheric/ionospheric refraction).
+    vis = sat_el_deg > cp.float32(float(visibility_elev_threshold_deg))
+
+    if atmosphere_lut_context is not None:
+        atm_lin = _lookup_atmosphere_lut_cp(
+            atmosphere_lut_context, sat_el_deg, altitude_km=observer_alt_km,
+        ).astype(cp.float32, copy=False)
+        # Atmosphere LUT returns linear transmission ∈ (0, 1]; clip so
+        # LUT rounding artifacts cannot push the computed PFD above the
+        # free-space value. Mirrors the directive power kernel behaviour.
+        atm_lin = cp.clip(atm_lin, cp.float32(0.0), cp.float32(1.0))
+    else:
+        atm_lin = cp.ones((time_count, sat_count), dtype=cp.float32)
+
+    # Resolve EIRP_channel in linear watts. Target-PFD mode reverse-maps the
+    # user's requested surface PFD to an equivalent EIRP via a reference
+    # slant range (nadir from the mean orbit radius). For UEMR this is less
+    # meaningful than for directive patterns — we accept it for API parity
+    # and warn callers that EIRP / Ptx are the natural UEMR inputs.
+    if quantity == "satellite_eirp":
+        if satellite_eirp_dbw_channel is None:
+            raise ValueError("satellite_eirp_dbw_channel must be set in satellite_eirp mode.")
+        eirp_lin_channel = float(10.0 ** (float(satellite_eirp_dbw_channel) / 10.0))
+    elif quantity == "satellite_ptx":
+        if satellite_ptx_dbw_channel is None:
+            raise ValueError("satellite_ptx_dbw_channel must be set in satellite_ptx mode.")
+        # Gtx = 0 dBi → EIRP_dBW = Ptx_dBW
+        eirp_lin_channel = float(10.0 ** (float(satellite_ptx_dbw_channel) / 10.0))
+    else:
+        if target_pfd_dbw_m2_channel is None:
+            raise ValueError("target_pfd_dbw_m2_channel must be set in target_pfd mode.")
+        # Invert PFD = EIRP / (4π r²) using r = nadir range of a nominal
+        # 550 km LEO shell. This path is mostly a compatibility shim; UEMR
+        # users should drive with Ptx or EIRP in practice.
+        nominal_range_m = 550.0e3
+        eirp_lin_channel = float(
+            (10.0 ** (float(target_pfd_dbw_m2_channel) / 10.0))
+            * (4.0 * _math.pi * nominal_range_m * nominal_range_m)
+        )
+
+    slab_frac = float(eirp_slab_fraction_lin)
+    if not np.isfinite(slab_frac) or slab_frac < 0.0:
+        raise ValueError("eirp_slab_fraction_lin must be finite and non-negative.")
+    eirp_effective_w = cp.float32(eirp_lin_channel * slab_frac)
+
+    # FSPL = (λ / 4π·d)². Guard against zero range.
+    wavelength_w = cp.float32(wavelength_m)
+    four_pi_w = cp.float32(4.0 * _math.pi)
+    range_safe = cp.where(vis, range_m, cp.float32(1.0))
+    fspl = cp.power(wavelength_w / (four_pi_w * range_safe), cp.float32(2.0))
+    fspl = cp.where(vis, fspl, cp.float32(0.0))
+
+    pfd_scale = cp.float32(4.0 * _math.pi / (wavelength_m * wavelength_m))
+    pfd_per_sat = eirp_effective_w * atm_lin / (
+        four_pi_w * range_safe * range_safe
+    )
+    pfd_per_sat = cp.where(vis, pfd_per_sat, cp.float32(0.0))
+
+    # Grx(γ) for Prx / EPFD. UEMR is direction-agnostic on TX, but the
+    # received Prx absolutely depends on RAS pointing direction because
+    # the receive antenna gain Grx(γ) varies with the angle between the
+    # RAS sky-cell pointing and each satellite. The telescope pointings
+    # tensor has shape (T, N_sky) — one independent pointing per sky cell
+    # per timestep. We MUST compute γ per (t, sky, sat) and broadcast Grx
+    # accordingly; using `tel_az[:, 0]` (only the first sky cell) was a
+    # bug that made the heatmap depend on RAS operational range in a
+    # spurious way (changing the operational range shifted which cell was
+    # at index 0 → effective RAS pointing direction changed → peak Prx
+    # shifted by ~10 dB with no physical justification).
+    sky_count = 1
+    grx_lin: Any = cp.float32(1.0)
+    grx_per_sky_sat = None  # shape (T, N_sky, S) when computed
+    if (
+        ras_pattern_context is not None
+        and telescope_azimuth_deg is not None
+        and telescope_elevation_deg is not None
+    ):
+        tel_az = _to_cupy_array(telescope_azimuth_deg, dtype=cp.float32)
+        tel_el = _to_cupy_array(telescope_elevation_deg, dtype=cp.float32)
+        d2r = cp.float32(_math.pi / 180.0)
+        sat_az_r = sat_az_deg * d2r            # shape (T, S)
+        sat_el_r = sat_el_deg * d2r            # shape (T, S)
+        if tel_az.ndim >= 2:
+            sky_count = int(tel_az.shape[1])
+        if sky_count > 1:
+            # Per-(t, sky, sat) γ. tel_*_r shape (T, N_sky, 1); sat_*_r (T, 1, S).
+            tel_az_r = (tel_az * d2r)[:, :, None]
+            tel_el_r = (tel_el * d2r)[:, :, None]
+            sat_az_r3 = sat_az_r[:, None, :]
+            sat_el_r3 = sat_el_r[:, None, :]
+            cos_gamma = (
+                cp.sin(tel_el_r) * cp.sin(sat_el_r3)
+                + cp.cos(tel_el_r) * cp.cos(sat_el_r3) * cp.cos(tel_az_r - sat_az_r3)
+            )
+            cp.clip(cos_gamma, cp.float32(-1.0), cp.float32(1.0), out=cos_gamma)
+            gamma_deg = cp.arccos(cos_gamma) * cp.float32(180.0 / _math.pi)
+            grx_db = _evaluate_ras_pattern_cp(ras_pattern_context, gamma_deg)
+            grx_per_sky_sat = cp.power(
+                cp.float32(10.0),
+                grx_db.astype(cp.float32, copy=False) * cp.float32(0.1),
+            )
+        else:
+            tel_az_use = tel_az[:, 0] if tel_az.ndim >= 2 else tel_az
+            tel_el_use = tel_el[:, 0] if tel_el.ndim >= 2 else tel_el
+            tel_az_r = (tel_az_use[:, None] * d2r) if tel_az_use.ndim == 1 else tel_az_use * d2r
+            tel_el_r = (tel_el_use[:, None] * d2r) if tel_el_use.ndim == 1 else tel_el_use * d2r
+            cos_gamma = (
+                cp.sin(tel_el_r) * cp.sin(sat_el_r)
+                + cp.cos(tel_el_r) * cp.cos(sat_el_r) * cp.cos(tel_az_r - sat_az_r)
+            )
+            cp.clip(cos_gamma, cp.float32(-1.0), cp.float32(1.0), out=cos_gamma)
+            gamma_deg = cp.arccos(cos_gamma) * cp.float32(180.0 / _math.pi)
+            grx_db = _evaluate_ras_pattern_cp(ras_pattern_context, gamma_deg)
+            grx_lin = cp.power(cp.float32(10.0), grx_db.astype(cp.float32, copy=False) * cp.float32(0.1))
+
+    # Base per-sat power with FSPL + atmosphere (no RAS-receive gain yet).
+    base_per_sat = eirp_effective_w * fspl * atm_lin   # shape (T, S)
+    result: dict[str, Any] = {}
+
+    if grx_per_sky_sat is not None:
+        # Per-(t, sky, sat) Prx. Memory: T*N_sky*S*4 bytes for float32.
+        prx_per_sky_sat = base_per_sat[:, None, :] * grx_per_sky_sat
+    else:
+        prx_per_sat_1d = base_per_sat
+        if not isinstance(grx_lin, float):
+            prx_per_sat_1d = prx_per_sat_1d * grx_lin
+        elif grx_lin != 1.0:
+            prx_per_sat_1d = prx_per_sat_1d * grx_lin
+        prx_per_sky_sat = prx_per_sat_1d[:, None, :]   # (T, 1, S) for shape consistency
+
+    # Aggregations now have a real sky axis. Match the directive kernel's
+    # (T, 1, N_sky) layout for compatibility with the writer pipeline (which
+    # expects axis 2 = sky for total quantities). UEMR is uniform across
+    # earth-grid cells, so axis 1 stays size 1.
+    if include_prx_total:
+        prx_total = cp.sum(prx_per_sky_sat, axis=2)        # (T, N_sky)
+        result["Prx_total_W"] = prx_total[:, None, :]      # (T, 1, N_sky)
+    if include_per_satellite_prx:
+        # Per-sat output contract matches the directive kernel's non-
+        # boresight branch: shape (T, S). When the kernel evaluated Grx
+        # across N_sky cells, the per-sat value is the MEAN over sky cells
+        # — a physically meaningful estimator of "expected Prx contribution
+        # from this satellite under random RAS pointing within the
+        # operational range". Per-sky variation is still observable via
+        # the (T, N_sky, n_cells) aggregates (Prx_total, EPFD).
+        if grx_per_sky_sat is not None:
+            result["Prx_per_sat_RAS_STATION_W"] = cp.mean(prx_per_sky_sat, axis=1)
+        else:
+            result["Prx_per_sat_RAS_STATION_W"] = prx_per_sky_sat[:, 0, :]
+    if include_epfd:
+        epfd = cp.sum(prx_per_sky_sat * pfd_scale, axis=2)  # (T, N_sky)
+        result["EPFD_W_m2"] = epfd[:, None, :]              # (T, 1, N_sky)
+    if include_total_pfd:
+        # PFD at the antenna site is independent of RAS pointing direction
+        # (no antenna gain in the PFD definition). Match directive's
+        # non-boresight contract: a 1-D (T,) tensor. The writer broadcasts
+        # to its storage layout. Using (T, 1, 1) here would mismatch the
+        # directive shape and break the multi-system combiner.
+        pfd_total = cp.sum(pfd_per_sat, axis=1)
+        result["PFD_total_RAS_STATION_W_m2"] = pfd_total
+    if include_per_satellite_pfd:
+        result["PFD_per_sat_RAS_STATION_W_m2"] = pfd_per_sat
     return result
 
 
@@ -12482,11 +12825,15 @@ def _accumulate_ras_power_cp(
     rad2deg = cp.float32(180.0 / np.pi)
     four_pi = cp.float32(4.0 * np.pi)
     wavelength_m = cp.float32(s1528_pattern_context.wavelength_m)
-    # Derive peak gain: S.1528 uses gm_db directly; M.2101 uses element gain + array gain
+    # Derive peak gain: S.1528 uses gm_db directly; M.2101 uses element gain + array gain;
+    # isotropic (UEMR leakage) has Gmax = 0 dBi = 1.0 linear.
+    is_isotropic_ctx = isinstance(s1528_pattern_context, GpuIsotropicPatternContext)
     if isinstance(s1528_pattern_context, GpuM2101PatternContext):
         _gm_db = float(s1528_pattern_context.g_emax_db) + 10.0 * math.log10(
             max(1, int(s1528_pattern_context.n_h) * int(s1528_pattern_context.n_v))
         )
+    elif is_isotropic_ctx:
+        _gm_db = 0.0
     else:
         _gm_db = float(s1528_pattern_context.gm_db) if s1528_pattern_context.gm_db is not None else 0.0
     gmax_lin = cp.float32(10.0 ** (_gm_db / 10.0) if _gm_db != 0.0 else 1.0)
@@ -12668,7 +13015,11 @@ def _accumulate_ras_power_cp(
             cos_da_cp = cp.cos(alpha0_active_cp - active_alpha_cp)
             cos_gamma_tx_cp = cosb0_active_cp * beam_cosb_cp + sinb0_active_cp * beam_sinb_cp * cos_da_cp
             cp.clip(cos_gamma_tx_cp, trig_dt(-1.0), trig_dt(1.0), out=cos_gamma_tx_cp)
-            if isinstance(s1528_pattern_context, GpuM2101PatternContext):
+            if is_isotropic_ctx:
+                # Isotropic UEMR leakage: Gtx = 0 dBi ⇒ abs=rel=1.0 everywhere.
+                gtx_abs_lin_cp = cp.ones(active_t_cp.shape, dtype=pwr_dt)
+                gtx_rel_lin_cp = gtx_abs_lin_cp
+            elif isinstance(s1528_pattern_context, GpuM2101PatternContext):
                 # M.2101 phased array: need satellite-frame az/el for both
                 # the RAS direction (from sat_azel) and beam steering direction
                 # (from beam alpha/beta).
@@ -13103,7 +13454,11 @@ def _accumulate_ras_power_cp(
         cos_gamma_tx = cp.where(valid_beam, cos_gamma_tx, trig_dt(-1.0))
         cp.clip(cos_gamma_tx, trig_dt(-1.0), trig_dt(1.0), out=cos_gamma_tx)
 
-    if isinstance(s1528_pattern_context, GpuM2101PatternContext):
+    if is_isotropic_ctx:
+        # Isotropic UEMR: flat 0 dBi, masked to active beams.
+        gtx_abs_lin = cp.where(valid_beam, pwr_dt(1.0), pwr_dt(0.0))
+        gtx_rel_lin = gtx_abs_lin
+    elif isinstance(s1528_pattern_context, GpuM2101PatternContext):
         # M.2101: 2D pattern from satellite-frame angles
         ras_az_3d = sat_azel_cp[..., 0].astype(cp.float32, copy=False)
         ras_el_3d = sat_azel_cp[..., 1].astype(cp.float32, copy=False)
@@ -14191,6 +14546,7 @@ def _accumulate_direct_epfd_from_link_library_cp(
                 and float(max_surface_pfd_lin_channel) > 0.0
                 and cap_mode_hoist in {"per_beam", "per_satellite"}
                 and slab_duration > 0
+                and not isinstance(s1528_pattern_context, GpuIsotropicPatternContext)
             ):
                 # Derive per-beam peak EIRP for the whole slab, matching
                 # the semantics inside the power kernel.
@@ -15280,6 +15636,9 @@ class GpuScepterSession:
         wavelength_val = float(u.Quantity(wavelength_m).to_value(u.m) if hasattr(wavelength_m, "to") else wavelength_m)
         lt_val = float(u.Quantity(lt_m).to_value(u.m) if hasattr(lt_m, "to") else lt_m)
         lr_val = float(u.Quantity(lr_m).to_value(u.m) if hasattr(lr_m, "to") else lr_m)
+        for _name, _val in (("wavelength_m", wavelength_val), ("lt_m", lt_val), ("lr_m", lr_val)):
+            if not np.isfinite(_val) or _val <= 0.0:
+                raise ValueError(f"S.1528 Rec 1.4 context: {_name} must be finite and > 0; got {_val!r}.")
         slr_val = _to_scalar_decibel_value(slr_db, name="slr_db")
         far_start_val = None
         if far_sidelobe_start_deg is not None:
@@ -15377,12 +15736,16 @@ class GpuScepterSession:
         _require_cupy()
 
         wavelength_val = float(u.Quantity(wavelength_m).to_value(u.m) if hasattr(wavelength_m, "to") else wavelength_m)
+        if not np.isfinite(wavelength_val) or wavelength_val <= 0.0:
+            raise ValueError(f"S.1528 Rec 1.2 context: wavelength_m must be finite and > 0; got {wavelength_val!r}.")
         gm_val = _to_scalar_decibel_value(gm_dbi, name="gm_dbi")
         ln_val = _to_scalar_decibel_value(ln_db, name="ln_db")
         z_val = max(float(z), 1e-9)
         d_val = None
         if diameter_m is not None:
             d_val = float(u.Quantity(diameter_m).to_value(u.m) if hasattr(diameter_m, "to") else diameter_m)
+            if not np.isfinite(d_val) or d_val <= 0.0:
+                raise ValueError(f"S.1528 Rec 1.2 context: diameter_m must be finite and > 0; got {d_val!r}.")
 
         key = (
             "rec12",
@@ -15441,6 +15804,45 @@ class GpuScepterSession:
         self._touch()
         return context
 
+    def prepare_isotropic_pattern_context(
+        self,
+        *,
+        wavelength_m: float | u.Quantity = 0.1,
+    ) -> GpuIsotropicPatternContext:
+        """Prepare an isotropic (UEMR-leakage) transmit pattern context.
+
+        Models an omnidirectional emitter with Gtx = 0 dBi in every
+        direction, used for unwanted emissions originating in internal
+        satellite circuitry rather than the directive antenna. Only
+        ``wavelength_m`` matters (it feeds the FSPL term); all angle
+        arguments are ignored.
+        """
+        self._ensure_owner_thread()
+        self._ensure_open()
+        _require_cupy()
+
+        wavelength_val = float(
+            u.Quantity(wavelength_m).to_value(u.m)
+            if hasattr(wavelength_m, "to")
+            else wavelength_m
+        )
+        if not np.isfinite(wavelength_val) or wavelength_val <= 0.0:
+            raise ValueError(
+                f"Isotropic context: wavelength_m must be finite and > 0; got {wavelength_val!r}."
+            )
+        key = ("isotropic", self.device_id, round(wavelength_val, 9))
+        cached = self._s1528_pattern_context_cache.get(key)
+        if cached is not None:
+            self._touch()
+            return cached
+        context = GpuIsotropicPatternContext(
+            session=self,
+            wavelength_m=wavelength_val,
+        )
+        self._s1528_pattern_context_cache[key] = context
+        self._touch()
+        return context
+
     def prepare_m2101_pattern_context(
         self,
         *,
@@ -15476,6 +15878,22 @@ class GpuScepterSession:
         if cached is not None:
             self._touch()
             return cached
+        # Guard against downstream NaN / Inf in the composite M.2101
+        # kernel. Division-by-zero on phi_3db / theta_3db in the CUDA
+        # kernel produces Inf → NaN → corrupted PFD outputs.
+        for _pname, _pval in (
+            ("phi_3db_deg", float(phi_3db_deg)),
+            ("theta_3db_deg", float(theta_3db_deg)),
+            ("wavelength_m", float(wavelength_m)),
+        ):
+            if not np.isfinite(_pval) or _pval <= 0.0:
+                raise ValueError(
+                    f"M.2101 context: {_pname} must be finite and > 0; got {_pval!r}."
+                )
+        if int(n_h) < 1 or int(n_v) < 1:
+            raise ValueError(
+                f"M.2101 context: n_h and n_v must be >= 1; got n_h={n_h!r}, n_v={n_v!r}."
+            )
         context = GpuM2101PatternContext(
             session=self,
             g_emax_db=float(g_emax_db),

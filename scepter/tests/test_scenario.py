@@ -1693,6 +1693,10 @@ def test_structured_channel_subset_leakage_consistency_for_19_channel_exact_fit_
             )
 
 
+@pytest.mark.skip(
+    reason="DEPRECATED / pending review: references removed SCEPTer_*.ipynb; "
+    "retained for future reinstatement once notebook workflow is redefined."
+)
 def test_maintained_notebooks_do_not_import_removed_notebook_helper_layers() -> None:
     parity_token = "notebook_" + "parity"
     postprocess_token = "notebook_" + "postprocess"
@@ -2274,6 +2278,10 @@ def test_summarize_direct_epfd_stage_timings_keeps_boresight_screening_separate(
     assert float(summary["power_accumulation_seconds"]) == pytest.approx(1.25)
 
 
+@pytest.mark.skip(
+    reason="DEPRECATED / pending review: references removed SCEPTer_simulate.ipynb; "
+    "retained for future reinstatement once notebook workflow is redefined."
+)
 def test_boresight_notebook_exposes_spectrum_plan_controls() -> None:
     source = "\n".join(_load_notebook_code_cells(BORESIGHT_NOTEBOOK_PATH))
 
@@ -3915,6 +3923,352 @@ def _recording_progress_factory(storage: list[_RecordingProgressBar]):
     return _factory
 
 
+class TestUemrBypassPipeline:
+    """End-to-end smoke for the UEMR bypass inside ``_compute_gpu_direct_epfd_batch_device``.
+
+    Exercises the early-return branch added in stage D of the UEMR work:
+    when ``uemr_mode=True`` the worker must skip the cell-link library,
+    skip beam-finalize, call ``_accumulate_uemr_power_cp``, and return a
+    payload with the same dict keys the caller's unpacking code expects.
+    """
+
+    def test_uemr_bypass_returns_full_payload_keys_without_touching_beam_library(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from scepter import gpu_accel
+        from scepter import scenario as sc
+
+        time_count = 2
+        sat_count = 3
+        sky_count = 1
+        n_cells = 2
+
+        # Replace the GPU UEMR kernel with a numpy-backed fake. Returns
+        # the exact key set our bypass branch expects to forward.
+        accum_calls = {"n": 0, "kwargs": None}
+
+        def _fake_accum(**kwargs):
+            accum_calls["n"] += 1
+            accum_calls["kwargs"] = dict(kwargs)
+            # Regression guard: the UEMR kernel documents (T, S, 3); the
+            # caller must slice off the 4th column before invoking it.
+            _topo = kwargs.get("sat_topo")
+            assert _topo is not None and _topo.ndim == 3 and _topo.shape[2] == 3, (
+                f"UEMR bypass passed sat_topo with shape {None if _topo is None else tuple(_topo.shape)!r}; "
+                "expected (T, S, 3) after slicing the 4-component propagator output."
+            )
+            return {
+                "EPFD_W_m2": np.full((time_count, 1, 1), 1.5e-13, dtype=np.float32),
+                "Prx_total_W": np.full((time_count, 1, 1), 2.7e-16, dtype=np.float32),
+                "PFD_total_RAS_STATION_W_m2": np.full(
+                    (time_count, 1, 1), 1.5e-13, dtype=np.float32,
+                ),
+            }
+
+        monkeypatch.setattr(gpu_accel, "_accumulate_uemr_power_cp", _fake_accum)
+
+        # The bypass path imports the kernel via:
+        #   from scepter.gpu_accel import _accumulate_uemr_power_cp as _uemr_accum
+        # That re-binds the name at import time, so patch the module-level
+        # symbol BEFORE the bypass runs (handled by monkeypatch above).
+
+        # Build a session whose only beam-library-related method must NOT be
+        # called. If the bypass somehow falls through, accessing these
+        # attributes will raise.
+        class _BypassSession:
+            def prepare_satellite_link_selection_library(self, *_a, **_kw):
+                raise AssertionError("UEMR bypass must skip the link library.")
+            def prepare_isotropic_pattern_context(self, **kwargs):
+                return gpu_accel.GpuIsotropicPatternContext(
+                    session=self, wavelength_m=float(kwargs.get("wavelength_m", 0.1)),
+                )
+
+        session = _BypassSession()
+        s1528_pattern_context = session.prepare_isotropic_pattern_context(wavelength_m=0.111)
+
+        # Real pipeline produces topo with 4 components (az, el, range, _);
+        # match that here so the UEMR bypass is tested through the same
+        # slicing logic used in production.
+        sat_topo = np.zeros((time_count, sat_count, 4), dtype=np.float32)
+        sat_topo[..., 1] = 45.0  # all visible
+        sat_topo[..., 2] = 800.0  # km range
+        sat_azel = np.zeros((time_count, sat_count, 2), dtype=np.float32)
+        sat_keep = np.ones((sat_count,), dtype=bool)
+        orbit_radius_full = np.full((sat_count,), 6.9e6, dtype=np.float32)
+
+        power_input = {
+            "bandwidth_mhz": 5.0,
+            "power_input_quantity": "satellite_ptx",
+            "target_pfd_dbw_m2_channel": None,
+            "satellite_ptx_dbw_channel": 0.0,
+            "satellite_eirp_dbw_channel": None,
+        }
+
+        payload = sc._compute_gpu_direct_epfd_batch_device(
+            session=session,
+            cp=_FakeCp(),
+            observer_context=None,
+            orbit_state=None,
+            sat_topo_ras_station=sat_topo,
+            sat_azel_ras_station=sat_azel,
+            sat_keep_batch=sat_keep,
+            sat_min_elev_deg_per_sat_f64=np.zeros(sat_count, dtype=np.float64),
+            sat_beta_max_deg_per_sat_f32=np.full(sat_count, 90.0, dtype=np.float32),
+            sat_belt_id_per_sat_i16=np.zeros(sat_count, dtype=np.int16),
+            selection_mode="max_elevation",
+            nco=0, nbeam=0,  # ignored in UEMR
+            n_cells_total=n_cells,
+            cell_active_mask_dev=None,
+            cell_spectral_weight_dev=None,
+            dynamic_spectrum_state=None,
+            ras_service_cell_index=-1,
+            effective_ras_pointing_mode="cell_center",
+            ras_guard_angle_rad=0.0,
+            boresight_active=False,
+            boresight_theta1_deg=None,
+            boresight_theta2_deg=None,
+            boresight_theta2_cell_ids=None,
+            pointings=None,
+            time_count_local=time_count,
+            cell_chunk=n_cells,
+            n_cell_chunks=1,
+            gpu_output_dtype=np.float32,
+            profile_stages=False,
+            stage_timings={},
+            stage_start=0.0,
+            enable_progress_bars=False,
+            progress_desc_mode="off",
+            pbar=None,
+            ii=0,
+            bi=0,
+            orbit_radius_full=orbit_radius_full,
+            observer_alt_km_ras_station=0.1,
+            power_input=power_input,
+            spectrum_plan_context=None,
+            target_alt_km=0.0,
+            use_ras_station_alt_for_co=False,
+            s1528_pattern_context=s1528_pattern_context,
+            ras_pattern_context=None,
+            atmosphere_context=None,
+            peak_pfd_lut_context=None,
+            max_surface_pfd_dbw_m2_channel=None,
+            max_surface_pfd_dbw_m2_mhz=None,
+            surface_pfd_cap_mode="per_beam",
+            surface_pfd_stats_enabled=False,
+            host_effective_budget_bytes=int(8 * 1024 ** 3),
+            gpu_effective_budget_bytes=int(8 * 1024 ** 3),
+            scheduler_active_target_fraction=0.5,
+            predicted_host_peak_bytes=1024,
+            predicted_gpu_propagation_peak_bytes=1024,
+            predicted_gpu_finalize_peak_bytes=1024,
+            predicted_gpu_power_peak_bytes=1024,
+            finalize_memory_budget_bytes=None,
+            power_memory_budget_bytes=None,
+            power_sky_slab=None,
+            spectral_slab=1,
+            visibility_elev_threshold_deg=0.0,
+            debug_direct_epfd=False,
+            write_epfd=True,
+            write_prx_total=True,
+            write_per_satellite_prx_ras_station=False,
+            write_prx_elevation_heatmap=False,
+            write_total_pfd_ras_station=True,
+            write_per_satellite_pfd_ras_station=False,
+            write_sat_beam_counts_used=False,
+            write_sat_eligible_mask=False,
+            uemr_mode=True,
+        )
+
+        # Bypass took the early-return path — UEMR kernel was called once.
+        assert accum_calls["n"] == 1, "UEMR accumulator must be called exactly once."
+        # Caller-expected keys all present.
+        for key in (
+            "power_result", "sat_idx_g", "sat_topo_visible", "sat_azel_visible",
+            "orbit_radius_eff", "sat_beam_counts_used_full", "sat_eligible_mask",
+            "diag_result", "debug_direct_epfd_stats",
+            "beam_finalize_substage_timings", "cell_link_library_chunk_telemetry",
+            "cell_link_library_stage_memory_summary",
+            "beam_finalize_stage_memory_summary", "power_stage_memory_summary",
+            "stage_start", "stage_memory_summary", "beam_finalize_chunk_shape",
+            "boresight_compaction_stats",
+        ):
+            assert key in payload, f"missing key {key!r} in UEMR bypass payload"
+        # Power result shape matches the writer expectation (T, N_sky, N_cell).
+        pr = payload["power_result"]
+        assert pr is not None
+        # Post-fix UEMR layout: aggregates are (T, 1, N_sky_or_1) — same as
+        # the directive kernel's writer contract. PFD_total has no sky
+        # dependence so stays (T, 1, 1); Prx_total / EPFD have a real
+        # sky axis when pointings are present. In this fake-accumulator
+        # test no pointings are passed, so sky=1 and the no-broadcast
+        # path gives (T, 1, 1).
+        assert pr["EPFD_W_m2"].shape == (time_count, 1, 1), pr["EPFD_W_m2"].shape
+        assert pr["Prx_total_W"].shape == (time_count, 1, 1), pr["Prx_total_W"].shape
+        assert pr["PFD_total_RAS_STATION_W_m2"].shape == (time_count, 1, 1), (
+            pr["PFD_total_RAS_STATION_W_m2"].shape
+        )
+        # Bypass leaves beam-library-only fields as None / empty.
+        assert payload["sat_beam_counts_used_full"] is None
+        assert payload["diag_result"] is None
+        assert payload["beam_finalize_substage_timings"] == {}
+
+    def test_uemr_bypass_does_not_run_when_no_power_outputs_requested(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """If write_* power flags are all False, the UEMR bypass must not call the kernel."""
+        from scepter import gpu_accel
+        from scepter import scenario as sc
+
+        called = {"n": 0}
+
+        def _fake_accum(**_kwargs):
+            called["n"] += 1
+            return {}
+
+        monkeypatch.setattr(gpu_accel, "_accumulate_uemr_power_cp", _fake_accum)
+
+        class _SessionGoesNuclear:
+            def prepare_satellite_link_selection_library(self, *_a, **_kw):
+                raise AssertionError("link library must not be called")
+
+        with pytest.raises(AssertionError):
+            # When uemr_mode=True but no power outputs requested, the bypass
+            # condition (`uemr_mode and any_power_outputs`) is False so the
+            # function falls through to the normal path which DOES touch the
+            # link library. This proves the bypass guards on power flags.
+            sc._compute_gpu_direct_epfd_batch_device(
+                session=_SessionGoesNuclear(),
+                cp=_FakeCp(),
+                observer_context=None,
+                orbit_state=None,
+                sat_topo_ras_station=np.zeros((1, 1, 3), dtype=np.float32),
+                sat_azel_ras_station=np.zeros((1, 1, 2), dtype=np.float32),
+                sat_keep_batch=np.ones((1,), dtype=bool),
+                sat_min_elev_deg_per_sat_f64=np.zeros(1, dtype=np.float64),
+                sat_beta_max_deg_per_sat_f32=np.full(1, 90.0, dtype=np.float32),
+                sat_belt_id_per_sat_i16=np.zeros(1, dtype=np.int16),
+                selection_mode="max_elevation",
+                nco=0, nbeam=0,
+                n_cells_total=1,
+                cell_active_mask_dev=None,
+                cell_spectral_weight_dev=None,
+                dynamic_spectrum_state=None,
+                ras_service_cell_index=-1,
+                effective_ras_pointing_mode="cell_center",
+                ras_guard_angle_rad=0.0,
+                boresight_active=False,
+                boresight_theta1_deg=None,
+                boresight_theta2_deg=None,
+                boresight_theta2_cell_ids=None,
+                pointings=None,
+                time_count_local=1,
+                cell_chunk=1,
+                n_cell_chunks=1,
+                gpu_output_dtype=np.float32,
+                profile_stages=False,
+                stage_timings={},
+                stage_start=0.0,
+                enable_progress_bars=False,
+                progress_desc_mode="off",
+                pbar=None,
+                ii=0, bi=0,
+                orbit_radius_full=np.full(1, 6.9e6, dtype=np.float32),
+                observer_alt_km_ras_station=0.0,
+                power_input={"bandwidth_mhz": 5.0, "power_input_quantity": "satellite_ptx"},
+                spectrum_plan_context=None,
+                target_alt_km=0.0,
+                use_ras_station_alt_for_co=False,
+                s1528_pattern_context=None,
+                ras_pattern_context=None,
+                atmosphere_context=None,
+                peak_pfd_lut_context=None,
+                max_surface_pfd_dbw_m2_channel=None,
+                max_surface_pfd_dbw_m2_mhz=None,
+                surface_pfd_cap_mode="per_beam",
+                surface_pfd_stats_enabled=False,
+                host_effective_budget_bytes=int(8 * 1024 ** 3),
+                gpu_effective_budget_bytes=int(8 * 1024 ** 3),
+                scheduler_active_target_fraction=0.5,
+                predicted_host_peak_bytes=1024,
+                predicted_gpu_propagation_peak_bytes=1024,
+                predicted_gpu_finalize_peak_bytes=1024,
+                predicted_gpu_power_peak_bytes=1024,
+                finalize_memory_budget_bytes=None,
+                power_memory_budget_bytes=None,
+                power_sky_slab=None,
+                spectral_slab=1,
+                visibility_elev_threshold_deg=0.0,
+                debug_direct_epfd=False,
+                write_epfd=False,
+                write_prx_total=False,
+                write_per_satellite_prx_ras_station=False,
+                write_prx_elevation_heatmap=False,
+                write_total_pfd_ras_station=False,
+                write_per_satellite_pfd_ras_station=False,
+                write_sat_beam_counts_used=False,
+                write_sat_eligible_mask=False,
+                uemr_mode=True,
+            )
+        assert called["n"] == 0
+
+    def test_multi_system_combine_uemr_and_directive_broadcasts_uniform(
+        self,
+    ) -> None:
+        """When one system is UEMR (spatially uniform (T,1,1)) and another is
+        directive (T, N_sky, N_cell), the combiner must broadcast the uniform
+        result up to the directive's shape before summing."""
+        from scepter import scenario as sc
+
+        T, N_sky, N_cell = 3, 1, 4
+
+        # UEMR-style result: spatially uniform (T, 1, 1).
+        uemr_val = 1.5e-13
+        uemr_result = {
+            "EPFD_W_m2": np.full((T, 1, 1), uemr_val, dtype=np.float32),
+            "Prx_total_W": np.full((T, 1, 1), 2.7e-16, dtype=np.float32),
+            "PFD_total_RAS_STATION_W_m2": np.full((T, 1, 1), uemr_val, dtype=np.float32),
+            "_spatially_uniform": True,
+        }
+        # Directive-style result: full (T, N_sky, N_cell), non-uniform values.
+        dir_epfd = np.arange(T * N_sky * N_cell, dtype=np.float32).reshape(T, N_sky, N_cell) * 1e-14
+        dir_result = {
+            "EPFD_W_m2": dir_epfd.copy(),
+            "Prx_total_W": dir_epfd.copy() * 0.5,
+            "PFD_total_RAS_STATION_W_m2": dir_epfd.copy(),
+        }
+
+        # Case 1: primary=directive, secondary=uemr.
+        combined = sc._combine_multi_system_power_results_device(
+            _FakeCp(),
+            [dir_result, uemr_result],
+            n_skycells_s1586=N_sky,
+            boresight_active=False,
+        )
+        assert combined is not None
+        assert combined["EPFD_W_m2"].shape == (T, N_sky, N_cell)
+        np.testing.assert_allclose(
+            combined["EPFD_W_m2"], dir_epfd + uemr_val, rtol=1e-5,
+        )
+        assert "_spatially_uniform" not in combined
+
+        # Case 2: primary=uemr (uniform), secondary=directive. Broadcast the
+        # other way.
+        combined2 = sc._combine_multi_system_power_results_device(
+            _FakeCp(),
+            [dict(uemr_result), dir_result],
+            n_skycells_s1586=N_sky,
+            boresight_active=False,
+        )
+        assert combined2 is not None
+        assert combined2["EPFD_W_m2"].shape == (T, N_sky, N_cell)
+        np.testing.assert_allclose(
+            combined2["EPFD_W_m2"], dir_epfd + uemr_val, rtol=1e-5,
+        )
+        assert "_spatially_uniform" not in combined2
+
+
 class TestDirectEpfdGpuRunner:
 
     def test_copy_compact_satellite_indices_host_explicitly_copies_cuda_vectors(self):
@@ -3966,6 +4320,10 @@ class TestDirectEpfdGpuRunner:
         assert ok is False
         assert "output family mode is unsupported" in message.lower()
 
+    @pytest.mark.skip(
+        reason="DEPRECATED / pending review: references removed SCEPTer_postprocess.ipynb; "
+        "retained for future reinstatement once notebook workflow is redefined."
+    )
     def test_postprocess_notebook_prefers_preaccumulated_instantaneous_ccdf_and_raw_corridor(self, tmp_path: Path):
         kwargs = _fake_direct_epfd_common_kwargs(
             tmp_path,
@@ -3999,6 +4357,10 @@ class TestDirectEpfdGpuRunner:
         assert preacc_info["p98"] is not None
         assert raw_info["p98"] is not None
 
+    @pytest.mark.skip(
+        reason="DEPRECATED / pending review: references removed SCEPTer_postprocess.ipynb; "
+        "retained for future reinstatement once notebook workflow is redefined."
+    )
     def test_postprocess_notebook_ccdf_cells_use_shared_histogram_plotter(self):
         cells = _load_notebook_code_cells(POSTPROCESS_NOTEBOOK_PATH)
         ccdf_cells = cells[1:13]

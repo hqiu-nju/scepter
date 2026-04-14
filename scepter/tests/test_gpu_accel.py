@@ -5355,6 +5355,267 @@ def test_beamforming_collapsed_frequency_term():
 
 
 # ---------------------------------------------------------------------------
+# Isotropic UEMR mode tests
+# ---------------------------------------------------------------------------
+
+
+@GPU_REQUIRED
+def test_accumulate_uemr_power_matches_analytic_free_space():
+    """UEMR: Prx per sat = Ptx · (λ/4π·d)² and EPFD = Prx·(4π/λ²). No beams."""
+    import cupy as cp
+    import math
+    session = gpu_accel.GpuScepterSession()
+    try:
+        wl = 0.1113
+        ctx = session.prepare_isotropic_pattern_context(wavelength_m=wl)
+        # 2 timesteps × 3 sats, known geometry.
+        topo = np.array([
+            [[0.0, 90.0, 550.0], [0.0, 30.0, 800.0], [0.0, -5.0, 2000.0]],
+            [[0.0, 60.0, 700.0], [0.0, 45.0, 900.0], [0.0, 0.0, 1500.0]],
+        ], dtype=np.float32)
+        out = gpu_accel._accumulate_uemr_power_cp(
+            uemr_pattern_context=ctx,
+            ras_pattern_context=None,
+            atmosphere_lut_context=None,
+            sat_topo=cp.asarray(topo),
+            telescope_azimuth_deg=None,
+            telescope_elevation_deg=None,
+            observer_alt_km=0.0,
+            bandwidth_mhz=10.0,
+            power_input_quantity="satellite_ptx",
+            target_pfd_dbw_m2_channel=None,
+            satellite_ptx_dbw_channel=0.0,  # 1 W channel
+            satellite_eirp_dbw_channel=None,
+            include_epfd=True,
+            include_prx_total=True,
+            include_total_pfd=True,
+        )
+        # Analytic Prx at t=0: two visible sats (90°, 30°), below-horizon skipped.
+        prx_t0 = (wl / (4 * math.pi * 550e3)) ** 2 + (wl / (4 * math.pi * 800e3)) ** 2
+        prx_out = out["Prx_total_W"].get().squeeze()
+        assert np.isclose(prx_out[0], prx_t0, rtol=1e-4), (prx_out[0], prx_t0)
+        # EPFD = Prx * 4π/λ²
+        epfd_expected = prx_out * (4.0 * math.pi / wl ** 2)
+        epfd_out = out["EPFD_W_m2"].get().squeeze()
+        assert np.allclose(epfd_out, epfd_expected, rtol=1e-5)
+        # t=1 sat 2 is at el=0 (strictly > 0 required) → skip; only two visible.
+        prx_t1 = (wl / (4 * math.pi * 700e3)) ** 2 + (wl / (4 * math.pi * 900e3)) ** 2
+        assert np.isclose(prx_out[1], prx_t1, rtol=1e-4)
+    finally:
+        session.close(reset_device=False)
+
+
+@GPU_REQUIRED
+def test_accumulate_uemr_power_slab_fraction_scales_linearly():
+    """UEMR: ``eirp_slab_fraction_lin`` multiplies all outputs linearly."""
+    import cupy as cp
+    session = gpu_accel.GpuScepterSession()
+    try:
+        ctx = session.prepare_isotropic_pattern_context(wavelength_m=0.1113)
+        topo = cp.asarray(np.array([
+            [[0.0, 80.0, 600.0], [0.0, 45.0, 900.0]],
+        ], dtype=np.float32))
+        kw = dict(
+            uemr_pattern_context=ctx, ras_pattern_context=None,
+            atmosphere_lut_context=None, sat_topo=topo,
+            telescope_azimuth_deg=None, telescope_elevation_deg=None,
+            observer_alt_km=0.0, bandwidth_mhz=10.0,
+            power_input_quantity="satellite_ptx",
+            target_pfd_dbw_m2_channel=None,
+            satellite_ptx_dbw_channel=0.0,
+            satellite_eirp_dbw_channel=None,
+            include_epfd=True, include_prx_total=True,
+        )
+        full = gpu_accel._accumulate_uemr_power_cp(eirp_slab_fraction_lin=1.0, **kw)
+        half = gpu_accel._accumulate_uemr_power_cp(eirp_slab_fraction_lin=0.5, **kw)
+        assert np.allclose(
+            half["Prx_total_W"].get(), 0.5 * full["Prx_total_W"].get(), rtol=1e-5,
+        )
+        assert np.allclose(
+            half["EPFD_W_m2"].get(), 0.5 * full["EPFD_W_m2"].get(), rtol=1e-5,
+        )
+    finally:
+        session.close(reset_device=False)
+
+
+@GPU_REQUIRED
+def test_accumulate_uemr_power_ptx_eirp_match_when_gtx_is_zero():
+    """UEMR: Gtx=0 dBi ⇒ EIRP(dBW) == Ptx(dBW). Both inputs give the same result."""
+    import cupy as cp
+    session = gpu_accel.GpuScepterSession()
+    try:
+        ctx = session.prepare_isotropic_pattern_context(wavelength_m=0.1113)
+        topo = cp.asarray(np.array([
+            [[0.0, 80.0, 600.0], [0.0, 45.0, 900.0]],
+        ], dtype=np.float32))
+        base = dict(
+            uemr_pattern_context=ctx, ras_pattern_context=None,
+            atmosphere_lut_context=None, sat_topo=topo,
+            telescope_azimuth_deg=None, telescope_elevation_deg=None,
+            observer_alt_km=0.0, bandwidth_mhz=10.0,
+            include_epfd=True, include_prx_total=True,
+        )
+        ptx = gpu_accel._accumulate_uemr_power_cp(
+            power_input_quantity="satellite_ptx",
+            satellite_ptx_dbw_channel=3.0,
+            target_pfd_dbw_m2_channel=None,
+            satellite_eirp_dbw_channel=None, **base,
+        )
+        eirp = gpu_accel._accumulate_uemr_power_cp(
+            power_input_quantity="satellite_eirp",
+            satellite_eirp_dbw_channel=3.0,
+            target_pfd_dbw_m2_channel=None,
+            satellite_ptx_dbw_channel=None, **base,
+        )
+        assert np.allclose(ptx["Prx_total_W"].get(), eirp["Prx_total_W"].get(), rtol=1e-6)
+    finally:
+        session.close(reset_device=False)
+
+
+@GPU_REQUIRED
+def test_accumulate_uemr_power_rejects_non_isotropic_context():
+    """UEMR kernel must reject S.1528 / M.2101 contexts."""
+    import cupy as cp
+    session = gpu_accel.GpuScepterSession()
+    try:
+        bad = session.prepare_s1528_rec12_pattern_context(
+            wavelength_m=0.1113, gm_dbi=30.0,
+        )
+        import pytest as _pt
+        with _pt.raises(TypeError, match="GpuIsotropicPatternContext"):
+            gpu_accel._accumulate_uemr_power_cp(
+                uemr_pattern_context=bad, ras_pattern_context=None,
+                atmosphere_lut_context=None,
+                sat_topo=cp.zeros((1, 1, 3), dtype=cp.float32),
+                telescope_azimuth_deg=None, telescope_elevation_deg=None,
+                observer_alt_km=0.0, bandwidth_mhz=10.0,
+                power_input_quantity="satellite_ptx",
+                target_pfd_dbw_m2_channel=None,
+                satellite_ptx_dbw_channel=0.0,
+                satellite_eirp_dbw_channel=None,
+            )
+    finally:
+        session.close(reset_device=False)
+
+
+@GPU_REQUIRED
+def test_isotropic_pattern_peak_gain_linear_is_one():
+    """Isotropic ``_pattern_peak_gain_linear`` must return exactly 1.0."""
+    session = gpu_accel.GpuScepterSession()
+    try:
+        ctx = session.prepare_isotropic_pattern_context(wavelength_m=0.1113)
+        assert gpu_accel._pattern_peak_gain_linear(ctx) == 1.0
+    finally:
+        session.close(reset_device=False)
+
+
+@GPU_REQUIRED
+def test_isotropic_evaluator_dispatches_through_s1528_wrapper():
+    """``_evaluate_s1528_pattern_cp`` must dispatch isotropic context to zero-dB output."""
+    import cupy as cp
+    session = gpu_accel.GpuScepterSession()
+    try:
+        ctx = session.prepare_isotropic_pattern_context(wavelength_m=0.1113)
+        theta = cp.asarray([0.0, 5.0, 30.0, 60.0, 90.0, 180.0], dtype=cp.float32)
+        out = gpu_accel._evaluate_s1528_pattern_cp(ctx, theta)
+        assert out.shape == theta.shape
+        assert cp.allclose(out, cp.zeros_like(theta)).get()
+    finally:
+        session.close(reset_device=False)
+
+
+@GPU_REQUIRED
+def test_prepare_isotropic_pattern_context_returns_expected_type():
+    """``session.prepare_isotropic_pattern_context`` returns GpuIsotropicPatternContext."""
+    session = gpu_accel.GpuScepterSession()
+    try:
+        ctx = session.prepare_isotropic_pattern_context(wavelength_m=0.123)
+        assert isinstance(ctx, gpu_accel.GpuIsotropicPatternContext)
+        assert float(ctx.wavelength_m) == pytest.approx(0.123)
+    finally:
+        session.close(reset_device=False)
+
+
+def test_flat_mask_preset_returns_zero_db_across_service_band():
+    """``flat`` mask preset must produce 0 dB attenuation for every offset."""
+    from scepter import scenario as sc
+    import numpy as _np
+    points = sc._resolve_direct_epfd_mask_points_mhz(
+        preset="flat", channel_bandwidth_mhz=5.0, custom_mask_points=None,
+    )
+    # Shape (n, 2): [offset_mhz, attenuation_db]
+    assert points.shape[1] == 2
+    assert _np.allclose(points[:, 1], 0.0), f"flat preset not zero-dB: {points}"
+    # Breakpoints span a wide range of offsets (tight to far), so any
+    # piecewise-linear interpolator / lookup will return 0 dB across the
+    # service band.
+    offsets = points[:, 0]
+    assert float(offsets.min()) <= -10.0 and float(offsets.max()) >= 10.0, (
+        f"flat preset breakpoints don't span ±10 MHz: {offsets}"
+    )
+
+
+@GPU_REQUIRED
+def test_accumulate_uemr_power_respects_radio_horizon_threshold():
+    """Radio horizon extends visibility below 0°; UEMR kernel must honour it."""
+    import cupy as cp
+    import math
+    session = gpu_accel.GpuScepterSession()
+    try:
+        ctx = session.prepare_isotropic_pattern_context(wavelength_m=0.1113)
+        topo = cp.asarray(np.array([[[0.0, -0.3, 2500.0]]], dtype=np.float32))
+        kw = dict(
+            uemr_pattern_context=ctx,
+            ras_pattern_context=None,
+            atmosphere_lut_context=None,
+            sat_topo=topo,
+            telescope_azimuth_deg=None,
+            telescope_elevation_deg=None,
+            observer_alt_km=0.0,
+            bandwidth_mhz=5.0,
+            power_input_quantity="satellite_ptx",
+            target_pfd_dbw_m2_channel=None,
+            satellite_ptx_dbw_channel=0.0,
+            satellite_eirp_dbw_channel=None,
+            include_epfd=False,
+            include_prx_total=True,
+        )
+        out_strict = gpu_accel._accumulate_uemr_power_cp(
+            visibility_elev_threshold_deg=0.0, **kw,
+        )
+        assert float(out_strict["Prx_total_W"].get().squeeze()) == 0.0
+        out_radio = gpu_accel._accumulate_uemr_power_cp(
+            visibility_elev_threshold_deg=-0.6, **kw,
+        )
+        prx_radio = float(out_radio["Prx_total_W"].get().squeeze())
+        expected = (0.1113 / (4.0 * math.pi * 2.5e6)) ** 2
+        assert prx_radio == pytest.approx(expected, rel=1e-4)
+    finally:
+        session.close(reset_device=False)
+
+
+@GPU_REQUIRED
+def test_peak_pfd_cap_lut_accepts_directive_isotropic_and_is_flat():
+    """Directive isotropic: cap LUT builds successfully and K(β) is β-independent."""
+    session = gpu_accel.GpuScepterSession()
+    try:
+        ctx = session.prepare_isotropic_pattern_context(wavelength_m=0.1113)
+        lut = session.prepare_peak_pfd_lut_context(
+            pattern_context=ctx,
+            sat_orbit_radius_m_per_sat=np.asarray([7000e3]),
+            atmosphere_lut_context=None,
+            target_alt_km=0.0,
+        )
+        assert lut.is_2d is False
+        assert lut.n_beta > 0
+        k = lut.d_k_lut.get().reshape(-1)
+        # All K values should be identical (flat pattern → K independent of β).
+        assert np.allclose(k, k[0], rtol=1e-6), f"K varies: min={k.min()} max={k.max()}"
+    finally:
+        session.close(reset_device=False)
+
+
+# ---------------------------------------------------------------------------
 # Variable power (slant-range and uniform-random) tests
 # ---------------------------------------------------------------------------
 

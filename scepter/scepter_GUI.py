@@ -137,6 +137,25 @@ def _safe_disconnect(signal: Any, slot: Callable[..., Any]) -> None:
         pass
 
 
+def _show_exception_warning(
+    parent: QtWidgets.QWidget | None,
+    title: str,
+    friendly_text: str,
+    exc: BaseException,
+) -> None:
+    """Show a friendly warning dialog with the raw exception in a secondary field."""
+    box = QtWidgets.QMessageBox(parent)
+    box.setIcon(QtWidgets.QMessageBox.Warning)
+    box.setWindowTitle(title)
+    box.setText(friendly_text)
+    detail = str(exc).strip()
+    if detail:
+        box.setInformativeText(detail)
+    box.setDetailedText(f"{type(exc).__name__}: {exc}")
+    box.setStandardButtons(QtWidgets.QMessageBox.Ok)
+    box.exec()
+
+
 def _flush_deferred_deletions() -> None:
     """Force immediate destruction of Qt objects scheduled via deleteLater().
 
@@ -223,12 +242,14 @@ _ANTENNA_MODEL_REC14 = "s1528_rec1_4"
 _ANTENNA_MODEL_M2101 = "m2101"
 _ANTENNA_MODEL_S672 = "s672"
 _ANTENNA_MODEL_COLLAPSED = "beamforming_collapsed"
+_ANTENNA_MODEL_ISOTROPIC = "isotropic"
 _ANTENNA_MODEL_OPTIONS = (
     ("ITU-R S.1528 Recommends 1.2", _ANTENNA_MODEL_REC12),
     ("ITU-R S.1528 Recommends 1.4", _ANTENNA_MODEL_REC14),
     ("ITU-R M.2101 Phased Array", _ANTENNA_MODEL_M2101),
     ("ITU-R S.672 (GSO)", _ANTENNA_MODEL_S672),
     ("Beamforming collapsed", _ANTENNA_MODEL_COLLAPSED),
+    ("Isotropic", _ANTENNA_MODEL_ISOTROPIC),
 )
 _KNOWN_OBSERVATORIES: tuple[tuple[str, dict[str, float]], ...] = (
     # --- SKA ---
@@ -357,6 +378,7 @@ _SPECTRUM_MASK_PRESET_OPTIONS: tuple[tuple[str, str], ...] = (
     ("3GPP TS 36.104", "3gpp_ts_36_104"),
     ("WRC-27 System 1 DC-MSS-IMT OOBE", "wrc27_1_13_s1_dc_mss_imt"),
     ("Adjacent 45 / non-adjacent 50 dBsd", "adjacent_45_nonadjacent_50"),
+    ("Flat (no suppression, UEMR baseline)", "flat"),
     ("Custom", "custom"),
 )
 _SPECTRUM_REFERENCE_MODE_OPTIONS: tuple[tuple[str, str], ...] = (
@@ -468,7 +490,9 @@ _SIMULATION_PAGE_COPY: dict[str, tuple[str, str]] = {
     "Satellite Orbitals": ("Satellite Orbitals", "Shape the constellation belts that drive the rest of the workflow."),
     "Satellite Antennas": ("Satellite Antennas", "Configure the satellite-system transmit antenna before coverage analysis."),
     "Service & Demand": ("Service & Demand", "Define Nco, Nbeam, selection strategy, and cell activity assumptions."),
+    "Service": ("Service", "Set the per-satellite UEMR power level (Ptx or EIRP); the beam library is bypassed so Nco, Nbeam, and selection strategy don't apply."),
     "Spectrum & Reuse": ("Spectrum & Reuse", "Plan the service band, reuse pattern, and transmitter unwanted emissions before the run."),
+    "Spectrum": ("Spectrum", "Define the service band and the emission mask that shapes UEMR power across frequency; reuse and channel bandwidth are skipped in UEMR mode."),
     "Coverage & Contours": ("Coverage & Contours", "Run the contour analyser and lock the effective cell spacing."),
     "Coverage & Boresight": ("Coverage & Boresight", "Preview the active hexgrid, geography masking, and boresight scope."),
     "Review & Run": ("Review & Run", "Confirm runtime/output choices and launch the structured GPU workflow."),
@@ -1325,13 +1349,24 @@ class OptionalNumericEdit(QtWidgets.QLineEdit):
         self.valueChanged.emit(self.value_or_none())
 
     def value_or_none(self) -> float | int | None:
+        import math as _math
         text = self.text().strip()
         if text == "":
             return None
         try:
-            return int(text) if self._integer else float(text)
+            value = int(text) if self._integer else float(text)
         except ValueError:
             return None
+        # Reject "inf", "-inf", "nan" strings which ``float()`` happily
+        # accepts. These have no meaningful interpretation in any SCEPTer
+        # input field and propagate through downstream math as NaN.
+        if not self._integer:
+            try:
+                if not _math.isfinite(float(value)):
+                    return None
+            except (TypeError, ValueError):
+                return None
+        return value
 
     def set_value(self, value: float | int | None) -> None:
         if value is None:
@@ -2905,7 +2940,25 @@ class RunMonitorWidget(QtWidgets.QFrame):
             )
         eta_s = self._planned_remaining_seconds
         if eta_s is not None and empirical_eta_s is not None:
-            eta_s = 0.55 * float(eta_s) + 0.45 * float(empirical_eta_s)
+            # Adaptive blend: early in the run the empirical estimate is
+            # dominated by JIT/kernel-compile overhead from the first batch
+            # (often 50-100x slower than steady state), which makes the ETA
+            # wildly pessimistic. Trust the scheduler more until ~30% of
+            # the run is done, then progressively shift to empirical as
+            # the steady-state mean stabilises.
+            fraction_done = (
+                float(self._overall_fraction)
+                if self._overall_fraction is not None
+                else 0.0
+            )
+            # planned_weight: 0.95 at fraction=0, 0.30 at fraction>=0.5,
+            # linear in between.
+            if fraction_done >= 0.5:
+                planned_weight = 0.30
+            else:
+                planned_weight = 0.95 - 1.30 * fraction_done
+            empirical_weight = 1.0 - planned_weight
+            eta_s = planned_weight * float(eta_s) + empirical_weight * float(empirical_eta_s)
         elif eta_s is None:
             eta_s = empirical_eta_s
         if eta_s is not None and np.isfinite(float(eta_s)):
@@ -6422,20 +6475,49 @@ def _build_spectrum_preview_curves(
     else:
         receiver_points = np.asarray(receiver_points_raw, dtype=np.float64)
     cutoff = float(plan["spectral_integration_cutoff_mhz"])
+    # Display window: the interesting region is the service band + RAS
+    # receiver band + a few channel widths of padding. The raw mask
+    # breakpoints may extend much further (e.g. the "flat" preset reaches
+    # 1000× channel bandwidth — up to ±100,000 MHz offset — to keep the
+    # integrator's mask domain effectively unbounded). That's fine for
+    # the physics, but using it as the plot X-axis produces absurd scales
+    # and nonsensical negative frequencies. Clip the plot bounds to a
+    # viewing window anchored at the service/RAS bands.
     padding = max(channel_bandwidth, ras_bandwidth, cutoff, 1.0)
+    display_padding = max(
+        3.0 * channel_bandwidth,  # a handful of channel widths
+        1.5 * ras_bandwidth,
+        5.0,
+    )
     slot_mask_offsets = slot_centers[:, None] + mask_points[None, :, 0]
+    # Cap the mask-offset contribution to a reasonable window so "flat"
+    # masks don't pull the axis to ±100,000 MHz. The real integration
+    # uses the full mask domain internally.
+    display_left = float(slot_edges[0]) - display_padding
+    display_right = float(slot_edges[-1]) + display_padding
+    mask_left_clipped = max(
+        float(np.min(slot_mask_offsets)) - 0.25 * channel_bandwidth,
+        display_left - 2.0 * channel_bandwidth,
+    )
+    mask_right_clipped = min(
+        float(np.max(slot_mask_offsets)) + 0.25 * channel_bandwidth,
+        display_right + 2.0 * channel_bandwidth,
+    )
     left_bound = min(
         float(slot_edges[0]) - padding,
         ras_start - padding,
-        float(np.min(slot_mask_offsets)) - 0.25 * channel_bandwidth,
+        mask_left_clipped,
         float(ras_center + np.min(receiver_points[:, 0])) - 0.25 * ras_bandwidth,
     )
     right_bound = max(
         float(slot_edges[-1]) + padding,
         ras_stop + padding,
-        float(np.max(slot_mask_offsets)) + 0.25 * channel_bandwidth,
+        mask_right_clipped,
         float(ras_center + np.max(receiver_points[:, 0])) + 0.25 * ras_bandwidth,
     )
+    # Frequencies are absolute (MHz) — never negative. Clamp the left
+    # bound to 0 so the plot axis stays physically meaningful.
+    left_bound = max(0.0, left_bound)
     frequency_axis = np.linspace(left_bound, right_bound, max(401, int(sample_count)), dtype=np.float64)
 
     tx_total_linear = np.zeros(frequency_axis.shape, dtype=np.float64)
@@ -6618,21 +6700,49 @@ def _preview_frequency_limits_mhz(
     plan: Mapping[str, Any],
     curves: Mapping[str, np.ndarray],
 ) -> tuple[float, float]:
+    import math as _math
+    # The plot's X-axis is the absolute frequency in MHz. Anchor the
+    # display window on the service band + RAS receiver band, plus a
+    # modest padding. Never return negative frequencies and never let
+    # an extreme mask-breakpoint extent (e.g. "flat" preset at ±1000×
+    # channel bandwidth) push the axis into the tens of kMHz.
     frequency_axis = np.asarray(curves["frequency_axis_mhz"], dtype=np.float64)
     if int(frequency_axis.size) < 2:
         return (0.0, 1.0)
-    step_mhz = float(np.median(np.diff(frequency_axis)))
-    padding_mhz = max(abs(step_mhz) * 2.0, 0.5)
-    left = min(
-        float(np.min(frequency_axis)),
-        float(plan["service_band_start_mhz"]),
-        float(plan["ras_receiver_band_start_mhz"]),
-    ) - padding_mhz
-    right = max(
-        float(np.max(frequency_axis)),
-        float(plan["service_band_stop_mhz"]),
-        float(plan["ras_receiver_band_stop_mhz"]),
-    ) + padding_mhz
+    svc_start = float(plan.get("service_band_start_mhz") or 0.0)
+    svc_stop = float(plan.get("service_band_stop_mhz") or (svc_start + 1.0))
+    ras_start = float(plan.get("ras_receiver_band_start_mhz") or svc_start)
+    ras_stop = float(plan.get("ras_receiver_band_stop_mhz") or svc_stop)
+    svc_bw = max(svc_stop - svc_start, 1.0)
+    ras_bw = max(ras_stop - ras_start, 1.0)
+    chan_bw_raw = plan.get("channel_bandwidth_mhz") or svc_bw
+    try:
+        chan_bw = float(chan_bw_raw)
+    except (TypeError, ValueError):
+        chan_bw = svc_bw
+    padding_mhz = max(
+        3.0 * chan_bw,
+        1.5 * ras_bw,
+        0.5 * svc_bw,
+        5.0,
+    )
+    left = min(svc_start, ras_start) - padding_mhz
+    right = max(svc_stop, ras_stop) + padding_mhz
+    # Never render negative frequencies.
+    left = max(0.0, left)
+    if right <= left:
+        right = left + 1.0
+    # Extend bounds outward to the next round number so the rightmost
+    # major tick has room for its label (matplotlib clips a tick flush
+    # against the axis edge — e.g. "3000" would render as "300").
+    window = right - left
+    round_step = 10.0 ** max(1.0, _math.floor(_math.log10(max(window, 1.0))) - 1)
+    left = _math.floor(left / round_step) * round_step
+    right = _math.ceil(right / round_step) * round_step
+    # Guarantee a ~5% margin on each side so tick labels don't clip.
+    label_margin = 0.05 * (right - left)
+    left = max(0.0, left - label_margin)
+    right = right + label_margin
     return (float(left), float(right))
 
 
@@ -8061,7 +8171,7 @@ class SpectrumPreviewDialog(QtWidgets.QDialog):
         try:
             updated_plan, updated_power_input = self._apply_selection_callback(selected)
         except Exception as exc:
-            QtWidgets.QMessageBox.warning(self, "Edit Spectrum", str(exc))
+            _show_exception_warning(self, "Edit Spectrum", "Couldn't apply the selected channels to the spectrum plan.", exc)
             self._enabled_channel_indices = set(_occupied_channel_indices_from_plan(self._plan))
             self._rebuild_channel_list(reset_selection=True)
             self._refresh_figure()
@@ -8560,6 +8670,28 @@ class AntennaM2101Config:
 
 
 @dataclass(slots=True)
+class AntennaIsotropicConfig:
+    """Persistent isotropic (UEMR) antenna controls.
+
+    The directive variant has no tunable parameters — G_tx is 0 dBi by
+    definition. ``uemr_mode`` selects the per-satellite bypass path that
+    skips the beam library entirely; when ``False`` the model runs through
+    the standard beam-library pipeline with a flat 0 dBi pattern.
+    """
+
+    uemr_mode: bool = False
+
+    def to_json_dict(self) -> dict[str, Any]:
+        return {"uemr_mode": bool(self.uemr_mode)}
+
+    @classmethod
+    def from_json_dict(cls, payload: dict[str, Any] | None) -> "AntennaIsotropicConfig":
+        if not payload:
+            return cls()
+        return cls(uemr_mode=bool(payload.get("uemr_mode", False)))
+
+
+@dataclass(slots=True)
 class RasAntennaConfig:
     """Persistent RAS-antenna controls."""
 
@@ -8651,6 +8783,7 @@ class AntennasConfig:
     rec12: AntennaRec12Config = field(default_factory=AntennaRec12Config)
     rec14: AntennaRec14Config = field(default_factory=AntennaRec14Config)
     m2101: AntennaM2101Config = field(default_factory=AntennaM2101Config)
+    isotropic: AntennaIsotropicConfig = field(default_factory=AntennaIsotropicConfig)
     ras: RasAntennaConfig = field(default_factory=RasAntennaConfig)
 
     def to_json_dict(self) -> dict[str, Any]:
@@ -8666,6 +8799,7 @@ class AntennasConfig:
             "rec12": self.rec12.to_json_dict(),
             "rec14": self.rec14.to_json_dict(),
             "m2101": self.m2101.to_json_dict(),
+            "isotropic": self.isotropic.to_json_dict(),
             "ras": self.ras.to_json_dict(),
         }
 
@@ -8693,6 +8827,11 @@ class AntennasConfig:
                 if "m2101" in payload
                 else AntennaM2101Config()
             ),
+            isotropic=(
+                AntennaIsotropicConfig.from_json_dict(payload.get("isotropic"))
+                if "isotropic" in payload
+                else AntennaIsotropicConfig()
+            ),
             ras=RasAntennaConfig.from_json_dict(payload["ras"]),
         )
 
@@ -8708,6 +8847,7 @@ class SatelliteAntennasConfig:
     rec12: AntennaRec12Config = field(default_factory=AntennaRec12Config)
     rec14: AntennaRec14Config = field(default_factory=AntennaRec14Config)
     m2101: AntennaM2101Config = field(default_factory=AntennaM2101Config)
+    isotropic: AntennaIsotropicConfig = field(default_factory=AntennaIsotropicConfig)
 
     def to_json_dict(self) -> dict[str, Any]:
         return {
@@ -8722,6 +8862,7 @@ class SatelliteAntennasConfig:
             "rec12": self.rec12.to_json_dict(),
             "rec14": self.rec14.to_json_dict(),
             "m2101": self.m2101.to_json_dict(),
+            "isotropic": self.isotropic.to_json_dict(),
         }
 
     @classmethod
@@ -8748,6 +8889,7 @@ class SatelliteAntennasConfig:
                 if "m2101" in payload and payload["m2101"] is not None
                 else AntennaM2101Config()
             ),
+            isotropic=AntennaIsotropicConfig.from_json_dict(payload.get("isotropic")),
         )
 
     @classmethod
@@ -8761,6 +8903,7 @@ class SatelliteAntennasConfig:
             rec12=AntennaRec12Config.from_json_dict(cfg.rec12.to_json_dict()),
             rec14=AntennaRec14Config.from_json_dict(cfg.rec14.to_json_dict()),
             m2101=AntennaM2101Config.from_json_dict(cfg.m2101.to_json_dict()),
+            isotropic=AntennaIsotropicConfig.from_json_dict(cfg.isotropic.to_json_dict()),
         )
 
     def to_antennas_config(self, ras: RasAntennaConfig | None = None) -> "AntennasConfig":
@@ -8773,6 +8916,7 @@ class SatelliteAntennasConfig:
             rec12=AntennaRec12Config.from_json_dict(self.rec12.to_json_dict()),
             rec14=AntennaRec14Config.from_json_dict(self.rec14.to_json_dict()),
             m2101=AntennaM2101Config.from_json_dict(self.m2101.to_json_dict()),
+            isotropic=AntennaIsotropicConfig.from_json_dict(self.isotropic.to_json_dict()),
             ras=RasAntennaConfig.from_json_dict((ras or RasAntennaConfig()).to_json_dict()),
         )
 
@@ -10206,43 +10350,90 @@ def _require_finite_service_target_pfd_dbw_m2_mhz(state: "ScepterProjectState") 
     return float(target_pfd)
 
 
-def _service_power_input_summary(power_input: Mapping[str, Any]) -> str:
-    return (
+def _service_power_input_summary(
+    power_input: Mapping[str, Any],
+    *,
+    uemr_mode: bool = False,
+) -> str:
+    # UEMR runs bypass the channel-bandwidth concept entirely — the kernel
+    # uses the full service-band width — so omit the "(bandwidth X MHz)"
+    # suffix to avoid implying a separate knob the user should tune.
+    core = (
         f"{_service_power_quantity_label(str(power_input['power_input_quantity']))} "
         f"{_service_power_basis_label(str(power_input['power_input_basis']))} "
-        f"{float(power_input['active_value']):.2f} {str(power_input['active_value_unit'])} "
-        f"(bandwidth {float(power_input['bandwidth_mhz']):.3f} MHz)"
+        f"{float(power_input['active_value']):.2f} {str(power_input['active_value_unit'])}"
     )
+    if uemr_mode:
+        return core
+    return f"{core} (bandwidth {float(power_input['bandwidth_mhz']):.3f} MHz)"
 
 
-def _has_valid_service_config(config: "ServiceConfig") -> bool:
-    if config.nco is None or int(config.nco) <= 0:
-        return False
-    if config.nbeam is None or int(config.nbeam) <= 0:
-        return False
-    if config.bandwidth_mhz is None:
-        return False
-    try:
-        bandwidth_mhz = float(config.bandwidth_mhz)
-    except Exception:
-        return False
-    if not np.isfinite(bandwidth_mhz) or bandwidth_mhz <= 0.0:
-        return False
-    if str(config.selection_strategy or "") not in {value for _, value in _SELECTION_STRATEGY_OPTIONS}:
-        return False
-    if config.cell_activity_factor is None:
-        return False
-    if not (0.0 <= float(config.cell_activity_factor) <= 1.0):
-        return False
-    try:
-        scenario._normalize_direct_epfd_cell_activity_mode(config.cell_activity_mode)
-    except Exception:
-        return False
+def _has_valid_service_config(
+    config: "ServiceConfig",
+    *,
+    uemr_mode: bool = False,
+) -> bool:
+    # In UEMR mode the beam library is bypassed entirely, so Nco, Nbeam,
+    # selection strategy, and cell-activity settings are meaningless. Only
+    # a valid power input (EIRP/Ptx per MHz) is required — the channel
+    # bandwidth auto-derives from the service band on the Spectrum tab.
+    if not uemr_mode:
+        if config.nco is None or int(config.nco) <= 0:
+            return False
+        if config.nbeam is None or int(config.nbeam) <= 0:
+            return False
+        if str(config.selection_strategy or "") not in {value for _, value in _SELECTION_STRATEGY_OPTIONS}:
+            return False
+        if config.cell_activity_factor is None:
+            return False
+        if not (0.0 <= float(config.cell_activity_factor) <= 1.0):
+            return False
+        try:
+            scenario._normalize_direct_epfd_cell_activity_mode(config.cell_activity_mode)
+        except Exception:
+            return False
+        if config.bandwidth_mhz is None:
+            return False
+        try:
+            bandwidth_mhz = float(config.bandwidth_mhz)
+        except Exception:
+            return False
+        if not np.isfinite(bandwidth_mhz) or bandwidth_mhz <= 0.0:
+            return False
+    else:
+        # UEMR: the power-quantity combo only offers Ptx and EIRP (Target
+        # PFD has no meaning without a directive beam), so require one
+        # of those two to be explicitly set. The default target_pfd fallback
+        # is intentionally ignored — otherwise Service would read as "ready"
+        # before the user had entered anything.
+        quantity = str(config.power_input_quantity or "satellite_ptx").lower()
+        if quantity not in {"satellite_ptx", "satellite_eirp"}:
+            return False
+        value = (
+            config.satellite_ptx_dbw_mhz
+            if quantity == "satellite_ptx"
+            else config.satellite_eirp_dbw_mhz
+        )
+        try:
+            return value is not None and np.isfinite(float(value))
+        except (TypeError, ValueError):
+            return False
     try:
         _normalize_service_config_power_input(config)
     except Exception:
         return False
     return True
+
+
+def _system_is_uemr(sys_cfg: "ScepterSystemState") -> bool:
+    """Return True when this system is configured for UEMR isotropic mode."""
+    ant = getattr(sys_cfg, "satellite_antennas", None)
+    if ant is None:
+        return False
+    if str(getattr(ant, "antenna_model", "") or "") != _ANTENNA_MODEL_ISOTROPIC:
+        return False
+    iso = getattr(ant, "isotropic", None)
+    return bool(iso is not None and getattr(iso, "uemr_mode", False))
 
 
 def _normalize_spectrum_config(
@@ -10408,10 +10599,14 @@ def _has_valid_spectrum_config(
     return True
 
 
-def _validate_ras_receiver_config(
+def _validate_ras_receiver_band(
     config: "RasStationConfig | None",
 ) -> tuple[bool, str]:
-    """Validate the receiver-side spectral controls shown on the RAS tab."""
+    """Validate only the receiver band + reference-frequency settings.
+
+    Gates the Preview/Edit Receiver Response button so the custom-mask editor
+    can be opened before any points exist (the editor self-provides a default).
+    """
     if config is None:
         return False, "Set the RAS receiver band first."
     start_mhz = config.receiver_band_start_mhz
@@ -10423,9 +10618,7 @@ def _validate_ras_receiver_config(
     if not np.isfinite(start_value) or not np.isfinite(stop_value) or stop_value <= start_value:
         return False, "RAS receiver band must satisfy stop > start with finite MHz values."
     try:
-        response_mode = scenario._resolve_direct_epfd_receiver_response_mode(
-            config.receiver_response_mode
-        )
+        scenario._resolve_direct_epfd_receiver_response_mode(config.receiver_response_mode)
     except Exception as exc:
         return False, str(exc)
     try:
@@ -10437,6 +10630,22 @@ def _validate_ras_receiver_config(
         )
     except Exception as exc:
         return False, str(exc)
+    return True, ""
+
+
+def _validate_ras_receiver_config(
+    config: "RasStationConfig | None",
+) -> tuple[bool, str]:
+    """Validate the receiver-side spectral controls shown on the RAS tab."""
+    band_ok, band_msg = _validate_ras_receiver_band(config)
+    if not band_ok:
+        return band_ok, band_msg
+    assert config is not None
+    start_value = float(config.receiver_band_start_mhz)
+    stop_value = float(config.receiver_band_stop_mhz)
+    response_mode = scenario._resolve_direct_epfd_receiver_response_mode(
+        config.receiver_response_mode
+    )
     if response_mode == "custom":
         mask_pts = config.receiver_custom_mask_points
         if mask_pts is None or (hasattr(mask_pts, "__len__") and len(mask_pts) < 2):
@@ -10555,6 +10764,7 @@ def _compute_workflow_status_payloads(
     """Compute serializable workflow status payloads without touching widgets."""
     all_systems = state.systems or [state.active_system()]
     n_systems = len(all_systems)
+    any_uemr = any(_system_is_uemr(s) for s in all_systems)
     receiver_ready, receiver_message = _validate_ras_receiver_config(state.ras_station)
     ras_ready = (
         _has_complete_ras_station_config(state.ras_station)
@@ -10585,11 +10795,37 @@ def _compute_workflow_status_payloads(
             sat_ant_ready = False
             sat_ant_issues.append(f"{label}: antenna incomplete")
         # Service
-        if not _has_valid_service_config(sys_cfg.service):
+        if not _has_valid_service_config(sys_cfg.service, uemr_mode=_system_is_uemr(sys_cfg)):
             service_ready = False
             service_issues.append(f"{label}: service incomplete")
-        # Spectrum
-        if spectrum_explicitly_configured:
+        # Spectrum — UEMR uses a simplified "service band + mask preset"
+        # check (no cell-reuse machinery); directive systems go through
+        # the full cell-reuse normalize. ``spectrum_explicitly_configured``
+        # is required so defaults-from-state don't silently count as
+        # user-provided input — the user must actually touch the widgets.
+        if _system_is_uemr(sys_cfg):
+            _sp = sys_cfg.spectrum
+            _band_ok = (
+                spectrum_explicitly_configured
+                and _sp.service_band_start_mhz is not None
+                and _sp.service_band_stop_mhz is not None
+                and float(_sp.service_band_stop_mhz) > float(_sp.service_band_start_mhz)
+            )
+            _mask_ok = (
+                spectrum_explicitly_configured
+                and bool(_sp.unwanted_emission_mask_preset)
+            )
+            if _band_ok and _mask_ok:
+                spectrum_ready = True
+            else:
+                spectrum_ready = False
+                missing = []
+                if not _band_ok:
+                    missing.append("service band (start/stop, stop > start)")
+                if not _mask_ok:
+                    missing.append("transmit unwanted-emission mask preset")
+                spectrum_issues.append(f"{label}: UEMR needs {', '.join(missing)}")
+        elif spectrum_explicitly_configured:
             try:
                 _normalize_spectrum_config(sys_cfg.service, sys_cfg.spectrum, state.ras_station)
             except Exception as exc:
@@ -10623,12 +10859,24 @@ def _compute_workflow_status_payloads(
     s0 = state.active_system()
     try:
         power_input = _require_service_power_input(state)
-        power_summary = _service_power_input_summary(power_input)
+        power_summary = _service_power_input_summary(power_input, uemr_mode=any_uemr)
     except ValueError:
         power_summary = None
 
     # Spectrum summary
-    if not spectrum_explicitly_configured:
+    if any_uemr and spectrum_ready:
+        _sp0 = s0.spectrum
+        try:
+            _start = float(_sp0.service_band_start_mhz)
+            _stop = float(_sp0.service_band_stop_mhz)
+            _mask = str(_sp0.unwanted_emission_mask_preset or "n/a")
+            spectrum_summary = (
+                f"UEMR: service band {_start:.3f}–{_stop:.3f} MHz | "
+                f"transmit mask {_mask}."
+            )
+        except Exception:
+            spectrum_summary = "UEMR spectrum inputs are ready."
+    elif not spectrum_explicitly_configured:
         spectrum_summary = ""
         spectrum_ready = False
     elif spectrum_ready:
@@ -10708,54 +10956,99 @@ def _compute_workflow_status_payloads(
             if service_ready
             else "Complete service and demand inputs",
             message=(
-                "Nco, Nbeam, selection, "
-                f"{_service_cell_activity_mode_label(str(s0.service.cell_activity_mode or _DEFAULT_SERVICE_CELL_ACTIVITY_MODE))} activity, "
-                f"and {power_summary} are ready."
+                (
+                    f"UEMR mode: {power_summary} is ready."
+                    if any_uemr
+                    else (
+                        "Nco, Nbeam, selection, "
+                        f"{_service_cell_activity_mode_label(str(s0.service.cell_activity_mode or _DEFAULT_SERVICE_CELL_ACTIVITY_MODE))} activity, "
+                        f"and {power_summary} are ready."
+                    )
+                )
                 if service_ready
                 else ("; ".join(service_issues) if service_issues
-                      else "Set valid Nco, Nbeam, selection strategy, activity factor, channel bandwidth, and one finite service power definition, or apply the service defaults.")
+                      else (
+                          "Set one finite service power definition (Ptx or EIRP) "
+                          "on the Service tab; UEMR mode skips Nco/Nbeam/"
+                          "selection/cell activity and channel bandwidth."
+                          if any_uemr
+                          else "Set valid Nco, Nbeam, selection strategy, activity factor, channel bandwidth, and one finite service power definition, or apply the service defaults."
+                      ))
             ),
             action="Open service and demand",
         ),
         "Spectrum & Reuse": _workflow_status_payload(
             ready=bool(spectrum_ready),
             kind="ready" if spectrum_ready else "warning",
-            title="Spectrum and reuse plan is configured"
-            if spectrum_ready
-            else "Complete spectrum and reuse inputs",
+            title=(
+                "Spectrum plan is configured"
+                if spectrum_ready and any_uemr
+                else "Spectrum and reuse plan is configured"
+            ) if spectrum_ready else (
+                "Complete spectrum inputs"
+                if any_uemr
+                else "Complete spectrum and reuse inputs"
+            ),
             message=(
                 spectrum_summary
                 if spectrum_ready
-                else "Set a valid service band, reuse factor, and transmitter unwanted-emission mask, then use Edit Spectrum to choose the simulated channels. The RAS receiver band is defined on the RAS Station tab."
+                else (
+                    "Set a valid service band and transmitter unwanted-emission "
+                    "mask; the RAS receiver band is defined on the RAS Station "
+                    "tab. UEMR mode ignores cell-reuse settings."
+                    if any_uemr
+                    else "Set a valid service band, reuse factor, and transmitter "
+                    "unwanted-emission mask, then use Edit Spectrum to choose "
+                    "the simulated channels. The RAS receiver band is defined "
+                    "on the RAS Station tab."
+                )
             ),
             action="Open spectrum and reuse",
         ),
         "Coverage & Contours": _workflow_status_payload(
-            ready=bool(contour_is_current),
-            kind="ready" if contour_is_current else "warning",
-            title="Contour spacing is ready" if contour_is_current else "Refresh contour spacing",
+            ready=bool(contour_is_current) or any_uemr,
+            kind=("ready" if (contour_is_current or any_uemr) else "warning"),
+            title=(
+                "Not applicable for UEMR mode"
+                if any_uemr and not contour_is_current
+                else ("Contour spacing is ready" if contour_is_current else "Refresh contour spacing")
+            ),
             message=(
-                f"Effective cell spacing is locked at {float(effective_cell_km or 0.0):g} km."
-                if contour_is_current
+                "Coverage analyser is skipped in UEMR mode — an isotropic UEMR source has no finite beamwidth to resolve."
+                if any_uemr and not contour_is_current
                 else (
-                    f"Stored contour spacing remains visible at {float(effective_cell_km or 0.0):g} km, but it is stale. "
-                    "Rerun the analyser or use a valid override before preparing the active hexgrid."
-                    if effective_cell_km is not None
-                    else "Run the analyser or enable a cell-size override before preparing the active hexgrid."
+                    f"Effective cell spacing is locked at {float(effective_cell_km or 0.0):g} km."
+                    if contour_is_current
+                    else (
+                        f"Stored contour spacing remains visible at {float(effective_cell_km or 0.0):g} km, but it is stale. "
+                        "Rerun the analyser or use a valid override before preparing the active hexgrid."
+                        if effective_cell_km is not None
+                        else "Run the analyser or enable a cell-size override before preparing the active hexgrid."
+                    )
                 )
             ),
             action="Open contour analysis",
         ),
         "Coverage & Boresight": _workflow_status_payload(
-            ready=bool(hexgrid_is_current),
-            kind="ready" if hexgrid_is_current else "warning",
-            title="Hexgrid settings are current"
-            if hexgrid_is_current
-            else "Apply or preview the coverage and boresight settings",
+            ready=bool(hexgrid_is_current) or any_uemr,
+            kind=("ready" if (hexgrid_is_current or any_uemr) else "warning"),
+            title=(
+                "Not applicable for UEMR mode"
+                if any_uemr and not hexgrid_is_current
+                else (
+                    "Hexgrid settings are current"
+                    if hexgrid_is_current
+                    else "Apply or preview the coverage and boresight settings"
+                )
+            ),
             message=(
-                "The current geography, RAS exclusion, and boresight settings are committed for this run."
-                if hexgrid_is_current
-                else hexgrid_status_message
+                "Hexgrid / boresight avoidance do not apply to UEMR systems — all satellites radiate omnidirectionally with no beam pointing."
+                if any_uemr and not hexgrid_is_current
+                else (
+                    "The current geography, RAS exclusion, and boresight settings are committed for this run."
+                    if hexgrid_is_current
+                    else hexgrid_status_message
+                )
             ),
             action="Open coverage and boresight",
         ),
@@ -10866,6 +11159,8 @@ def _has_valid_satellite_antenna_config(config: AntennasConfig | SatelliteAntenn
         )
     if config.antenna_model == _ANTENNA_MODEL_COLLAPSED:
         return True  # collapsed mode has no pattern requirements
+    if config.antenna_model == _ANTENNA_MODEL_ISOTROPIC:
+        return True  # isotropic needs only a valid wavelength
     return False
 
 
@@ -10900,6 +11195,7 @@ def _satellite_antenna_pattern_spec(
         m2101_d_v=config.m2101.d_v,
         m2101_n_h=config.m2101.n_h,
         m2101_n_v=config.m2101.n_v,
+        isotropic_uemr_mode=bool(getattr(config, "isotropic", AntennaIsotropicConfig()).uemr_mode),
         use_numba=False,
     )
 
@@ -12050,21 +12346,31 @@ def validate_project_state(
         lines.append("  cell size override=off")
     lines.append("")
     lines.append("Service / demand:")
-    if _has_valid_service_config(svc):
-        power_summary = _service_power_input_summary(_require_service_power_input(state))
-        lines.append(
-            f"  Nco={int(svc.nco)}, Nbeam={int(svc.nbeam)}, "
-            f"selection={svc.selection_strategy}, "
-            f"activity={float(svc.cell_activity_factor) * 100.0:.1f}%, "
-            f"mode={_service_cell_activity_mode_label(str(svc.cell_activity_mode or _DEFAULT_SERVICE_CELL_ACTIVITY_MODE))}, "
-            "seed="
-            + (
-                "random"
-                if svc.cell_activity_seed_base is None
-                else str(int(svc.cell_activity_seed_base))
-            )
+    _svc_is_uemr = _system_is_uemr(s0)
+    if _has_valid_service_config(svc, uemr_mode=_svc_is_uemr):
+        power_summary = _service_power_input_summary(
+            _require_service_power_input(state), uemr_mode=_svc_is_uemr,
         )
-        lines.append(f"  power input: {power_summary}")
+        if _svc_is_uemr:
+            lines.append(
+                f"  UEMR mode (per-satellite bypass; no beam mechanics), "
+                f"bandwidth={float(svc.bandwidth_mhz):.3f} MHz"
+            )
+            lines.append(f"  power input: {power_summary}")
+        else:
+            lines.append(
+                f"  Nco={int(svc.nco)}, Nbeam={int(svc.nbeam)}, "
+                f"selection={svc.selection_strategy}, "
+                f"activity={float(svc.cell_activity_factor) * 100.0:.1f}%, "
+                f"mode={_service_cell_activity_mode_label(str(svc.cell_activity_mode or _DEFAULT_SERVICE_CELL_ACTIVITY_MODE))}, "
+                "seed="
+                + (
+                    "random"
+                    if svc.cell_activity_seed_base is None
+                    else str(int(svc.cell_activity_seed_base))
+                )
+            )
+            lines.append(f"  power input: {power_summary}")
     else:
         lines.append("  Service inputs are incomplete.")
     lines.append("")
@@ -13311,11 +13617,22 @@ class ConstellationWizardDialog(QtWidgets.QDialog):
             self._viewer.speed_combo.setCurrentIndex(idx)
         else:
             self._viewer._playback_multiplier = speed
-        # Auto-extend the preview span so animation lasts at least 30s real-time
+        # Auto-extend the preview span so animation lasts at least 30 s
+        # real-time. CRITICAL: ``apply_preview_settings`` re-reads end_utc
+        # from the viewer's ``end_edit`` widget via
+        # ``_current_preview_parameters()`` — so we MUST update the widget,
+        # not the internal ``_preview_params``. Setting only the internal
+        # value would be silently overwritten on the next apply call,
+        # producing an infinite "build-rebuild" loop where every readiness
+        # event re-extends the span and triggers another rebuild.
         needed_sim_s = speed * self._MIN_REALTIME_PLAYBACK_S
         current_span_s = self._viewer._preview_params.span_s
         if current_span_s < needed_sim_s:
             new_end = self._viewer._preview_params.start_utc + timedelta(seconds=needed_sim_s)
+            # Update the widget so _current_preview_parameters() picks it up.
+            blocker = QtCore.QSignalBlocker(self._viewer.end_edit)
+            self._viewer.end_edit.setDateTime(QtCore.QDateTime(new_end))
+            del blocker
             self._viewer._preview_params.end_utc = new_end
             self._viewer.apply_preview_settings(force_frame_rebuild=True)
 
@@ -13424,7 +13741,7 @@ class ConstellationWizardDialog(QtWidgets.QDialog):
             self._belt_model.replace_belts(belts)
             self._on_belt_data_changed()
         except Exception as exc:
-            QtWidgets.QMessageBox.warning(self, "Import error", str(exc))
+            _show_exception_warning(self, "Import error", "Couldn't import belt definitions from the selected file.", exc)
 
     def _export_belts(self) -> None:
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
@@ -13439,7 +13756,7 @@ class ConstellationWizardDialog(QtWidgets.QDialog):
             with open(path, "w", encoding="utf-8") as fh:
                 json.dump({"belts": belts}, fh, indent=2)
         except Exception as exc:
-            QtWidgets.QMessageBox.warning(self, "Export error", str(exc))
+            _show_exception_warning(self, "Export error", "Couldn't export belt definitions to the selected file.", exc)
 
     # --- Preset loading ---
     def _on_preset_selected(self, index: int) -> None:
@@ -15013,7 +15330,7 @@ class ConstellationViewerWindow(QtWidgets.QMainWindow):
             if params.playback_fps <= 0.0:
                 raise ValueError("Playback rate must be positive.")
         except Exception as exc:
-            QtWidgets.QMessageBox.warning(self, "Invalid preview settings", str(exc))
+            _show_exception_warning(self, "Invalid preview settings", "The preview settings aren't valid — please check the highlighted fields.", exc)
             return
 
         selected_render_mode = self._selected_render_mode()
@@ -17687,6 +18004,27 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
         collapsed_form.addRow("", collapsed_desc)
         self.rf_model_stack.addWidget(collapsed_widget)
 
+        # Isotropic: mode selector. Full description lives in the checkbox
+        # tooltip so the page stays uncluttered.
+        isotropic_widget = QtWidgets.QWidget(self)
+        isotropic_form = QtWidgets.QFormLayout(isotropic_widget)
+        isotropic_form.setContentsMargins(0, 0, 0, 0)
+        self.isotropic_uemr_checkbox = QtWidgets.QCheckBox(
+            "UEMR mode (per-satellite bypass)", self,
+        )
+        self.isotropic_uemr_checkbox.setToolTip(
+            "Unchecked — Directive isotropic: flat 0 dBi pattern routed "
+            "through the standard beam library. Coverage, contours, and "
+            "surface-PFD cap all apply normally.\n\n"
+            "Checked — UEMR: leakage from internal satellite circuitry. "
+            "The beam library is bypassed entirely; every visible satellite "
+            "radiates the configured Ptx/EIRP isotropically. Coverage tabs, "
+            "boresight avoidance, and surface-PFD cap are disabled for "
+            "this mode."
+        )
+        isotropic_form.addRow("Mode", self._helpful_widget(self.isotropic_uemr_checkbox))
+        self.rf_model_stack.addWidget(isotropic_widget)
+
         self.restore_model_defaults_button = QtWidgets.QPushButton("Restore model defaults", self)
         sat_antenna_layout.addWidget(self.restore_model_defaults_button, 0, QtCore.Qt.AlignRight)
         pattern_button_row = QtWidgets.QGridLayout()
@@ -17819,6 +18157,7 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
         service_form_left.addRow("Nbeam", self._helpful_widget(self.service_nbeam_edit))
         service_form_left.addRow("Selection strategy", self._helpful_widget(self.service_selection_combo))
         service_demand_layout.addLayout(service_form_left)
+        self._service_form_left = service_form_left
         service_target_group = QtWidgets.QGroupBox("Power target and activity", service_tab)
         self.service_target_group = service_target_group
         service_target_layout = QtWidgets.QVBoxLayout(service_target_group)
@@ -17852,6 +18191,7 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
         service_form_right.addRow("", self.service_power_equivalent_label)
         service_form_right.addRow("", self.service_power_mode_note)
         service_target_layout.addLayout(service_form_right)
+        self._service_form_right = service_form_right
         # Give "Power target and activity" 2× stretch so the wider panel
         # gets more space than the compact "Subscriber demand" panel.
         service_body_layout.addWidget(service_demand_group, 1)
@@ -17924,6 +18264,7 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
         cap_group_layout = QtWidgets.QVBoxLayout(cap_group)
         cap_group_layout.addWidget(self._surface_pfd_cap_fields)
         self._surface_pfd_cap_fields.hide()  # hidden by default (checkbox off)
+        self._surface_pfd_cap_group_widget = cap_group
         service_layout.addLayout(service_body_layout)
         service_layout.addWidget(cap_group)
         service_button_row = QtWidgets.QGridLayout()
@@ -20439,6 +20780,24 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
         self._update_spectrum_complexity_sections(level_rank)
         self._update_hexgrid_complexity_sections(level_rank)
         self._refresh_help_mode_highlights()
+        # Complexity rules just re-made coverage tabs + reuse rows visible.
+        # Re-apply UEMR-specific hiding so they stay hidden under UEMR.
+        # Only run when the active system is actually UEMR — the helper
+        # would re-show widgets that complexity rules legitimately hid
+        # (e.g. Advanced-gated rows in Basic mode), causing test-side
+        # state bleed in directive mode.
+        if hasattr(self, "isotropic_uemr_checkbox"):
+            uemr_active = False
+            try:
+                active_cfg = self.current_state().active_system().satellite_antennas
+                uemr_active = (
+                    str(getattr(active_cfg, "antenna_model", "") or "") == _ANTENNA_MODEL_ISOTROPIC
+                    and bool(getattr(active_cfg, "isotropic", None) and active_cfg.isotropic.uemr_mode)
+                )
+            except Exception:
+                uemr_active = False
+            if uemr_active:
+                self._apply_uemr_mode_gating(uemr_active=True)
 
     def _grid_advanced_tuning_is_default(self, state: ScepterProjectState | None = None) -> bool:
         state_use = self.current_state() if state is None else state
@@ -20546,6 +20905,16 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
         )
         show_advanced = rank >= _COMPLEXITY_RANK["Advanced"]
         show_expert = rank >= _COMPLEXITY_RANK["Expert"]
+        # UEMR mode bypasses the beam library; cell-reuse, anchor-slot,
+        # power-policy, and split-denominator rules are meaningless there.
+        # Force-hide those rows regardless of the complexity setting.
+        state_for_uemr = self.current_state() if state is None else state
+        uemr_active = False
+        try:
+            active_sys = state_for_uemr.active_system()
+            uemr_active = _system_is_uemr(active_sys)
+        except Exception:
+            pass
         for field_widget in (
             self.spectrum_anchor_slot_field,
             self.spectrum_power_policy_field,
@@ -20560,7 +20929,18 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
                 }
                 else self._spectrum_mask_form
             )
-            self._set_form_row_visible(form, field_widget, show_advanced)
+            # UEMR hides all four of these: anchor-slot / power-policy
+            # are reuse-only concepts, and cutoff basis/percent are
+            # forced to service_bandwidth/100% so the user doesn't need
+            # to pick them.
+            is_uemr_hidden = field_widget in {
+                self.spectrum_anchor_slot_field,
+                self.spectrum_power_policy_field,
+                self.spectrum_cutoff_basis_field,
+                self.spectrum_cutoff_percent_field,
+            }
+            visible = show_advanced and not (uemr_active and is_uemr_hidden)
+            self._set_form_row_visible(form, field_widget, visible)
         for field_widget in (
             self.spectrum_split_denominator_field,
             self.spectrum_tx_reference_field,
@@ -20571,7 +20951,9 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
                 if field_widget is self.spectrum_split_denominator_field
                 else self._spectrum_reference_form
             )
-            self._set_form_row_visible(form, field_widget, show_expert)
+            is_split_row = field_widget is self.spectrum_split_denominator_field
+            visible = show_expert and not (uemr_active and is_split_row)
+            self._set_form_row_visible(form, field_widget, visible)
         state_use = self.current_state() if state is None else state
         defaults = _default_spectrum_config()
         spectrum = state_use.active_system().spectrum
@@ -20743,6 +21125,102 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
         p.drawText(QtCore.QRect(int(sat2_x) - 28, int(sat_y) + 20, 56, 14), QtCore.Qt.AlignCenter, "modified")
         p.setPen(QtGui.QColor("#22c55e"))
         p.drawText(QtCore.QRect(int(out_x) - 25, int(sat_y) + 20, 50, 14), QtCore.Qt.AlignCenter, "active")
+
+        p.end()
+        buf = QtCore.QBuffer()
+        buf.open(QtCore.QBuffer.WriteOnly)
+        pixmap.save(buf, "PNG")
+        b64 = base64.b64encode(bytes(buf.data())).decode("ascii")
+        return (
+            f'<div style="text-align:center; margin:4px 0;">'
+            f'<img src="data:image/png;base64,{b64}" width="{lw}" height="{lh}"/>'
+            f'</div>'
+        )
+
+    @staticmethod
+    def _uemr_isotropic_schematic_data_uri() -> str:
+        """Render a UEMR isotropic-sphere diagram as a HiDPI PNG data URI.
+
+        Depicts a satellite at centre radiating uniformly in all directions
+        (flat 0 dBi) with arrows on a sphere outline — the per-satellite,
+        beam-less UEMR leakage model.
+        """
+        import base64
+        import math as _math
+        scale = 2
+        lw, lh = 360, 200
+        pw, ph = lw * scale, lh * scale
+        pixmap = QtGui.QPixmap(pw, ph)
+        pixmap.setDevicePixelRatio(scale)
+        pixmap.fill(QtGui.QColor("#0c182b"))
+        p = QtGui.QPainter(pixmap)
+        p.setRenderHint(QtGui.QPainter.Antialiasing, True)
+
+        cx, cy = 180.0, 100.0
+        r = 70.0
+
+        p.setPen(QtCore.Qt.NoPen)
+        p.setBrush(QtGui.QColor(14, 165, 233, 28))
+        p.drawEllipse(QtCore.QPointF(cx, cy), r, r)
+        p.setPen(QtGui.QPen(QtGui.QColor(14, 165, 233, 160), 1.4))
+        p.setBrush(QtCore.Qt.NoBrush)
+        p.drawEllipse(QtCore.QPointF(cx, cy), r, r)
+        p.setPen(QtGui.QPen(QtGui.QColor(14, 165, 233, 90), 0.8, QtCore.Qt.DashLine))
+        p.drawEllipse(QtCore.QRectF(cx - r, cy - r * 0.28, r * 2, r * 0.56))
+        p.drawEllipse(QtCore.QRectF(cx - r * 0.28, cy - r, r * 0.56, r * 2))
+
+        pen_arrow = QtGui.QPen(QtGui.QColor("#38bdf8"), 1.6)
+        pen_arrow.setCapStyle(QtCore.Qt.RoundCap)
+        p.setPen(pen_arrow)
+        n_arrows = 12
+        head_len = 6.0
+        for i in range(n_arrows):
+            a = 2 * _math.pi * i / n_arrows
+            sx = cx + r * _math.cos(a)
+            sy = cy + r * _math.sin(a)
+            ex = cx + (r + 22) * _math.cos(a)
+            ey = cy + (r + 22) * _math.sin(a)
+            p.drawLine(QtCore.QPointF(sx, sy), QtCore.QPointF(ex, ey))
+            ah1 = a + _math.radians(150)
+            ah2 = a - _math.radians(150)
+            p.drawLine(
+                QtCore.QPointF(ex, ey),
+                QtCore.QPointF(ex + head_len * _math.cos(ah1), ey + head_len * _math.sin(ah1)),
+            )
+            p.drawLine(
+                QtCore.QPointF(ex, ey),
+                QtCore.QPointF(ex + head_len * _math.cos(ah2), ey + head_len * _math.sin(ah2)),
+            )
+
+        p.setPen(QtCore.Qt.NoPen)
+        p.setBrush(QtGui.QColor("#38bdf8"))
+        p.drawRoundedRect(QtCore.QRectF(cx - 10, cy - 9, 20, 18), 3, 3)
+        p.setBrush(QtGui.QColor("#e0f2fe"))
+        p.drawRoundedRect(QtCore.QRectF(cx - 22, cy - 4, 9, 8), 1.5, 1.5)
+        p.drawRoundedRect(QtCore.QRectF(cx + 13, cy - 4, 9, 8), 1.5, 1.5)
+
+        bold = QtGui.QFont("Segoe UI", 10, QtGui.QFont.Bold)
+        small = QtGui.QFont("Segoe UI", 8)
+        p.setFont(bold)
+        p.setPen(QtGui.QColor("#e0f2fe"))
+        p.drawText(QtCore.QRect(int(cx - 80), 6, 160, 16), QtCore.Qt.AlignCenter, "UEMR isotropic source")
+        p.setFont(small)
+        p.setPen(QtGui.QColor("#94a3b8"))
+        p.drawText(
+            QtCore.QRect(int(cx - 100), int(cy + r + 28), 200, 14),
+            QtCore.Qt.AlignCenter,
+            "Flat 0 dBi — once per satellite, no beams",
+        )
+        # Place the "G = 0 dBi" label above the horizontal arrow tip to
+        # avoid overlapping the arrow shaft/head at y=cy. The rightmost
+        # arrow ends at (cx+r+22, cy); shifting the label ~20px upward
+        # puts it clear of the arrow.
+        p.setPen(QtGui.QColor("#38bdf8"))
+        p.drawText(
+            QtCore.QRect(int(cx + r + 6), int(cy - 26), 70, 14),
+            QtCore.Qt.AlignLeft,
+            "G = 0 dBi",
+        )
 
         p.end()
         buf = QtCore.QBuffer()
@@ -21456,36 +21934,12 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
                 ),
                 "Basic",
             ),
-            (
-                self.service_nco_edit,
-                "Nco",
-                "Number of concurrently served cells or demand opportunities considered by the service model.",
-                self._help_details_html(
-                    default="Use the current project default unless the service plan changes the offered concurrency.",
-                    symptoms="Larger values increase demand pressure and can increase the amount of work done during selection and power control.",
-                ),
-                "Basic",
-            ),
-            (
-                self.service_nbeam_edit,
-                "Nbeam",
-                "Maximum number of beams the service side can keep active concurrently.",
-                self._help_details_html(
-                    default="Keep this aligned with the beam-management assumptions used by the scenario.",
-                    interactions="Nbeam works with Nco and the selection strategy to determine how aggressively service is allocated across the visible system.",
-                ),
-                "Basic",
-            ),
-            (
-                self.service_selection_combo,
-                "Selection strategy",
-                "Choose how the service path selects candidate beams or satellites when more than one option is available.",
-                self._help_details_html(
-                    default="Use the project default unless a validation or sensitivity run explicitly needs another strategy.",
-                    interactions="Selection interacts with Nco, Nbeam, and the visible geometry, so changing it can materially alter both service behaviour and interference outcomes.",
-                ),
-                "Basic",
-            ),
+            # NOTE: detailed help for ``service_nco_edit``, ``service_nbeam_edit``
+            # and ``service_selection_combo`` is registered later in this
+            # same list with more precise wording. The earlier generic
+            # entries that used to live here were removed because they
+            # contradicted the later ones (e.g. "cells" vs "candidate
+            # links per cell").
             (
                 self.service_cell_activity_edit,
                 "Cell activity [%]",
@@ -21952,6 +22406,24 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
                     default="Rec 1.4 uses the analytical Bessel/Taylor formula with visible sidelobes. "
                     "Rec 1.2 is a piecewise envelope approximation without sidelobes, parameterised by Gm, LN, and z. "
                     "Both models support LUT-accelerated GPU evaluation.",
+                ),
+                "Basic",
+            ),
+            (
+                self.isotropic_uemr_checkbox,
+                "Isotropic UEMR mode",
+                "Switch between Directive isotropic (per-beam, uses the beam library) and UEMR (per-satellite bypass for internal-circuitry leakage).",
+                self._uemr_isotropic_schematic_data_uri()
+                + self._help_details_html(
+                    default="Unchecked — Directive isotropic: flat 0 dBi pattern routed through the standard beam library. "
+                    "Nbeam, coverage tabs, boresight avoidance, and surface-PFD cap all apply normally. Useful for "
+                    "modelling N co-located omnidirectional transmitters per satellite (aggregate leakage scales with Nbeam).",
+                    when="Checked — UEMR: each visible satellite radiates the configured Ptx/EIRP isotropically, once per satellite. "
+                    "The beam library is bypassed entirely — Nbeam, selection strategy, cell activity, coverage tabs, "
+                    "boresight avoidance, and the surface-PFD cap are all disabled because they have no meaning without beams. "
+                    "Use this to model unwanted emissions from internal satellite circuitry that are not coupled to the directive antenna.",
+                    interactions="Toggling UEMR on hides irrelevant Service & Demand fields and the Coverage tabs; toggling it off restores them. "
+                    "The transmit emission mask on the Spectrum tab still shapes UEMR power across frequency.",
                 ),
                 "Basic",
             ),
@@ -23019,23 +23491,41 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
         s0 = state.active_system()
         try:
             power_input = _require_service_power_input(state)
-            power_summary = _service_power_input_summary(power_input)
+            power_summary = _service_power_input_summary(power_input, uemr_mode=uemr_active)
         except ValueError:
             power_summary = None
-        service_ready = _has_valid_service_config(s0.service)
+        uemr_active = _system_is_uemr(s0)
+        service_ready = _has_valid_service_config(s0.service, uemr_mode=uemr_active)
+        if service_ready:
+            if uemr_active:
+                ready_msg = f"{power_summary} is ready."
+            else:
+                ready_msg = (
+                    "Nco, Nbeam, selection, "
+                    f"{_service_cell_activity_mode_label(str(s0.service.cell_activity_mode or _DEFAULT_SERVICE_CELL_ACTIVITY_MODE))} activity, "
+                    f"and {power_summary} are ready."
+                )
+        else:
+            if uemr_active:
+                ready_msg = (
+                    "Set one finite service power definition (Ptx or EIRP) on "
+                    "the Service tab. UEMR mode ignores Nco/Nbeam/selection "
+                    "strategy/cell activity and channel bandwidth (the kernel "
+                    "uses the service band width automatically)."
+                )
+            else:
+                ready_msg = (
+                    "Set valid Nco, Nbeam, selection strategy, activity factor, "
+                    "channel bandwidth, and one finite service power definition, "
+                    "or apply the service defaults."
+                )
         return self._page_status(
             ready=bool(service_ready),
             kind="ready" if service_ready else "warning",
             title="Service and demand inputs are configured"
             if service_ready
             else "Complete service and demand inputs",
-            message=(
-                "Nco, Nbeam, selection, "
-                f"{_service_cell_activity_mode_label(str(s0.service.cell_activity_mode or _DEFAULT_SERVICE_CELL_ACTIVITY_MODE))} activity, "
-                f"and {power_summary} are ready."
-                if service_ready
-                else "Set valid Nco, Nbeam, selection strategy, activity factor, channel bandwidth, and one finite service power definition, or apply the service defaults."
-            ),
+            message=ready_msg,
             target=self.service_tab,
             action="Open service and demand",
         )
@@ -23117,9 +23607,17 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
         elif self._review_run_state == "completed":
             run_title = "Simulation finished"
             run_message_text = "The last run completed and the result file is ready for postprocess."
+            if getattr(self, "_final_elapsed_s", None) is not None:
+                run_message_text += (
+                    f" Total elapsed time: {_format_duration_compact(float(self._final_elapsed_s))}."
+                )
         elif self._review_run_state == "stopped":
             run_title = "Simulation stopped cleanly"
             run_message_text = "The last run stopped with flushed partial results that can still be inspected."
+            if getattr(self, "_final_elapsed_s", None) is not None:
+                run_message_text += (
+                    f" Elapsed before stop: {_format_duration_compact(float(self._final_elapsed_s))}."
+                )
         else:
             run_title = "Review parameters and outputs" if run_ready else "Resolve run preflight blockers"
             run_message_text = (
@@ -23213,9 +23711,19 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
         icon_ready = self.style().standardIcon(QtWidgets.QStyle.SP_DialogApplyButton)
         icon_warning = self.style().standardIcon(QtWidgets.QStyle.SP_MessageBoxWarning)
         icon_review = self.style().standardIcon(QtWidgets.QStyle.SP_MessageBoxInformation)
+        # In UEMR mode we rename "Spectrum & Reuse" -> "Spectrum" and
+        # "Service & Demand" -> "Service" at the tab-widget level, but the
+        # status-payload dict is keyed by the ORIGINAL tab names. Map the
+        # renamed labels back so the lookup doesn't silently miss.
+        _uemr_label_aliases = {
+            "Spectrum": "Spectrum & Reuse",
+            "Service": "Service & Demand",
+        }
         for tab_index in range(self.tab_widget.count()):
             label = self.tab_widget.tabText(tab_index)
             status = statuses_use.get(label)
+            if status is None and label in _uemr_label_aliases:
+                status = statuses_use.get(_uemr_label_aliases[label])
             item = self.simulation_page_list.item(tab_index)
             if status is None or item is None:
                 continue
@@ -23600,7 +24108,10 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
         self._set_workspace(_WORKSPACE_SIMULATION)
         page = self._simulation_page_for_target(target)
         idx = self.tab_widget.indexOf(page) if page is not None else -1
-        if idx >= 0:
+        # Don't navigate to a tab that has been hidden (e.g. coverage tabs
+        # under UEMR). Fall through silently instead of popping a blank
+        # page into view.
+        if idx >= 0 and self.tab_widget.tabBar().isTabVisible(idx):
             self.tab_widget.setCurrentIndex(idx)
         self._highlight_widget(target if isinstance(target, QtWidgets.QWidget) else page)
 
@@ -23618,7 +24129,7 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
         try:
             self.postprocess_widget.open_result_file(filename)
         except Exception as exc:
-            QtWidgets.QMessageBox.warning(self, "Open result failed", str(exc))
+            _show_exception_warning(self, "Open result failed", "Couldn't open the selected result file.", exc)
             return
         self._remember_recent_result(filename)
         self._set_workspace(_WORKSPACE_POSTPROCESS)
@@ -23630,7 +24141,7 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
         try:
             state = load_project_state(path)
         except Exception as exc:
-            QtWidgets.QMessageBox.warning(self, "Load failed", str(exc))
+            _show_exception_warning(self, "Load failed", "Couldn't load the recent project file.", exc)
             return
         self._current_path = Path(path)
         self._dirty = False
@@ -23715,6 +24226,8 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
         self.ras_grx_max_spin.editingFinished.connect(self._on_state_changed)
         self.derive_pattern_wavelength_checkbox.toggled.connect(self._on_rf_pattern_source_changed)
         self.antenna_model_combo.currentIndexChanged.connect(self._on_rf_model_changed)
+        self.isotropic_uemr_checkbox.toggled.connect(self._on_rf_model_changed)
+        self.isotropic_uemr_checkbox.toggled.connect(self._on_state_changed)
         self.pattern_wavelength_spin.valueChanged.connect(self._on_state_changed)
         self.pattern_wavelength_spin.editingFinished.connect(self._on_state_changed)
         self.restore_model_defaults_button.clicked.connect(self._restore_selected_model_defaults)
@@ -24158,6 +24671,43 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
         # (per_mhz ↔ per_channel) whenever the power basis changes.
         if hasattr(self, "max_surface_pfd_enable_check"):
             self._sync_surface_pfd_cap_controls()
+        # Auto-fill the newly-selected basis editor from the other basis'
+        # value. Without this, a user who flips "per MHz → per channel"
+        # after entering a Ptx value sees an empty field and the
+        # validator reports "service incomplete" even though their input
+        # is fully determined. This matches the conversion-safe semantics
+        # in ``scenario.normalize_direct_epfd_power_input``.
+        bw_raw = self.service_bandwidth_edit.value_or_none()
+        try:
+            bw_mhz = float(bw_raw) if bw_raw is not None else None
+        except Exception:
+            bw_mhz = None
+        if bw_mhz is not None and np.isfinite(bw_mhz) and bw_mhz > 0.0:
+            editor_map = {
+                (q, b): w for q, b, w in self._service_power_editor_order
+            }
+            active_widget = editor_map.get((quantity, basis))
+            other_basis = "per_channel" if basis == "per_mhz" else "per_mhz"
+            other_widget = editor_map.get((quantity, other_basis))
+            if active_widget is not None and other_widget is not None:
+                active_val = active_widget.value_or_none()
+                other_val = other_widget.value_or_none()
+                active_empty = active_val is None or not np.isfinite(float(active_val))
+                other_has = other_val is not None and np.isfinite(float(other_val))
+                if active_empty and other_has:
+                    try:
+                        from scepter.scenario import convert_direct_epfd_power_basis_db
+                        converted = convert_direct_epfd_power_basis_db(
+                            float(other_val),
+                            bandwidth_mhz=float(bw_mhz),
+                            from_basis=other_basis,
+                            to_basis=basis,
+                        )
+                        blocker = QtCore.QSignalBlocker(active_widget)
+                        active_widget.set_value(round(float(converted), 6))
+                        del blocker
+                    except Exception:
+                        pass
         for idx, (editor_quantity, editor_basis, _widget) in enumerate(
             self._service_power_editor_order
         ):
@@ -24167,7 +24717,14 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
         # Power variation visibility and labelling
         var_mode = str(self.service_power_variation_combo.currentData() or "fixed")
         is_target_pfd = quantity == "target_pfd"
-        show_variation = not is_target_pfd
+        # UEMR mode forces a fixed power value (no stochastic variation) —
+        # keep variation widgets hidden regardless of quantity.
+        _uemr_active_here = False
+        try:
+            _uemr_active_here = _system_is_uemr(self.current_state().active_system())
+        except Exception:
+            pass
+        show_variation = (not is_target_pfd) and (not _uemr_active_here)
         is_range = show_variation and var_mode != "fixed"
         unit = _service_power_value_unit(quantity, basis)
         qty_label = _service_power_quantity_label(quantity)
@@ -24196,9 +24753,16 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
         try:
             power_input = _normalize_service_config_power_input(self._current_service_config())
         except Exception:
-            self.service_power_equivalent_label.setText(
-                "Enter a positive channel bandwidth and a finite value for the selected power quantity/basis."
-            )
+            if _uemr_active_here:
+                self.service_power_equivalent_label.setText(
+                    f"Enter a finite {qty_label} value for the selected basis. "
+                    "UEMR mode uses the service band width automatically — no "
+                    "separate channel bandwidth is needed."
+                )
+            else:
+                self.service_power_equivalent_label.setText(
+                    "Enter a positive channel bandwidth and a finite value for the selected power quantity/basis."
+                )
             return
         complementary_basis = "per_channel" if basis == "per_mhz" else "per_mhz"
         complementary_key = f"{quantity}_dbw_mhz"
@@ -24343,7 +24907,8 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
             spectrum_has_explicit_inputs and reuse_factor is not None
         )
         receiver_ready, receiver_message = _validate_ras_receiver_config(ras_cfg)
-        self.ras_receiver_response_tool_button.setEnabled(bool(receiver_ready))
+        receiver_button_ready, _ = _validate_ras_receiver_band(ras_cfg)
+        self.ras_receiver_response_tool_button.setEnabled(bool(receiver_button_ready))
         self.ras_receiver_response_tool_button.setText(
             "Edit Receiver Response"
             if receiver_mode == "custom"
@@ -24367,32 +24932,51 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
         )
         if not spectrum_has_explicit_inputs:
             self._refresh_reuse_factor_highlights(partial_plan)
-            self.spectrum_summary_label.setText(
-                "Spectrum inputs are blank. Enter the service band and reuse settings here, then define the RAS receiver band on the RAS Station tab, or apply the spectrum defaults."
-            )
-            if partial_plan is None:
-                self.spectrum_zero_leftover_label.setText(
-                    "Exact-fit reuse highlighting appears once the service band and channel bandwidth are valid."
+            uemr_active_here = False
+            try:
+                uemr_active_here = _system_is_uemr(self.current_state().active_system())
+            except Exception:
+                pass
+            if uemr_active_here:
+                self.spectrum_summary_label.setText(
+                    "Spectrum inputs are blank. In UEMR mode, set the service band "
+                    "(defines the transmitter's intended operating band) and the "
+                    "transmit unwanted-emission mask here, then define the RAS "
+                    "receiver band on the RAS Station tab."
+                )
+                self.spectrum_zero_leftover_label.setText("")
+                self.spectrum_leakage_summary_label.setText(
+                    "Set a valid service band, transmitter mask, channel bandwidth, "
+                    "and a valid RAS receiver band on the RAS Station tab to preview "
+                    "leakage."
                 )
             else:
-                exact_fit_factors = tuple(
-                    int(value) for value in partial_plan["zero_leftover_reuse_factors"]
+                self.spectrum_summary_label.setText(
+                    "Spectrum inputs are blank. Enter the service band and reuse settings here, then define the RAS receiver band on the RAS Station tab, or apply the spectrum defaults."
                 )
-                if exact_fit_factors:
+                if partial_plan is None:
                     self.spectrum_zero_leftover_label.setText(
-                        "Exact-fit reuse factors for the current band plan: "
-                        + ", ".join(f"F{value}" for value in exact_fit_factors)
-                        + "."
+                        "Exact-fit reuse highlighting appears once the service band and channel bandwidth are valid."
                     )
                 else:
-                    self.spectrum_zero_leftover_label.setText(
-                        "No supported reuse factor uses the full configured service band without leftover spectrum."
+                    exact_fit_factors = tuple(
+                        int(value) for value in partial_plan["zero_leftover_reuse_factors"]
                     )
+                    if exact_fit_factors:
+                        self.spectrum_zero_leftover_label.setText(
+                            "Exact-fit reuse factors for the current band plan: "
+                            + ", ".join(f"F{value}" for value in exact_fit_factors)
+                            + "."
+                        )
+                    else:
+                        self.spectrum_zero_leftover_label.setText(
+                            "No supported reuse factor uses the full configured service band without leftover spectrum."
+                        )
+                self.spectrum_leakage_summary_label.setText(
+                    "Set a valid service band, reuse scheme, transmitter mask, channel bandwidth, and a valid RAS receiver band on the RAS Station tab to preview leakage."
+                )
             self.spectrum_mask_summary_label.setText(
                 "Leakage preview becomes available once the spectrum plan validates."
-            )
-            self.spectrum_leakage_summary_label.setText(
-                "Set a valid service band, reuse scheme, transmitter mask, channel bandwidth, and a valid RAS receiver band on the RAS Station tab to preview leakage."
             )
             self.spectrum_split_denominator_combo.setEnabled(False)
             self.preview_spectrum_plot_button.setEnabled(False)
@@ -24401,6 +24985,24 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
         try:
             plan = _normalize_spectrum_config(service_cfg, spectrum_cfg, ras_cfg)
         except Exception as exc:
+            # UEMR fallback: the full normalize requires RAS receiver band,
+            # which is optional for UEMR. When the system is UEMR and the
+            # service band + mask preset are valid, enable the Edit Spectrum
+            # button anyway so the user can still preview UEMR integration
+            # into the RAS receiver band once the receiver band is set.
+            try:
+                _uemr_active_here = _system_is_uemr(self.current_state().active_system())
+            except Exception:
+                _uemr_active_here = False
+            if (
+                _uemr_active_here
+                and spectrum_cfg.service_band_start_mhz is not None
+                and spectrum_cfg.service_band_stop_mhz is not None
+                and float(spectrum_cfg.service_band_stop_mhz)
+                    > float(spectrum_cfg.service_band_start_mhz)
+                and spectrum_cfg.unwanted_emission_mask_preset
+            ):
+                self.preview_spectrum_plot_button.setEnabled(True)
             self._refresh_reuse_factor_highlights(partial_plan)
             self.spectrum_summary_label.setText(
                 _spectrum_summary_text(partial_plan)
@@ -24433,7 +25035,22 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
                 "Set a valid service band, reuse scheme, transmitter mask, channel bandwidth, and a valid RAS receiver band on the RAS Station tab to preview leakage."
             )
             self.spectrum_split_denominator_combo.setEnabled(False)
-            self.preview_spectrum_plot_button.setEnabled(False)
+            # Preserve the UEMR-enable above: only disable when UEMR is NOT
+            # active with valid service band + mask.
+            _uemr_can_edit = False
+            try:
+                _uemr_can_edit = (
+                    _system_is_uemr(self.current_state().active_system())
+                    and spectrum_cfg.service_band_start_mhz is not None
+                    and spectrum_cfg.service_band_stop_mhz is not None
+                    and float(spectrum_cfg.service_band_stop_mhz)
+                        > float(spectrum_cfg.service_band_start_mhz)
+                    and bool(spectrum_cfg.unwanted_emission_mask_preset)
+                )
+            except Exception:
+                pass
+            if not _uemr_can_edit:
+                self.preview_spectrum_plot_button.setEnabled(False)
             self._refresh_open_spectrum_editor_window(spectrum_plan=None)
             return
         self._refresh_reuse_factor_highlights(plan)
@@ -24446,8 +25063,33 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
             == "per_channel"
         )
         self.spectrum_split_denominator_combo.setEnabled(show_expert and split_denominator_relevant)
-        self.preview_spectrum_plot_button.setEnabled(True)
-        self.spectrum_summary_label.setText(_spectrum_summary_text(plan))
+        # Edit Spectrum requires a mask preset — otherwise the dialog has
+        # no envelope to display. A missing preset is a valid "not yet
+        # configured" state, not an enable-the-button state.
+        self.preview_spectrum_plot_button.setEnabled(
+            bool(spectrum_cfg.unwanted_emission_mask_preset)
+        )
+        # UEMR mode bypasses the beam/channel/reuse concepts; show a
+        # UEMR-appropriate summary instead of the directive "N channels /
+        # cluster=X / exact-fit reuse" line (which references beams).
+        _uemr_active_summary = False
+        try:
+            _uemr_active_summary = _system_is_uemr(self.current_state().active_system())
+        except Exception:
+            pass
+        if _uemr_active_summary:
+            try:
+                _sb_start = float(spectrum_cfg.service_band_start_mhz)
+                _sb_stop = float(spectrum_cfg.service_band_stop_mhz)
+                _mp = str(spectrum_cfg.unwanted_emission_mask_preset or "n/a")
+                self.spectrum_summary_label.setText(
+                    f"UEMR: service band {_sb_start:.3f}–{_sb_stop:.3f} MHz "
+                    f"({_sb_stop - _sb_start:.3f} MHz wide) | transmit mask {_mp}."
+                )
+            except Exception:
+                self.spectrum_summary_label.setText("UEMR spectrum inputs are ready.")
+        else:
+            self.spectrum_summary_label.setText(_spectrum_summary_text(plan))
         exact_fit_factors = tuple(int(value) for value in plan["zero_leftover_reuse_factors"])
         if exact_fit_factors:
             self.spectrum_zero_leftover_label.setText(
@@ -24523,6 +25165,9 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
                 d_v=self.m2101_d_v_spin.value_or_none(),
                 n_h=self.m2101_n_h_spin.value_or_none(),
                 n_v=self.m2101_n_v_spin.value_or_none(),
+            ),
+            isotropic=AntennaIsotropicConfig(
+                uemr_mode=bool(self.isotropic_uemr_checkbox.isChecked()),
             ),
             ras=RasAntennaConfig(
                 antenna_diameter_m=self.antenna_spin.value_or_none(),
@@ -25429,6 +26074,7 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
         self.m2101_d_v_spin.set_value(sat_cfg.m2101.d_v)
         self.m2101_n_h_spin.set_value(sat_cfg.m2101.n_h)
         self.m2101_n_v_spin.set_value(sat_cfg.m2101.n_v)
+        self.isotropic_uemr_checkbox.setChecked(bool(sat_cfg.isotropic.uemr_mode))
         self._sync_rf_panel()
 
     def _load_antennas_widgets(self, config: AntennasConfig) -> None:
@@ -25467,6 +26113,7 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
         self.m2101_d_v_spin.set_value(config.m2101.d_v)
         self.m2101_n_h_spin.set_value(config.m2101.n_h)
         self.m2101_n_v_spin.set_value(config.m2101.n_v)
+        self.isotropic_uemr_checkbox.setChecked(bool(config.isotropic.uemr_mode))
         self.antenna_spin.set_value(config.ras.antenna_diameter_m)
         if config.ras.grx_max_dbi is not None:
             self.ras_grx_max_spin.set_value(config.ras.grx_max_dbi)
@@ -26024,6 +26671,23 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
         self._update_grid_complexity_sections(state=state)
         self._update_spectrum_complexity_sections(state=state)
         self._update_hexgrid_complexity_sections(state=state)
+        # Complexity updates above toggle visibility of Advanced/Expert
+        # widgets. If UEMR is active they must stay hidden afterwards —
+        # re-apply the UEMR gating to enforce that.
+        if hasattr(self, "isotropic_uemr_checkbox"):
+            try:
+                active_cfg = state.active_system().satellite_antennas
+                uemr_active = (
+                    str(getattr(active_cfg, "antenna_model", "") or "") == _ANTENNA_MODEL_ISOTROPIC
+                    and bool(
+                        getattr(active_cfg, "isotropic", None)
+                        and active_cfg.isotropic.uemr_mode
+                    )
+                )
+            except Exception:
+                uemr_active = False
+            if uemr_active:
+                self._apply_uemr_mode_gating(uemr_active=True)
 
     @QtCore.Slot()
     def _on_runtime_controls_changed(self, *_args: object) -> None:
@@ -26041,6 +26705,18 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
     def _on_spectrum_controls_changed(self, *_args: object) -> None:
         if self._state_load_in_progress:
             return
+        # If UEMR is active, re-apply the forced defaults so that a
+        # newly-entered service band immediately updates the hidden
+        # channel-bandwidth field (which the kernel still reads as the
+        # active spectral slab width).
+        try:
+            if (
+                hasattr(self, "isotropic_uemr_checkbox")
+                and self.isotropic_uemr_checkbox.isChecked()
+            ):
+                self._apply_uemr_forced_defaults()
+        except Exception:
+            pass
         self._sync_spectrum_controls()
         self._on_state_changed()
 
@@ -26442,6 +27118,11 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
         live_idx = state._active_index
         for sys_idx, sys_cfg in enumerate(all_systems):
             label = sys_cfg.system_name or f"System {sys_idx + 1}"
+            # UEMR systems bypass the beam library entirely — they have no
+            # finite beamwidth, so contour analysis is not applicable and
+            # hexgrid / boresight are not used. Skip both checks.
+            if _system_is_uemr(sys_cfg):
+                continue
             if sys_idx == live_idx:
                 # This system's derived state is in the window variables
                 contour_current = self._contour_is_current(state)
@@ -26477,17 +27158,39 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
                 return False, f"{label}: no belts defined."
             if not _has_valid_satellite_antenna_config(sys_cfg.satellite_antennas):
                 return False, f"{label}: satellite antenna incomplete."
-            if not _has_valid_service_config(sys_cfg.service):
+            if not _has_valid_service_config(sys_cfg.service, uemr_mode=_system_is_uemr(sys_cfg)):
                 return False, f"{label}: service & demand incomplete."
-            try:
-                _normalize_spectrum_config(sys_cfg.service, sys_cfg.spectrum, state.ras_station)
-            except TypeError:
-                return False, (
-                    f"{label}: spectrum configuration incomplete. "
-                    "Check that RAS receiver band start/stop and response mode are set."
-                )
-            except Exception as exc:
-                return False, f"{label}: spectrum invalid ({exc})."
+            # UEMR systems skip the cell/reuse spectrum normalisation
+            # entirely — they need only a valid service band + mask preset.
+            # The full normalize call requires RAS receiver band fields
+            # which are optional for UEMR (the UEMR bypass path doesn't
+            # compute receiver-band overlap integrals the same way).
+            if _system_is_uemr(sys_cfg):
+                sp = sys_cfg.spectrum
+                if (
+                    sp.service_band_start_mhz is None
+                    or sp.service_band_stop_mhz is None
+                    or float(sp.service_band_stop_mhz) <= float(sp.service_band_start_mhz)
+                ):
+                    return False, (
+                        f"{label}: UEMR spectrum needs a valid service band "
+                        "(start < stop) on the Spectrum tab."
+                    )
+                if not sp.unwanted_emission_mask_preset:
+                    return False, (
+                        f"{label}: UEMR spectrum needs a transmit mask preset "
+                        "selected on the Spectrum tab."
+                    )
+            else:
+                try:
+                    _normalize_spectrum_config(sys_cfg.service, sys_cfg.spectrum, state.ras_station)
+                except TypeError:
+                    return False, (
+                        f"{label}: spectrum configuration incomplete. "
+                        "Check that RAS receiver band start/stop and response mode are set."
+                    )
+                except Exception as exc:
+                    return False, f"{label}: spectrum invalid ({exc})."
             # Surface-PFD cap: when the user enables the cap, we need
             # exactly one of the limit forms (per-MHz or per-channel)
             # set to a finite value, and a known cap mode.  Catch this
@@ -26495,6 +27198,16 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
             # with a cryptic LUT / limit mismatch error.
             svc_cfg = sys_cfg.service
             if bool(getattr(svc_cfg, "max_surface_pfd_enabled", False)):
+                # UEMR + cap is a semantic mismatch — block at the GUI
+                # layer so the user sees a clear readiness message
+                # instead of the pipeline's runtime ValueError.
+                if _system_is_uemr(sys_cfg):
+                    return False, (
+                        f"{label}: Surface-PFD cap cannot be combined with "
+                        f"UEMR mode. UEMR radiates omnidirectionally with no "
+                        f"beams to cap — disable either the cap or the UEMR "
+                        f"flag on this system."
+                    )
                 _cap_mhz = getattr(svc_cfg, "max_surface_pfd_dbw_m2_mhz", None)
                 _cap_ch = getattr(svc_cfg, "max_surface_pfd_dbw_m2_channel", None)
                 _cap_mhz_ok = _cap_mhz is not None and np.isfinite(float(_cap_mhz))
@@ -26545,24 +27258,27 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
         )
         if total_sats > 500_000:
             return False, f"Constellation has {total_sats:,} satellites — maximum supported is 500,000."
-        if svc.nco is None or int(svc.nco) <= 0:
-            return False, "Run Simulation requires Nco to be positive."
-        if svc.nbeam is None or int(svc.nbeam) <= 0:
-            return False, "Run Simulation requires Nbeam to be positive."
-        _max_nco = 64
-        try:
-            from scepter.gpu_accel import GPU_LINK_SELECTION_MAX_LINKS
-            _max_nco = int(GPU_LINK_SELECTION_MAX_LINKS)
-        except Exception:
-            pass
-        if int(svc.nco) > _max_nco:
-            return False, f"Run Simulation supports at most {_max_nco} serving links (Nco)."
-        if str(svc.selection_strategy or "") not in {
-            value for _, value in _SELECTION_STRATEGY_OPTIONS
-        }:
-            return False, "Run Simulation selection strategy is unsupported."
-        if svc.cell_activity_factor is None or not (0.0 <= float(svc.cell_activity_factor) <= 1.0):
-            return False, "Run Simulation requires cell activity in [0, 100] %."
+        # Beam-library-specific checks apply only when the primary system
+        # runs the directive pipeline. UEMR bypasses them entirely.
+        if not _system_is_uemr(s0):
+            if svc.nco is None or int(svc.nco) <= 0:
+                return False, "Run Simulation requires Nco to be positive."
+            if svc.nbeam is None or int(svc.nbeam) <= 0:
+                return False, "Run Simulation requires Nbeam to be positive."
+            _max_nco = 64
+            try:
+                from scepter.gpu_accel import GPU_LINK_SELECTION_MAX_LINKS
+                _max_nco = int(GPU_LINK_SELECTION_MAX_LINKS)
+            except Exception:
+                pass
+            if int(svc.nco) > _max_nco:
+                return False, f"Run Simulation supports at most {_max_nco} serving links (Nco)."
+            if str(svc.selection_strategy or "") not in {
+                value for _, value in _SELECTION_STRATEGY_OPTIONS
+            }:
+                return False, "Run Simulation selection strategy is unsupported."
+            if svc.cell_activity_factor is None or not (0.0 <= float(svc.cell_activity_factor) <= 1.0):
+                return False, "Run Simulation requires cell activity in [0, 100] %."
         try:
             start_time = _parse_utc_iso_text(state.runtime.base_start_utc_iso)
             end_time = _parse_utc_iso_text(state.runtime.base_end_utc_iso)
@@ -26591,6 +27307,12 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
         try:
             _require_service_power_input(state)
         except ValueError:
+            if _system_is_uemr(s0):
+                return (
+                    False,
+                    "Run Simulation requires one finite service power "
+                    "definition (Ptx or EIRP per MHz) on the Service tab.",
+                )
             return (
                 False,
                 "Run Simulation requires a positive channel bandwidth and one finite service power definition.",
@@ -26716,7 +27438,7 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
         _model_page = {
             _ANTENNA_MODEL_REC12: 0, _ANTENNA_MODEL_REC14: 1,
             _ANTENNA_MODEL_M2101: 2, _ANTENNA_MODEL_S672: 0,
-            _ANTENNA_MODEL_COLLAPSED: 3,
+            _ANTENNA_MODEL_COLLAPSED: 3, _ANTENNA_MODEL_ISOTROPIC: 4,
         }
         self.rf_model_stack.setCurrentIndex(_model_page.get(selected_model, 1))
         # S.672 calls the near-in sidelobe level "Ls"; S.1528 calls it "LN"
@@ -26724,13 +27446,396 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
             self._rec12_ln_label.setText(
                 "Ls [dB]" if selected_model == _ANTENNA_MODEL_S672 else "LN [dB]"
             )
+        # UEMR-mode gating: when the UEMR isotropic bypass is active, the
+        # beam library is skipped so Nbeam, coverage & contours, coverage &
+        # boresight, and surface-PFD cap are all inapplicable.
+        self._apply_uemr_mode_gating(
+            uemr_active=(
+                selected_model == _ANTENNA_MODEL_ISOTROPIC
+                and bool(self.isotropic_uemr_checkbox.isChecked())
+            )
+        )
+
+    def _apply_uemr_mode_gating(self, *, uemr_active: bool) -> None:
+        """Hide GUI sections that don't apply in UEMR mode.
+
+        In UEMR the beam library is bypassed entirely, so Nco / Nbeam /
+        selection / cell-activity controls have no effect; the coverage
+        tabs run an analyser that can't produce meaningful cell sizes
+        without a directive pattern; and the surface-PFD cap is blocked
+        at runtime. Hide all of these (rather than just disabling) so
+        users aren't confused by inapplicable controls.
+        """
+        # Hide per-row Service & Demand fields that don't apply. For each
+        # field widget we hide (a) the inner widget, (b) its helper-button
+        # container (so the "?" goes away too), and (c) call
+        # ``setRowVisible`` on the form so the row label also disappears.
+        for form_attr, field_attrs in (
+            ("_service_form_left", ("service_nco_edit", "service_nbeam_edit", "service_selection_combo")),
+            (
+                "_service_form_right",
+                (
+                    "service_cell_activity_edit",
+                    "service_cell_activity_mode_combo",
+                    "service_cell_seed_edit",
+                    # UEMR does not have channels — Channel bandwidth
+                    # is forced to equal the service band width. Power
+                    # basis is forced to per_mhz (spectral density is the
+                    # only meaningful UEMR quantity), and Power variation
+                    # is forced to fixed (no stochastic UEMR model). The
+                    # range min/max editors are NOT listed here — they
+                    # are managed by ``_sync_service_power_controls`` based
+                    # on the fixed/range mode, and that path already hides
+                    # them when UEMR forces fixed.
+                    "service_bandwidth_edit",
+                    "service_power_basis_combo",
+                    "service_power_variation_combo",
+                ),
+            ),
+        ):
+            form = getattr(self, form_attr, None)
+            if form is None:
+                continue
+            for fname in field_attrs:
+                field = getattr(self, fname, None)
+                if field is None:
+                    continue
+                container = self._help_buttons[field].parent() if field in self._help_buttons else None
+                try:
+                    field.setVisible(not uemr_active)
+                except Exception:
+                    pass
+                if container is not None:
+                    try:
+                        container.setVisible(not uemr_active)
+                    except Exception:
+                        pass
+                try:
+                    form.setRowVisible(container or field, not uemr_active)
+                except Exception:
+                    pass
+        # Hide both coverage tabs entirely — their analyser requires a
+        # finite beamwidth and has no useful output for isotropic UEMR.
+        tabs = getattr(self, "tab_widget", None) or getattr(self, "tabs", None)
+        coverage_labels = {"Coverage & Contours", "Coverage & Boresight"}
+        if tabs is not None:
+            for tab_attr in ("grid_tab", "hexgrid_tab"):
+                tab = getattr(self, tab_attr, None)
+                if tab is None:
+                    continue
+                try:
+                    idx = tabs.indexOf(tab)
+                    if idx >= 0:
+                        tabs.setTabVisible(idx, not uemr_active)
+                except Exception:
+                    try:
+                        tabs.setTabEnabled(idx, not uemr_active)
+                    except Exception:
+                        pass
+        # The sidebar is a QListWidget (self.simulation_page_list) that
+        # drives tab selection; QTabWidget's tabBar is hidden. Hide the
+        # two coverage entries in the sidebar rail too.
+        sim_list = getattr(self, "simulation_page_list", None)
+        if sim_list is not None:
+            for row in range(sim_list.count()):
+                item = sim_list.item(row)
+                if item is None:
+                    continue
+                tab_idx = item.data(QtCore.Qt.UserRole)
+                if tab_idx is None or tabs is None:
+                    continue
+                try:
+                    tab_label = tabs.tabText(int(tab_idx))
+                except Exception:
+                    continue
+                if tab_label in coverage_labels:
+                    item.setHidden(uemr_active)
+        # Hide the surface-PFD cap group box wholesale.
+        cap_group = getattr(self, "_surface_pfd_cap_group_widget", None)
+        if cap_group is not None:
+            try:
+                cap_group.setVisible(not uemr_active)
+            except Exception:
+                pass
+        # Spectrum & Reuse: in UEMR mode, cell-reuse concepts do not apply
+        # (no beams are assigned to cells). Keep the transmit mask / service
+        # band for emission-mask shaping, but hide reuse factor, RAS
+        # anchor slot, group power policy, and split-denominator rule.
+        # The "Show Reuse Scheme" preview also has no meaning without beams.
+        for reuse_btn_attr in ("show_reuse_scheme_button",):
+            btn = getattr(self, reuse_btn_attr, None)
+            if btn is not None:
+                try:
+                    btn.setVisible(not uemr_active)
+                except Exception:
+                    pass
+        service_band_form = getattr(self, "_spectrum_service_band_form", None)
+        if service_band_form is not None:
+            for inner_attr, field_attr in (
+                ("spectrum_reuse_factor_combo", "spectrum_reuse_factor_field"),
+                ("spectrum_anchor_slot_spin", "spectrum_anchor_slot_field"),
+                ("spectrum_power_policy_combo", "spectrum_power_policy_field"),
+                ("spectrum_split_denominator_combo", "spectrum_split_denominator_field"),
+            ):
+                inner = getattr(self, inner_attr, None)
+                container = getattr(self, field_attr, None)
+                if inner is not None:
+                    try:
+                        inner.setVisible(not uemr_active)
+                    except Exception:
+                        pass
+                if container is not None:
+                    try:
+                        container.setVisible(not uemr_active)
+                    except Exception:
+                        pass
+                    try:
+                        service_band_form.setRowVisible(container, not uemr_active)
+                    except Exception:
+                        pass
+
+        # UEMR: hide the Integration cutoff basis + Integration cutoff
+        # percent rows. For UEMR we force the basis to 'service_bandwidth'
+        # and the cutoff to 100% because there are no channels and we
+        # want to integrate the unwanted-emission mask over the full
+        # service band.
+        mask_form = getattr(self, "_spectrum_mask_form", None)
+        if mask_form is not None:
+            for inner_attr, field_attr in (
+                ("spectrum_cutoff_basis_combo", "spectrum_cutoff_basis_field"),
+                ("spectrum_cutoff_percent_edit", "spectrum_cutoff_percent_field"),
+            ):
+                inner = getattr(self, inner_attr, None)
+                container = getattr(self, field_attr, None)
+                if inner is not None:
+                    try:
+                        inner.setVisible(not uemr_active)
+                    except Exception:
+                        pass
+                if container is not None:
+                    try:
+                        container.setVisible(not uemr_active)
+                    except Exception:
+                        pass
+                    try:
+                        mask_form.setRowVisible(container, not uemr_active)
+                    except Exception:
+                        pass
+
+        # Restrict the Power-quantity dropdown in UEMR mode. "Target PFD"
+        # has no meaning without a directive beam pointing at the surface,
+        # so remove it from the combo entirely. Restore all three options
+        # when UEMR is turned off. Signal-block the combo during population,
+        # then call _sync_service_power_controls() AFTER so the form label
+        # ("Satellite Ptx [dBW/MHz]") and hint text match the new selection.
+        if hasattr(self, "service_power_quantity_combo"):
+            _combo = self.service_power_quantity_combo
+            _blocker = QtCore.QSignalBlocker(_combo)
+            try:
+                _cur_data = _combo.currentData()
+                _combo.clear()
+                for _label, _value in _SERVICE_POWER_INPUT_QUANTITY_OPTIONS:
+                    if uemr_active and _value == "target_pfd":
+                        continue
+                    _combo.addItem(_label, userData=_value)
+                # Restore selection where possible; in UEMR if the prior
+                # selection was target_pfd, fall back to satellite_ptx.
+                _desired = _cur_data
+                if uemr_active and _desired == "target_pfd":
+                    _desired = "satellite_ptx"
+                _idx = _combo.findData(_desired)
+                if _idx >= 0:
+                    _combo.setCurrentIndex(_idx)
+            finally:
+                del _blocker
+            # Sync form label + hint text to the (possibly new) selection.
+            # Safe to call without the state-change cascade because we're
+            # already inside the gating/refresh path.
+            try:
+                self._sync_service_power_controls()
+            except Exception:
+                pass
+
+        # Force the hidden-field defaults when UEMR is turned on so the
+        # state model always has the values the kernel expects. Signal
+        # blockers keep us from firing cascading state-change events
+        # that would re-trigger this helper.
+        if uemr_active:
+            self._apply_uemr_forced_defaults()
+
+        # Hide reuse/leakage-preview leftover labels on the Spectrum
+        # page under UEMR (they reference cell-reuse concepts). Under
+        # directive mode, show them; their contents are refreshed by
+        # ``_sync_spectrum_controls`` so display is always consistent.
+        for leftover_attr in (
+            "spectrum_zero_leftover_label",
+            "spectrum_mask_summary_label",
+            "spectrum_leakage_summary_label",
+        ):
+            widget = getattr(self, leftover_attr, None)
+            if widget is not None:
+                try:
+                    widget.setVisible(not uemr_active)
+                except Exception:
+                    pass
+
+        # Rename the sidebar rail entry AND the tab-widget tab text when
+        # UEMR is active: "Spectrum & Reuse" → "Spectrum", "Service &
+        # Demand" → "Service". Both the sidebar list item and the
+        # underlying tab header need updating so the title shown at the
+        # top of the Simulation workspace stays in sync with the sidebar.
+        sim_list2 = getattr(self, "simulation_page_list", None)
+        tabs2 = getattr(self, "tab_widget", None)
+        if tabs2 is not None:
+            # Track original labels so we can restore on toggle-off.
+            orig = getattr(self, "_uemr_tab_orig_labels", None)
+            if orig is None:
+                orig = {}
+                for tab_attr, default_label in (
+                    ("spectrum_tab", "Spectrum & Reuse"),
+                    ("service_tab", "Service & Demand"),
+                ):
+                    tab = getattr(self, tab_attr, None)
+                    if tab is None:
+                        continue
+                    idx = tabs2.indexOf(tab)
+                    if idx >= 0:
+                        orig[tab_attr] = tabs2.tabText(idx) or default_label
+                self._uemr_tab_orig_labels = orig
+            _renames = {
+                "spectrum_tab": ("Spectrum", orig.get("spectrum_tab", "Spectrum & Reuse")),
+                "service_tab": ("Service", orig.get("service_tab", "Service & Demand")),
+            }
+            for tab_attr, (uemr_label, full_label) in _renames.items():
+                tab = getattr(self, tab_attr, None)
+                if tab is None:
+                    continue
+                idx = tabs2.indexOf(tab)
+                if idx >= 0:
+                    tabs2.setTabText(idx, uemr_label if uemr_active else full_label)
+        if sim_list2 is not None and tabs2 is not None:
+            for row in range(sim_list2.count()):
+                item = sim_list2.item(row)
+                if item is None:
+                    continue
+                tab_idx = item.data(QtCore.Qt.UserRole)
+                if tab_idx is None:
+                    continue
+                try:
+                    tab_label = tabs2.tabText(int(tab_idx))
+                except Exception:
+                    continue
+                # Now that tab text is renamed in UEMR, match on either name.
+                if tab_label in ("Spectrum & Reuse", "Spectrum"):
+                    item.setText("Spectrum" if uemr_active else "Spectrum & Reuse")
+                elif tab_label in ("Service & Demand", "Service"):
+                    item.setText("Service" if uemr_active else "Service & Demand")
+
+    def _apply_uemr_forced_defaults(self) -> None:
+        """Force the hidden Service & Demand / Spectrum fields to the
+        values the UEMR kernel expects. Safe to call repeatedly.
+
+        Channel bandwidth auto-tracks the service band width (stop-start).
+        Power basis is locked to per_mhz, Power variation to fixed. The
+        spectrum-plan integration cutoff is locked to the full service
+        band (basis=service_bandwidth, percent=100).
+        """
+        blockers: list[QtCore.QSignalBlocker] = []
+        try:
+            # Channel bandwidth ← service band width
+            start = self.spectrum_service_band_start_edit.value_or_none()
+            stop = self.spectrum_service_band_stop_edit.value_or_none()
+            if (
+                start is not None and stop is not None
+                and float(stop) > float(start)
+            ):
+                width = float(stop) - float(start)
+                blockers.append(QtCore.QSignalBlocker(self.service_bandwidth_edit))
+                self.service_bandwidth_edit.set_value(round(width, 6))
+            # Power basis ← per_mhz
+            idx_pm = self.service_power_basis_combo.findData("per_mhz")
+            if idx_pm >= 0 and self.service_power_basis_combo.currentIndex() != idx_pm:
+                blockers.append(QtCore.QSignalBlocker(self.service_power_basis_combo))
+                self.service_power_basis_combo.setCurrentIndex(idx_pm)
+            # Power variation ← fixed
+            idx_fixed = self.service_power_variation_combo.findData("fixed")
+            if idx_fixed >= 0 and self.service_power_variation_combo.currentIndex() != idx_fixed:
+                blockers.append(QtCore.QSignalBlocker(self.service_power_variation_combo))
+                self.service_power_variation_combo.setCurrentIndex(idx_fixed)
+            # Transmit unwanted-emission mask ← flat (rectangular) preset.
+            # UEMR models internal-circuitry leakage with a spatially-
+            # isotropic emission; the flat mask (no OOB suppression) is
+            # the correct baseline shape. Combined with the cutoff
+            # below (service_bandwidth @ 100%), the spectrum plan
+            # clips to the service band.
+            idx_flat = self.spectrum_mask_preset_combo.findData("flat")
+            if idx_flat >= 0 and self.spectrum_mask_preset_combo.currentIndex() != idx_flat:
+                blockers.append(QtCore.QSignalBlocker(self.spectrum_mask_preset_combo))
+                self.spectrum_mask_preset_combo.setCurrentIndex(idx_flat)
+            # Integration cutoff basis ← service_bandwidth
+            idx_sb = self.spectrum_cutoff_basis_combo.findData("service_bandwidth")
+            if idx_sb >= 0 and self.spectrum_cutoff_basis_combo.currentIndex() != idx_sb:
+                blockers.append(QtCore.QSignalBlocker(self.spectrum_cutoff_basis_combo))
+                self.spectrum_cutoff_basis_combo.setCurrentIndex(idx_sb)
+            # Integration cutoff ← 50% of service bandwidth.
+            # The cutoff window is [center ± cutoff_mhz] where
+            # cutoff_mhz = span × percent / 100, so the TOTAL integration
+            # width equals 2·cutoff. Setting percent=50 with basis=
+            # service_bandwidth makes 2·cutoff == service_bandwidth,
+            # i.e. the integration window exactly matches the service
+            # band edges — the correct UEMR baseline.
+            current_pct = self.spectrum_cutoff_percent_edit.value_or_none()
+            if current_pct is None or abs(float(current_pct) - 50.0) > 1e-6:
+                blockers.append(QtCore.QSignalBlocker(self.spectrum_cutoff_percent_edit))
+                self.spectrum_cutoff_percent_edit.set_value(50.0)
+            # Reuse factor ← 1 (UEMR has no cells; force sane default so
+            # the spectrum-plan normaliser doesn't choke on None).
+            idx_r1 = self.spectrum_reuse_factor_combo.findData(1)
+            if idx_r1 < 0:
+                idx_r1 = self.spectrum_reuse_factor_combo.findText("1")
+            if idx_r1 >= 0 and self.spectrum_reuse_factor_combo.currentIndex() != idx_r1:
+                blockers.append(QtCore.QSignalBlocker(self.spectrum_reuse_factor_combo))
+                self.spectrum_reuse_factor_combo.setCurrentIndex(idx_r1)
+            # Anchor slot ← 0
+            if self.spectrum_anchor_slot_spin.count() > 0:
+                idx_a0 = self.spectrum_anchor_slot_spin.findData(0)
+                if idx_a0 < 0:
+                    idx_a0 = 0
+                if self.spectrum_anchor_slot_spin.currentIndex() != idx_a0:
+                    blockers.append(QtCore.QSignalBlocker(self.spectrum_anchor_slot_spin))
+                    self.spectrum_anchor_slot_spin.setCurrentIndex(idx_a0)
+            # Power policy ← repeat_per_group (the simple default; reuse
+            # scheme is disabled in UEMR so the policy never matters).
+            idx_pp = self.spectrum_power_policy_combo.findData("repeat_per_group")
+            if idx_pp >= 0 and self.spectrum_power_policy_combo.currentIndex() != idx_pp:
+                blockers.append(QtCore.QSignalBlocker(self.spectrum_power_policy_combo))
+                self.spectrum_power_policy_combo.setCurrentIndex(idx_pp)
+            # Split-denominator mode ← configured_groups
+            idx_sd = self.spectrum_split_denominator_combo.findData("configured_groups")
+            if idx_sd >= 0 and self.spectrum_split_denominator_combo.currentIndex() != idx_sd:
+                blockers.append(QtCore.QSignalBlocker(self.spectrum_split_denominator_combo))
+                self.spectrum_split_denominator_combo.setCurrentIndex(idx_sd)
+        finally:
+            del blockers
 
     def _update_antenna_plot_controls(self) -> None:
         state = self.current_state()
         antennas_cfg = state.active_system().satellite_antennas
         enabled = _has_valid_satellite_antenna_config(antennas_cfg)
+        # The main-lobe plot derives the zoom window from the half-power
+        # beamwidth. Isotropic has no beamwidth, so disable that button
+        # specifically while leaving the full-pattern plot available.
+        is_isotropic = (
+            antennas_cfg is not None
+            and str(getattr(antennas_cfg, "antenna_model", "") or "") == _ANTENNA_MODEL_ISOTROPIC
+        )
         self.plot_antenna_full_button.setEnabled(enabled)
-        self.plot_antenna_main_button.setEnabled(enabled)
+        self.plot_antenna_main_button.setEnabled(enabled and not is_isotropic)
+        self.plot_antenna_main_button.setToolTip(
+            "Main-lobe plot is unavailable for isotropic patterns "
+            "(no finite beamwidth). Use the full-pattern plot instead."
+            if (enabled and is_isotropic) else ""
+        )
         self.antenna_pattern_status.setText(
             "Pattern plots are ready."
             if enabled
@@ -27745,7 +28850,7 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
         try:
             spectrum_plan = self._current_explicit_spectrum_plan()
         except Exception as exc:
-            QtWidgets.QMessageBox.warning(self, "Edit Spectrum unavailable", str(exc))
+            _show_exception_warning(self, "Edit Spectrum unavailable", "The spectrum editor can't open with the current settings.", exc)
             return
         try:
             power_input = _normalize_service_config_power_input(self._current_service_config())
@@ -27852,7 +28957,7 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
     @QtCore.Slot()
     def _open_ras_receiver_response_tool(self) -> None:
         ras_cfg = self._current_ras_station_config()
-        receiver_ready, message = _validate_ras_receiver_config(ras_cfg)
+        receiver_ready, message = _validate_ras_receiver_band(ras_cfg)
         if not receiver_ready or ras_cfg is None:
             QtWidgets.QMessageBox.warning(
                 self,
@@ -28300,12 +29405,14 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
         del blocker_ras_frequency
         del blocker_frequency
 
-        if str(self.antenna_model_combo.currentData() or _ANTENNA_MODEL_REC12) == _ANTENNA_MODEL_REC12:
+        model = str(self.antenna_model_combo.currentData() or _ANTENNA_MODEL_REC12)
+        if model in {_ANTENNA_MODEL_REC12, _ANTENNA_MODEL_S672}:
+            # S.672 uses the same parameter set as Rec 1.2.
             default_cfg = _default_rec12_config()
             self.rec12_gm_spin.set_value(default_cfg.gm_dbi)
             self.rec12_ln_spin.set_value(default_cfg.ln_db)
             self.rec12_z_spin.set_value(default_cfg.z)
-        else:
+        elif model == _ANTENNA_MODEL_REC14:
             default_cfg = _default_rec14_config()
             self.rec14_gm_spin.set_value(default_cfg.gm_dbi)
             self.rec14_lt_spin.set_value(default_cfg.lt_m)
@@ -28314,6 +29421,27 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
             self.rec14_slr_spin.set_value(default_cfg.slr_db)
             self.rec14_far_start_spin.set_value(default_cfg.far_sidelobe_start_deg)
             self.rec14_far_level_spin.set_value(default_cfg.far_sidelobe_level_dbi)
+        elif model == _ANTENNA_MODEL_M2101:
+            m_cfg = _default_m2101_config()
+            self.m2101_g_emax_spin.set_value(m_cfg.g_emax_dbi)
+            self.m2101_a_m_spin.set_value(m_cfg.a_m_db)
+            self.m2101_sla_nu_spin.set_value(m_cfg.sla_nu_db)
+            self.m2101_phi_3db_spin.set_value(m_cfg.phi_3db_deg)
+            self.m2101_theta_3db_spin.set_value(m_cfg.theta_3db_deg)
+            self.m2101_d_h_spin.set_value(m_cfg.d_h)
+            self.m2101_d_v_spin.set_value(m_cfg.d_v)
+            self.m2101_n_h_spin.set_value(m_cfg.n_h)
+            self.m2101_n_v_spin.set_value(m_cfg.n_v)
+        elif model == _ANTENNA_MODEL_COLLAPSED:
+            # Collapsed-beamforming has its own small set of defaults.
+            self.collapsed_baseline_edit.set_value(-55.6)
+            self.collapsed_eval_freq_edit.set_value(2695.0)
+            self.collapsed_ref_freq_edit.set_value(2000.0)
+        elif model == _ANTENNA_MODEL_ISOTROPIC:
+            # Isotropic has no tunable parameters — just reset UEMR mode.
+            blocker_iso = QtCore.QSignalBlocker(self.isotropic_uemr_checkbox)
+            self.isotropic_uemr_checkbox.setChecked(False)
+            del blocker_iso
 
         self._sync_rf_panel()
         self._on_state_changed()
@@ -28376,6 +29504,7 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
             QtCore.QSignalBlocker(self.rec14_slr_spin),
             QtCore.QSignalBlocker(self.rec14_far_start_spin),
             QtCore.QSignalBlocker(self.rec14_far_level_spin),
+            QtCore.QSignalBlocker(self.isotropic_uemr_checkbox),
         ]
         self._set_shared_frequency_widgets(defaults.frequency_mhz)
         self.derive_pattern_wavelength_checkbox.setChecked(
@@ -28399,6 +29528,10 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
         self.rec14_slr_spin.set_value(defaults.rec14.slr_db)
         self.rec14_far_start_spin.set_value(defaults.rec14.far_sidelobe_start_deg)
         self.rec14_far_level_spin.set_value(defaults.rec14.far_sidelobe_level_dbi)
+        # Always return to directive (non-UEMR) mode on "Set defaults" — the
+        # UEMR flag lives on the Isotropic page only and must not leak from a
+        # prior session / previous test into an unrelated antenna model.
+        self.isotropic_uemr_checkbox.setChecked(bool(defaults.isotropic.uemr_mode))
         del blockers
         self._sync_rf_panel()
         self._update_antenna_plot_controls()
@@ -28407,6 +29540,18 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
     @QtCore.Slot()
     def _set_service_defaults(self) -> None:
         defaults = _default_service_config()
+        # Is the active system UEMR? If so, "Set Service Defaults" must
+        # NOT write to fields that are hidden in the UI (Nco, Nbeam,
+        # selection, cell activity, bandwidth, surface-PFD cap) — doing
+        # so would set values behind the user's back. Only touch the
+        # visible controls; let ``_apply_uemr_forced_defaults`` handle
+        # the few hidden fields the kernel genuinely requires.
+        try:
+            uemr_active = _system_is_uemr(self.current_state().active_system())
+        except Exception:
+            uemr_active = False
+        # Signal-block every service widget we might touch (harmless to
+        # block widgets we then leave alone).
         blockers = [
             QtCore.QSignalBlocker(self.service_nco_edit),
             QtCore.QSignalBlocker(self.service_nbeam_edit),
@@ -28431,40 +29576,81 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
             QtCore.QSignalBlocker(self.max_surface_pfd_channel_edit),
             QtCore.QSignalBlocker(self.surface_pfd_cap_mode_combo),
         ]
-        self.service_nco_edit.set_value(defaults.nco)
-        self.service_nbeam_edit.set_value(defaults.nbeam)
-        service_idx = self.service_selection_combo.findData(defaults.selection_strategy)
-        self.service_selection_combo.setCurrentIndex(service_idx if service_idx >= 0 else 0)
-        self.service_cell_activity_edit.set_value(
-            None if defaults.cell_activity_factor is None else float(defaults.cell_activity_factor) * 100.0
-        )
-        self._set_combo_to_data(
-            self.service_cell_activity_mode_combo,
-            defaults.cell_activity_mode,
-        )
-        self.service_cell_seed_edit.set_value(defaults.cell_activity_seed_base)
-        self.service_bandwidth_edit.set_value(defaults.bandwidth_mhz)
-        self._set_combo_to_data(self.service_power_quantity_combo, defaults.power_input_quantity)
-        self._set_combo_to_data(self.service_power_basis_combo, defaults.power_input_basis)
-        self.target_pfd_edit.set_value(defaults.target_pfd_dbw_m2_mhz)
-        self.target_pfd_channel_edit.set_value(defaults.target_pfd_dbw_m2_channel)
-        self.satellite_ptx_mhz_edit.set_value(defaults.satellite_ptx_dbw_mhz)
-        self.satellite_ptx_channel_edit.set_value(defaults.satellite_ptx_dbw_channel)
-        self.satellite_eirp_mhz_edit.set_value(defaults.satellite_eirp_dbw_mhz)
-        self.satellite_eirp_channel_edit.set_value(defaults.satellite_eirp_dbw_channel)
-        self._set_combo_to_data(self.service_power_variation_combo, defaults.power_variation_mode or "fixed")
-        self.service_power_range_min_edit.set_value(defaults.power_range_min_db)
-        self.service_power_range_max_edit.set_value(defaults.power_range_max_db)
-        self.max_surface_pfd_enable_check.setChecked(bool(defaults.max_surface_pfd_enabled))
-        self.max_surface_pfd_mhz_edit.set_value(defaults.max_surface_pfd_dbw_m2_mhz)
-        self.max_surface_pfd_channel_edit.set_value(defaults.max_surface_pfd_dbw_m2_channel)
-        self._set_combo_to_data(
-            self.surface_pfd_cap_mode_combo,
-            defaults.surface_pfd_cap_mode or "per_beam",
-        )
+        # --- Hidden in UEMR: SKIP these writes so the user doesn't get
+        # silent values they never saw. The kernel-required subset is
+        # re-applied by ``_apply_uemr_forced_defaults`` at the end.
+        if not uemr_active:
+            self.service_nco_edit.set_value(defaults.nco)
+            self.service_nbeam_edit.set_value(defaults.nbeam)
+            service_idx = self.service_selection_combo.findData(defaults.selection_strategy)
+            self.service_selection_combo.setCurrentIndex(service_idx if service_idx >= 0 else 0)
+            self.service_cell_activity_edit.set_value(
+                None if defaults.cell_activity_factor is None else float(defaults.cell_activity_factor) * 100.0
+            )
+            self._set_combo_to_data(
+                self.service_cell_activity_mode_combo,
+                defaults.cell_activity_mode,
+            )
+            self.service_cell_seed_edit.set_value(defaults.cell_activity_seed_base)
+            self.service_bandwidth_edit.set_value(defaults.bandwidth_mhz)
+            self._set_combo_to_data(self.service_power_basis_combo, defaults.power_input_basis)
+            self._set_combo_to_data(self.service_power_variation_combo, defaults.power_variation_mode or "fixed")
+            self.service_power_range_min_edit.set_value(defaults.power_range_min_db)
+            self.service_power_range_max_edit.set_value(defaults.power_range_max_db)
+            self.max_surface_pfd_enable_check.setChecked(bool(defaults.max_surface_pfd_enabled))
+            self.max_surface_pfd_mhz_edit.set_value(defaults.max_surface_pfd_dbw_m2_mhz)
+            self.max_surface_pfd_channel_edit.set_value(defaults.max_surface_pfd_dbw_m2_channel)
+            self._set_combo_to_data(
+                self.surface_pfd_cap_mode_combo,
+                defaults.surface_pfd_cap_mode or "per_beam",
+            )
+        # --- Always-visible fields (or UEMR-visible subset) ---
+        # Power quantity: UEMR combo only offers Ptx/EIRP. For UEMR we
+        # populate a CISPR-32 Class B-derived unwanted-emission EIRP
+        # at 2 GHz as a starting point (quasi-peak 54 dBµV/m @ 3 m,
+        # 1 MHz measurement BW → EIRP ≈ -71 dBW/MHz). For non-UEMR the
+        # ServiceConfig default (typically target_pfd) is kept.
+        default_quantity = str(defaults.power_input_quantity or "target_pfd")
+        if uemr_active:
+            default_quantity = "satellite_eirp"
+        self._set_combo_to_data(self.service_power_quantity_combo, default_quantity)
+        # Target PFD widgets are hidden in UEMR — don't reset them.
+        if not uemr_active:
+            self.target_pfd_edit.set_value(defaults.target_pfd_dbw_m2_mhz)
+            self.target_pfd_channel_edit.set_value(defaults.target_pfd_dbw_m2_channel)
+        if uemr_active:
+            # CISPR-32 Class B radiated quasi-peak limit above 1 GHz:
+            # 54 dBµV/m at 3 m in a 1 MHz measurement bandwidth →
+            # EIRP ≈ -71 dBW/MHz. A sensible starting point for
+            # unwanted-emission studies at ~2 GHz; the user can refine.
+            _CISPR_EIRP_DBW_MHZ = -71.0
+            self.satellite_ptx_mhz_edit.set_value(None)
+            self.satellite_ptx_channel_edit.set_value(None)
+            self.satellite_eirp_mhz_edit.set_value(_CISPR_EIRP_DBW_MHZ)
+            self.satellite_eirp_channel_edit.set_value(None)
+        else:
+            # Non-UEMR: Ptx / EIRP value editors are visible (one of
+            # them, depending on the selected quantity). Resetting them
+            # to None is the safest default — the user will enter a
+            # value next. Don't fabricate numbers they didn't choose.
+            self.satellite_ptx_mhz_edit.set_value(defaults.satellite_ptx_dbw_mhz)
+            self.satellite_ptx_channel_edit.set_value(defaults.satellite_ptx_dbw_channel)
+            self.satellite_eirp_mhz_edit.set_value(defaults.satellite_eirp_dbw_mhz)
+            self.satellite_eirp_channel_edit.set_value(defaults.satellite_eirp_dbw_channel)
+
         self._sync_service_power_controls()
         self._sync_surface_pfd_cap_controls()
         del blockers
+        # If the active system is UEMR, re-assert UEMR-forced defaults so
+        # the kernel-required hidden fields (reuse_factor=1, anchor=0,
+        # bandwidth=service_band_width, basis=per_mhz, variation=fixed)
+        # have sane values. These are ALL fields the user never sees,
+        # set strictly for the kernel's benefit — not pretend user input.
+        if uemr_active:
+            try:
+                self._apply_uemr_forced_defaults()
+            except Exception:
+                pass
         self._on_runtime_controls_changed()
 
     @QtCore.Slot()
@@ -28522,14 +29708,32 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
         self.max_surface_pfd_mhz_edit.set_value(None)
         self.max_surface_pfd_channel_edit.set_value(None)
         self._set_combo_to_data(self.surface_pfd_cap_mode_combo, "per_beam")
+        # Always put power_variation back to a defined default ("fixed") so
+        # the hidden-in-UEMR variation combo isn't left in an undefined
+        # "Select..." state, and reset the range editors for the same reason.
+        self._set_combo_to_data(self.service_power_variation_combo, "fixed")
+        self.service_power_range_min_edit.set_value(None)
+        self.service_power_range_max_edit.set_value(None)
         self._sync_service_power_controls()
         self._sync_surface_pfd_cap_controls()
         del blockers
+        # For UEMR systems, re-apply forced defaults so the hidden-but-
+        # required values (bandwidth=service_band_width, basis=per_mhz,
+        # variation=fixed, cutoff=service_bandwidth/100) are populated.
+        try:
+            if _system_is_uemr(self.current_state().active_system()):
+                self._apply_uemr_forced_defaults()
+        except Exception:
+            pass
         self._on_runtime_controls_changed()
 
     @QtCore.Slot()
     def _set_spectrum_defaults(self) -> None:
         defaults = _default_spectrum_config()
+        try:
+            uemr_active = _system_is_uemr(self.current_state().active_system())
+        except Exception:
+            uemr_active = False
         blockers = [
             QtCore.QSignalBlocker(self.spectrum_service_band_start_edit),
             QtCore.QSignalBlocker(self.spectrum_service_band_stop_edit),
@@ -28543,8 +29747,25 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
             QtCore.QSignalBlocker(self.spectrum_tx_reference_combo),
             QtCore.QSignalBlocker(self.spectrum_tx_reference_points_spin),
         ]
-        self._load_spectrum_widgets(defaults)
+        if uemr_active:
+            # Only touch VISIBLE UEMR spectrum fields: service band +
+            # transmit mask. Hidden fields (reuse, anchor, policy,
+            # cutoff basis/%, tx reference) are set by
+            # ``_apply_uemr_forced_defaults`` for the kernel only.
+            self.spectrum_service_band_start_edit.set_value(defaults.service_band_start_mhz)
+            self.spectrum_service_band_stop_edit.set_value(defaults.service_band_stop_mhz)
+            self._set_combo_to_data(
+                self.spectrum_mask_preset_combo,
+                defaults.unwanted_emission_mask_preset,
+            )
+        else:
+            self._load_spectrum_widgets(defaults)
         del blockers
+        if uemr_active:
+            try:
+                self._apply_uemr_forced_defaults()
+            except Exception:
+                pass
         self._sync_spectrum_controls()
         self._on_runtime_controls_changed()
 
@@ -28793,6 +30014,31 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
     ) -> Mapping[str, Any]:
         """Build the contour summary used by both the run request and storage attrs."""
         s0 = state.active_system()
+        # UEMR systems bypass the beam library entirely — the isotropic pattern
+        # has no finite 3 dB beamwidth, so the antenna-driven contour/spacing
+        # summary is both undefined and unused downstream (the UEMR bypass in
+        # scenario.py never consults per-beam geometry). Return a minimal stub
+        # so _resolve_effective_run_cell_size_km and storage attrs stay happy.
+        if _system_is_uemr(s0):
+            ga = s0.grid_analysis
+            fallback_km = float(
+                ga.cell_size_override_km
+                if ga.cell_size_override_enabled and ga.cell_size_override_km is not None
+                else 100.0
+            )
+            # Synthetic guard angle — isotropic has no finite edge; pick 90° so
+            # any downstream threshold treats the whole visible hemisphere as
+            # within beam reach (matches the "per-satellite, no beams" model).
+            return {
+                "selected_cell_spacing_km": fallback_km,
+                "leading_metric": str(ga.leading_metric or "spacing_contour"),
+                "cell_spacing_rule": str(ga.cell_spacing_rule or "full_footprint_diameter"),
+                "indicative_footprint_drop": str(ga.indicative_footprint_drop or "db3"),
+                "spacing_drop": str(ga.spacing_drop or "db7"),
+                "spacing_theta_edge": 90.0 * u.deg,
+                "indicative_theta_edge": 90.0 * u.deg,
+                "per_belt": {},
+            }
         return earthgrid.summarize_contour_spacing(
             antenna_func,
             belt_names=constellation["belt_names"],
@@ -29061,9 +30307,30 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
             "timestep_s": float(state.runtime.timestep_s),
             "iteration_count": int(state.runtime.iteration_count),
             "iteration_rng_seed": int(state.runtime.iteration_rng_seed),
-            "nbeam": int(svc.nbeam),
-            "nco": int(svc.nco),
-            "selection_strategy": str(svc.selection_strategy),
+            # UEMR systems have no Nco / Nbeam / selection-strategy: the
+            # fields are hidden in the UI and the kernel bypass never reads
+            # them. Storage attrs record the USER-VISIBLE configuration:
+            # mark these "not applicable" rather than fabricating a "1"
+            # that could be misread as "the user picked Nbeam=1".
+            **(
+                {
+                    # Consistent "n/a" across all three fields the user
+                    # never saw in UEMR mode. Downstream readers must
+                    # branch on ``uemr_mode=True`` (or accept the string
+                    # sentinel) rather than blindly ``int()``-coercing.
+                    "nbeam": "n/a",
+                    "nco": "n/a",
+                    "selection_strategy": "n/a",
+                    "uemr_mode": True,
+                }
+                if _system_is_uemr(s0)
+                else {
+                    "nbeam": int(svc.nbeam),
+                    "nco": int(svc.nco),
+                    "selection_strategy": str(svc.selection_strategy),
+                    "uemr_mode": False,
+                }
+            ),
             "cell_spacing_km": float(effective_cell_km),
             "geography_mask_mode": str(hx.geography_mask_mode),
             "shoreline_buffer_km": (
@@ -29353,9 +30620,15 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
             "timestep": float(state.runtime.timestep_s),
             "iteration_count": int(state.runtime.iteration_count),
             "iteration_rng_seed": int(state.runtime.iteration_rng_seed),
-            "nco": int(svc.nco),
-            "nbeam": int(svc.nbeam),
-            "selection_strategy": str(svc.selection_strategy),
+            # Kernel-signature sentinel ONLY: ``run_gpu_direct_epfd``
+            # requires a positive int for nco/nbeam, but its UEMR bypass
+            # never reads them. The value "1" here is NOT user-visible
+            # (storage_attrs record the actual n/a state for UEMR — see
+            # ``_build_run_storage_attrs``). Do not change this to any
+            # meaningful number — it must stay semantically null.
+            "nco": int(1 if svc.nco is None else svc.nco),
+            "nbeam": int(1 if svc.nbeam is None else svc.nbeam),
+            "selection_strategy": str(svc.selection_strategy or "max_elevation"),
             "ras_pointing_mode": str(hx.ras_pointing_mode),
             "ras_service_cell_index": int(active_grid["ras_service_cell_index"]),
             "ras_service_cell_active": bool(active_grid["ras_service_cell_active"]),
@@ -29373,8 +30646,10 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
             * u.km,
             "target_alt_km": float(state.runtime.target_alt_km),
             "use_ras_station_alt_for_co": bool(state.runtime.use_ras_station_alt_for_co),
-            "cell_activity_factor": float(svc.cell_activity_factor),
-            "cell_activity_mode": str(svc.cell_activity_mode),
+            "cell_activity_factor": float(
+                1.0 if svc.cell_activity_factor is None else svc.cell_activity_factor
+            ),
+            "cell_activity_mode": str(svc.cell_activity_mode or "whole_cell"),
             "cell_activity_seed_base": svc.cell_activity_seed_base,
             "split_total_group_denominator_mode": str(
                 s0.spectrum.split_total_group_denominator_mode
@@ -29923,7 +31198,7 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
             )
             return
         except Exception as exc:
-            QtWidgets.QMessageBox.warning(self, "Load failed", str(exc))
+            _show_exception_warning(self, "Load failed", f"Couldn't load the project file {Path(filename).name}.", exc)
             return
         self._current_path = Path(filename)
         self._dirty = False
@@ -29940,7 +31215,7 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
         try:
             save_project_state(self._current_path, self.current_state())
         except Exception as exc:
-            QtWidgets.QMessageBox.warning(self, "Save failed", str(exc))
+            _show_exception_warning(self, "Save failed", "Couldn't save the project file.", exc)
             return
         self._dirty = False
         self._remember_recent_config(self._current_path)

@@ -91,6 +91,7 @@ _DIRECT_EPFD_MASK_PRESETS = frozenset(
         "wrc27_1_13_s1_dc_mss_imt",
         "adjacent_45_nonadjacent_50",
         "custom",
+        "flat",
     }
 )
 _DIRECT_EPFD_RESULT_SCHEMA_VERSION = 4
@@ -2790,28 +2791,22 @@ def _resolve_direct_epfd_reference_frequencies_mhz(
 def _sm329_spurious_db(ras_frequency_ghz: float, category: str) -> float:
     """Return the SM.329 spurious domain attenuation level in dBc.
 
-    Per ITU-R SM.329-12, the spurious emission limit for space stations is:
-    ``min(43 + 10*log10(P), cap)`` where the cap depends on the frequency
-    range of the spurious emission (approximately the RAS receiver frequency).
+    Per ITU-R SM.329-13 Table 2 (Category A), the spurious-domain limit
+    for space stations (and space-service earth stations) is:
 
-    ========  ===========  =============  ========  =======
-    Range     Rel. cap     Abs. floor A   Floor B   Ref BW
-    ========  ===========  =============  ========  =======
-    <150 MHz  50 dBc       -13 dBW        -35 dBW   4 kHz
-    ≥150 MHz  60 dBc       -13 dBW        -35 dBW   1 MHz
-    ========  ===========  =============  ========  =======
+        min(43 + 10·log10(P), 60 dBc)   in a 4 kHz reference bandwidth
 
-    Category A is the mandatory minimum (less strict, -13 dBW floor).
-    Category B is the desirable target (stricter, -35 dBW floor).
-    For Category B, the tighter absolute floor (-35 dBW) means that
-    high-power transmitters must suppress spurious further than the
-    relative cap alone requires.  We model this as +5 dB additional
-    attenuation over the relative cap as a representative design margin.
+    We apply the 60 dBc cap (the less-stringent branch, appropriate for
+    typical high-power satellite transmitters where P > 500 W makes the
+    relative formula looser than the cap). The cap is frequency-
+    independent per SM.329-13 §4.1 — space services always use 4 kHz
+    reference bandwidth regardless of the spurious frequency.
+
+    Category B represents stricter regional (European) limits; we model
+    them as +5 dB additional attenuation over the Category A cap as a
+    representative design margin.
     """
-    if ras_frequency_ghz < 0.150:
-        base = 50.0
-    else:
-        base = 60.0
+    base = 60.0
     if category == "b":
         return base + 5.0
     return base
@@ -2832,31 +2827,47 @@ def _direct_epfd_relative_mask_points(
     to ±2.5 × B_N from centre.  Beyond that the spurious domain (SM.329)
     applies at a frequency-dependent attenuation level.
     """
-    # --- SM.1539 OOB-only masks (no spurious extension) ---
-    if preset in {"sm1541_fss", "sm1541_mss"}:
-        return [
-            (0.5, 0.0),
-            (1.0, 1.0),
-            (1.5, 1.0 + 40.0 * np.log10(2.0)),
-            (2.5, 1.0 + 40.0 * np.log10(4.0)),
-            (4.5, 1.0 + 40.0 * np.log10(8.0)),
-        ]
-    # --- SM.1539 + SM.329 combined masks ---
-    # OOB domain (SM.1539): 0.5 to 2.5 × B_N from centre
-    # Spurious domain (SM.329): beyond 2.5 × B_N from centre
-    _sm1539_fss_oob = [
-        (0.5, 0.0),
-        (1.0, 1.0),
-        (1.5, 1.0 + 40.0 * np.log10(2.0)),
-        (2.5, 1.0 + 40.0 * np.log10(4.0)),
+    # --- Flat preset: no suppression (UEMR baseline) ---
+    if preset == "flat":
+        return [(0.5, 0.0), (1000.0, 0.0)]
+    # --- SM.1541-7 Annex 5 §2 (FSS) and §3 (MSS) OoB masks ---
+    # ITU formula (dBsd, reference bandwidth 4 kHz below 15 GHz,
+    # 1 MHz above 15 GHz):
+    #   A(F) = 40 · log10(F/50 + 1)
+    # where F is the frequency offset from the edge of the total
+    # assigned band expressed as a percentage of the necessary
+    # bandwidth B_N. The edge of the assigned band is at multiplier
+    # k = 0.5 × B_N from the channel centre, so F = 100·(k − 0.5).
+    # Substituting gives the equivalent centre-referenced form
+    #   A(k) = 40 · log10(2·k)   for k ∈ [0.5, 2.5]
+    # (A(0.5) = 0 dB at the channel edge; A(2.5) ≈ 27.96 dB at the
+    # OoB/spurious boundary per SM.1539).
+    #
+    # We sample the continuous curve at 17 points because the
+    # downstream integrator interpolates log-linearly in dB between
+    # breakpoints — sparse sampling undershoots the integrated
+    # leakage by up to ~0.66 dB near the band edge. 17 points gives
+    # <0.1 dB integration error versus the closed form for typical
+    # RAS-band widths.
+    _sm1541_oob = [
+        (float(k), 40.0 * np.log10(2.0 * float(k)) if k > 0.5 else 0.0)
+        for k in np.linspace(0.5, 2.5, 17)
     ]
-    _sm1539_mss_oob = _sm1539_fss_oob  # same SM.1539 OOB formula for FSS and MSS
+    if preset in {"sm1541_fss", "sm1541_mss"}:
+        return _sm1541_oob
+    # --- SM.1541-7 + SM.329-13 combined masks ---
+    # OoB domain (SM.1541-7 Annex 5 §§2–3): 0.5 to 2.5 × B_N
+    # Spurious domain (SM.329-13 Table 2, Category A space stations):
+    #   43 + 10·log10(P) or 60 dBc, whichever is less stringent
+    # beyond 2.5 × B_N from the centre (SM.1539-2 boundary).
+    _sm1541_fss_oob = _sm1541_oob
+    _sm1541_mss_oob = _sm1541_oob  # SM.1541-7 §3 MSS formula is identical to §2 FSS
     if preset == "sm1541_sm329_fss":
         spur = _sm329_spurious_db(ras_frequency_ghz, "a")
-        return _sm1539_fss_oob + [(2.5 + 0.01, spur), (10.0, spur)]
+        return _sm1541_fss_oob + [(2.5 + 0.01, spur), (10.0, spur)]
     if preset == "sm1541_sm329_mss":
         spur = _sm329_spurious_db(ras_frequency_ghz, "a")
-        return _sm1539_mss_oob + [(2.5 + 0.01, spur), (10.0, spur)]
+        return _sm1541_mss_oob + [(2.5 + 0.01, spur), (10.0, spur)]
     # --- Other presets ---
     if preset == "3gpp_ts_36_104":
         # 3GPP TS 36.104 Table 6.6.2.1-1 OoB emission limits (5 MHz ref BW).
@@ -3340,6 +3351,40 @@ def _resolve_direct_epfd_enabled_channel_indices(
     return sorted(enabled_indices), int(groups_cap)
 
 
+# Bounded memoization cache for normalize_direct_epfd_spectrum_plan.
+# The function is pure w.r.t. its kwargs. GUI status refreshes call it
+# thousands of times per run with stable per-system inputs; caching
+# collapses that into O(n_distinct_plans) real evaluations.
+_DIRECT_EPFD_SPECTRUM_PLAN_CACHE: "dict[tuple, dict[str, Any]]" = {}
+_DIRECT_EPFD_SPECTRUM_PLAN_CACHE_MAX = 256
+
+
+def _direct_epfd_spectrum_plan_hashable(value: Any) -> Any:
+    """Best-effort convert an input into a stable hashable representation.
+
+    Dict-like mappings become sorted tuples of (key, hashable(value)).
+    Sequences become tuples. numpy arrays become tuples of their flat
+    contents. Everything else is returned as-is (and TypeError at the
+    call site signals uncacheable).
+    """
+    if value is None:
+        return None
+    if isinstance(value, (str, bytes, int, float, bool)):
+        return value
+    if isinstance(value, np.ndarray):
+        return ("__ndarray__", value.shape, value.dtype.str,
+                tuple(value.reshape(-1).tolist()))
+    if isinstance(value, Mapping):
+        return tuple(
+            (str(k), _direct_epfd_spectrum_plan_hashable(v))
+            for k, v in sorted(value.items(), key=lambda kv: str(kv[0]))
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_direct_epfd_spectrum_plan_hashable(v) for v in value)
+    # Numpy scalars / other — fall back to str() which is deterministic.
+    return ("__repr__", repr(value))
+
+
 def normalize_direct_epfd_spectrum_plan(
     *,
     spectrum_plan: Mapping[str, Any] | None,
@@ -3385,6 +3430,29 @@ def normalize_direct_epfd_spectrum_plan(
     if spectrum_plan is None:
         return None
 
+    # Memoization: this function is pure w.r.t. its inputs and is called many
+    # times per batch by GUI status refreshes (10,000+ calls/run, ~12s cumtime
+    # at realistic scale). Cache by a stable key derived from the hashable
+    # representation of the inputs. On cache hit we return a shallow copy so
+    # callers may not mutate the cached dict in-place (numpy arrays inside
+    # are still shared — all downstream users re-wrap with np.asarray(...,
+    # dtype=...) before GPU upload, so sharing is safe).
+    try:
+        _cache_key = (
+            _direct_epfd_spectrum_plan_hashable(spectrum_plan),
+            float(channel_bandwidth_mhz),
+            (str(split_total_group_denominator_mode)
+             if split_total_group_denominator_mode is not None else None),
+            (int(active_cell_count) if active_cell_count is not None else None),
+            _direct_epfd_spectrum_plan_hashable(active_cell_reuse_slot_ids),
+        )
+    except Exception:
+        _cache_key = None  # Unhashable input — fall through to full compute.
+    if _cache_key is not None:
+        _cached = _DIRECT_EPFD_SPECTRUM_PLAN_CACHE.get(_cache_key)
+        if _cached is not None:
+            return dict(_cached)
+
     plan = dict(spectrum_plan)
     channel_bandwidth = float(channel_bandwidth_mhz)
     if not np.isfinite(channel_bandwidth) or channel_bandwidth <= 0.0:
@@ -3414,7 +3482,11 @@ def normalize_direct_epfd_spectrum_plan(
         reuse_factor=int(reuse_factor),
         max_groups_per_cell=int(max_groups_per_cell),
     )
-    anchor_slot = int(plan.get("ras_anchor_reuse_slot", 0)) % int(reuse_factor)
+    _anchor_raw = plan.get("ras_anchor_reuse_slot", 0)
+    # A None anchor-slot (e.g. from a UEMR config where the field is hidden)
+    # is treated as slot 0 — the spectrum planner still needs a concrete
+    # integer here, and UEMR never consults the reuse scheme downstream.
+    anchor_slot = (int(_anchor_raw) if _anchor_raw is not None else 0) % int(reuse_factor)
     power_policy = _normalize_direct_epfd_power_policy(plan.get("multi_group_power_policy"))
     denominator_mode_raw = plan.get("split_total_group_denominator_mode")
     if (
@@ -3595,7 +3667,7 @@ def normalize_direct_epfd_spectrum_plan(
         mask_point_count=int(mask_points_mhz.shape[0]),
         receiver_mask_point_count=int(receiver_response_points_mhz.shape[0]),
     )
-    return {
+    _result = {
         "service_band_start_mhz": float(service_start_mhz),
         "service_band_stop_mhz": float(service_stop_mhz),
         "service_bandwidth_total_mhz": float(service_bandwidth_total_mhz),
@@ -3675,6 +3747,17 @@ def normalize_direct_epfd_spectrum_plan(
         "spectral_slab": 1,
         "spectrum_context_bytes": int(context_bytes),
     }
+    if _cache_key is not None:
+        # Bounded cache — evict oldest when exceeding cap to prevent unbounded
+        # growth during long-lived GUI sessions.
+        if len(_DIRECT_EPFD_SPECTRUM_PLAN_CACHE) >= _DIRECT_EPFD_SPECTRUM_PLAN_CACHE_MAX:
+            try:
+                _oldest_key = next(iter(_DIRECT_EPFD_SPECTRUM_PLAN_CACHE))
+                _DIRECT_EPFD_SPECTRUM_PLAN_CACHE.pop(_oldest_key, None)
+            except StopIteration:
+                pass
+        _DIRECT_EPFD_SPECTRUM_PLAN_CACHE[_cache_key] = _result
+    return dict(_result)
 
 # Absolute lower bound for dynamic histogram edges (dB).  Values below this
 # are physically meaningless — even a single photon in the receiver bandwidth
@@ -3917,9 +4000,24 @@ def _resolve_output_family_configs(
 
 def _resolve_direct_epfd_output_family_plan(
     family_configs: Mapping[str, Mapping[str, Any]],
+    *,
+    uemr_mode: bool = False,
 ) -> dict[str, Any]:
-    """Translate canonical family configs to internal raw/preacc requirements."""
+    """Translate canonical family configs to internal raw/preacc requirements.
+
+    When ``uemr_mode=True`` the beam library is bypassed entirely, so all
+    beam-related outputs (per-satellite beam counts, beam demand, beam
+    statistics) are forced off regardless of their individual config —
+    there is no beam data to write.
+    """
     configs = _normalize_output_family_configs(family_configs)
+    if uemr_mode:
+        # Force beam_statistics off: no beam library, no counts. Keep the
+        # other families alone — the user explicitly selected them and
+        # they're still meaningful (EPFD distribution, per-sat PFD, etc.).
+        configs = dict(configs)
+        configs["beam_statistics"] = dict(configs["beam_statistics"])
+        configs["beam_statistics"]["mode"] = "off"
 
     raw_epfd = _mode_includes_raw(configs["epfd_distribution"]["mode"])
     raw_prx_total = _mode_includes_raw(configs["prx_total_distribution"]["mode"])
@@ -5862,6 +5960,7 @@ def _estimate_direct_epfd_combined_gpu_peaks(
     activity_gpu_bytes: int = 0,
     activity_gpu_resident_bytes: int | None = None,
     activity_gpu_peak_bytes: int | None = None,
+    uemr_mode: bool = False,
 ) -> dict[str, int]:
     orbit_state_bytes = _estimate_direct_epfd_orbit_state_gpu_bytes(
         time_count=int(batch_timesteps),
@@ -5883,24 +5982,52 @@ def _estimate_direct_epfd_combined_gpu_peaks(
         sat_visible_count=int(sat_visible_count),
         output_dtype=output_dtype,
     )
-    link_library_bytes = _estimate_direct_epfd_link_library_gpu_bytes(
-        time_count=int(batch_timesteps),
-        cell_count=int(cell_count),
-        sat_count_total=int(sat_count_total),
-        sat_visible_count=int(sat_visible_count),
-        n_skycells=int(n_skycells),
-        store_eligible_mask=bool(store_eligible_mask),
-        boresight_active=bool(boresight_active),
-    )
-    finalize_accumulator_bytes = _estimate_direct_epfd_finalize_accumulator_gpu_bytes(
-        time_count=int(batch_timesteps),
-        sat_count_total=int(sat_count_total),
-        n_skycells=int(n_skycells),
-        boresight_active=bool(boresight_active),
-        write_sat_beam_counts_used=bool(write_sat_beam_counts_used),
-        profile_stages=bool(profile_stages),
-        count_dtype=count_dtype,
-    )
+    if uemr_mode:
+        # UEMR bypass: no beam library, no finalize. The link-library and
+        # finalize-accumulator bytes are pure waste in the budget — they
+        # never get allocated. Zero them so the planner can fit far more
+        # timesteps per batch (the user observed many-small-batches
+        # behaviour caused by these overestimates). Keep all the dict
+        # keys the downstream code reads — just zero them.
+        link_library_bytes = {
+            "candidate_pairs": 0,
+            "candidate_part_bytes_per_pair": 0,
+            "candidate_part_bytes": 0,
+            "packed_base_bytes_per_pair": 0,
+            "packed_base_bytes": 0,
+            "selector_view_bytes": 0,
+            "direct_view_bytes": 0,
+            "eligible_mask_bytes": 0,
+            "boresight_mask_bytes": 0,
+            "chunk_visible_mask_bytes": 0,
+            "chunk_theta_abs_bytes": 0,
+            "chunk_eligible_temp_bytes": 0,
+            "chunk_index_scratch_bytes": 0,
+            "chunk_transient_peak_bytes": 0,
+            "resident_bytes": 0,
+            "finalize_pack_peak_bytes": 0,
+            "finalize_resident_bytes": 0,
+        }
+        finalize_accumulator_bytes = 0
+    else:
+        link_library_bytes = _estimate_direct_epfd_link_library_gpu_bytes(
+            time_count=int(batch_timesteps),
+            cell_count=int(cell_count),
+            sat_count_total=int(sat_count_total),
+            sat_visible_count=int(sat_visible_count),
+            n_skycells=int(n_skycells),
+            store_eligible_mask=bool(store_eligible_mask),
+            boresight_active=bool(boresight_active),
+        )
+        finalize_accumulator_bytes = _estimate_direct_epfd_finalize_accumulator_gpu_bytes(
+            time_count=int(batch_timesteps),
+            sat_count_total=int(sat_count_total),
+            n_skycells=int(n_skycells),
+            boresight_active=bool(boresight_active),
+            write_sat_beam_counts_used=bool(write_sat_beam_counts_used),
+            profile_stages=bool(profile_stages),
+            count_dtype=count_dtype,
+        )
     power_result_bytes = _estimate_direct_epfd_power_result_gpu_bytes(
         time_count=int(batch_timesteps),
         sat_visible_count=int(sat_visible_count),
@@ -6205,12 +6332,34 @@ def _estimate_direct_epfd_batch_seconds(
     boresight_active: bool,
     sky_slab: int,
     output_family_plan: Mapping[str, bool],
+    multi_system_count: int = 1,
+    multi_system_uemr_count: int = 0,
+    uemr_mode: bool = False,
 ) -> float:
     work_units = float(max(1, bulk_timesteps)) * float(max(1, cell_chunk))
     work_units *= max(1.0, float(max(1, visible_satellite_est)) * float(max(1, nco)) / 8.0)
     work_units *= max(1.0, float(max(1, nbeam)) / 16.0)
     if boresight_active:
         work_units *= max(1.0, float(max(1, min(int(sky_slab), int(max(1, n_skycells))))) / 8.0)
+    # UEMR bypass: no cell-link library, no beam-finalize, no surface-PFD
+    # cap — just the per-satellite kernel on visible sats. Empirically
+    # 4-6× cheaper than the directive path, so scale work_units down to
+    # ~20% of the directive estimate. The scheduler's ETA uses this
+    # value directly; without the factor the ETA overshoots by 5×.
+    if bool(uemr_mode):
+        work_units *= 0.20
+    # Multi-system scaling: shared propagation, but the power stage and
+    # bookkeeping run once per additional system. Empirically each extra
+    # directive system adds ~7%, UEMR systems ~2.5% (they bypass the beam
+    # library). See [scenario.py:10548] for the prior post-hoc scale factor.
+    n_total = max(1, int(multi_system_count))
+    n_uemr = max(0, int(multi_system_uemr_count))
+    n_directive = max(0, n_total - n_uemr)
+    if n_total > 1:
+        n_dir_extra = max(0, n_directive - 1) if n_directive >= 1 else 0
+        n_uemr_extra = n_uemr if n_directive >= 1 else max(0, n_uemr - 1)
+        ms_scale = 1.0 + 0.07 * float(n_dir_extra) + 0.025 * float(n_uemr_extra)
+        work_units *= ms_scale
     output_multiplier = 1.0
     if bool(output_family_plan.get("needs_epfd")):
         output_multiplier += 0.15
@@ -6276,7 +6425,16 @@ def _build_direct_epfd_iteration_candidate_record(
     anchor_obs_fraction: float,
     anchor_time_fraction: float,
     force_bulk_timesteps: int | None,
+    multi_system_count: int = 1,
+    multi_system_uemr_count: int = 0,
 ) -> dict[str, Any] | None:
+    # When the entire workload is UEMR (single-system UEMR or every system
+    # in the multi-system list is UEMR) the beam library + finalize stages
+    # are bypassed at run time. Tell the memory model so it doesn't
+    # over-budget those workspaces — that overestimate caused the planner
+    # to pick small bulk_timesteps and produce many small batches even
+    # though UEMR has plenty of GPU headroom.
+    _uemr_primary = bool(multi_system_uemr_count >= max(1, int(multi_system_count)))
     predicted_host_peak_bytes = int(
         int(predicted_host_link_peak_bytes) + int(predicted_host_export_peak_bytes)
     )
@@ -6321,6 +6479,7 @@ def _build_direct_epfd_iteration_candidate_record(
         spectrum_context_bytes=int(spectrum_context_bytes),
         activity_gpu_resident_bytes=int(activity_memory["resident_bytes"]),
         activity_gpu_peak_bytes=int(activity_memory["peak_bytes"]),
+        uemr_mode=bool(_uemr_primary),
     )
     predicted_gpu_propagation_peak_bytes = int(combined_gpu_peaks["predicted_gpu_cell_link_peak_bytes"])
     predicted_gpu_finalize_peak_bytes = int(combined_gpu_peaks["predicted_gpu_finalize_peak_bytes"])
@@ -6472,6 +6631,7 @@ def _build_direct_epfd_iteration_candidate_record(
     elif limiting_resource == "spectral-activity":
         underfill_reason = "spectral_activity_limited"
 
+    # ``_uemr_primary`` was computed at function entry and reused below.
     planned_batch_seconds = _estimate_direct_epfd_batch_seconds(
         bulk_timesteps=int(candidate_bulk),
         cell_chunk=int(cell_chunk),
@@ -6482,6 +6642,9 @@ def _build_direct_epfd_iteration_candidate_record(
         boresight_active=bool(boresight_active),
         sky_slab=int(sky_slab),
         output_family_plan=output_family_plan,
+        multi_system_count=int(multi_system_count),
+        multi_system_uemr_count=int(multi_system_uemr_count),
+        uemr_mode=_uemr_primary,
     )
     if spectral_backoff_active:
         planned_batch_seconds *= 1.0 + 0.05 * float(
@@ -6672,6 +6835,8 @@ def _plan_direct_epfd_iteration_schedule(
     activity_split_total_group_denominator_mode: str = "configured_groups",
     surface_pfd_cap_enabled: bool = False,
     surface_pfd_cap_mode: str = "per_beam",
+    multi_system_count: int = 1,
+    multi_system_uemr_count: int = 0,
 ) -> dict[str, Any]:
     steps_total_i = int(max(1, n_steps_total))
     cells_total_i = int(max(1, n_cells_total))
@@ -7056,6 +7221,8 @@ def _plan_direct_epfd_iteration_schedule(
                     anchor_obs_fraction=float(anchor_obs_fraction),
                     anchor_time_fraction=float(anchor_time_fraction),
                     force_bulk_timesteps=force_bulk_timesteps,
+                    multi_system_count=int(multi_system_count),
+                    multi_system_uemr_count=int(multi_system_uemr_count),
                 )
                 if candidate_record is None:
                     continue
@@ -7384,6 +7551,7 @@ def _compute_gpu_direct_epfd_batch_device(
     write_sat_eligible_mask: bool,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
     cancel_callback: Callable[[], str | None] | None = None,
+    uemr_mode: bool = False,
 ) -> dict[str, Any]:
     def _capture_stage_summary(summary: Mapping[str, Any] | None) -> dict[str, Any]:
         return _update_direct_epfd_stage_memory_summary(
@@ -7460,6 +7628,75 @@ def _compute_gpu_direct_epfd_batch_device(
         or write_total_pfd_ras_station
         or write_per_satellite_pfd_ras_station
     )
+    # --- UEMR bypass branch -------------------------------------------------
+    # UEMR systems radiate isotropically, so there is no beam library, no
+    # beam-finalize, and no cell-link selection. We invoke the dedicated
+    # UEMR kernel directly on the visible-filtered topocentric slice and
+    # return a payload with all the dict keys the caller's unpacking
+    # expects. Per-beam-library fields (sat_beam_counts, eligible_mask,
+    # diag_result) are None / empty.
+    if uemr_mode and any_power_outputs:
+        from scepter.gpu_accel import _accumulate_uemr_power_cp as _uemr_accum
+
+        _sat_idx_g = cp.nonzero(sat_keep_batch)[0].astype(cp.int32, copy=False)
+        _sat_topo_visible = sat_topo_ras_station[:, _sat_idx_g, :]
+        _sat_azel_visible = sat_azel_ras_station[:, _sat_idx_g, :]
+        _orbit_radius_eff = orbit_radius_full[_sat_idx_g]
+        # UEMR kernel documents sat_topo as (T, S, 3); strip the 4th
+        # propagator column (xyz sentinel / range padding) if present.
+        _uemr_topo = _sat_topo_visible[:, :, :3]
+        _tel_az = None if pointings is None else pointings["azimuth_deg"]
+        _tel_el = None if pointings is None else pointings["elevation_deg"]
+        _uemr_result = _uemr_accum(
+            uemr_pattern_context=s1528_pattern_context,
+            ras_pattern_context=ras_pattern_context,
+            atmosphere_lut_context=atmosphere_context,
+            sat_topo=_uemr_topo,
+            telescope_azimuth_deg=_tel_az,
+            telescope_elevation_deg=_tel_el,
+            observer_alt_km=float(observer_alt_km_ras_station),
+            bandwidth_mhz=float(power_input["bandwidth_mhz"]),
+            power_input_quantity=str(power_input["power_input_quantity"]),
+            target_pfd_dbw_m2_channel=power_input.get("target_pfd_dbw_m2_channel"),
+            satellite_ptx_dbw_channel=power_input.get("satellite_ptx_dbw_channel"),
+            satellite_eirp_dbw_channel=power_input.get("satellite_eirp_dbw_channel"),
+            eirp_slab_fraction_lin=1.0,
+            visibility_elev_threshold_deg=float(visibility_elev_threshold_deg),
+            include_epfd=bool(write_epfd),
+            include_prx_total=bool(write_prx_total),
+            include_per_satellite_prx=bool(write_per_satellite_prx_ras_station),
+            include_total_pfd=bool(write_total_pfd_ras_station),
+            include_per_satellite_pfd=bool(write_per_satellite_pfd_ras_station),
+        )
+        # The UEMR kernel produces tensors with the SAME layout as the
+        # directive kernel: (T, 1, N_sky) for Prx_total / EPFD,
+        # (T, 1, 1) for PFD_total, (T, S) for per-satellite. Across
+        # systems sharing the same telescope context, N_sky is identical,
+        # so the combiner can sum them directly without any uniform-
+        # broadcast logic. We do NOT flag _spatially_uniform — that flag
+        # was for the old (T, 1, 1) UEMR layout that needed scalar
+        # broadcasting; the new layout doesn't need it.
+        _uemr_bypass_payload: dict[str, Any] = dict(_uemr_result)
+        return {
+            "power_result": _uemr_bypass_payload,
+            "sat_idx_g": _sat_idx_g,
+            "sat_topo_visible": _sat_topo_visible,
+            "sat_azel_visible": _sat_azel_visible,
+            "orbit_radius_eff": _orbit_radius_eff,
+            "sat_beam_counts_used_full": None,
+            "sat_eligible_mask": None,
+            "diag_result": None,
+            "debug_direct_epfd_stats": None,
+            "beam_finalize_substage_timings": {},
+            "cell_link_library_chunk_telemetry": {},
+            "cell_link_library_stage_memory_summary": {},
+            "beam_finalize_stage_memory_summary": {},
+            "power_stage_memory_summary": {},
+            "stage_start": stage_start,
+            "stage_memory_summary": {},
+            "beam_finalize_chunk_shape": {},
+            "boresight_compaction_stats": {},
+        }
     cell_link_stage_summary = _start_direct_epfd_stage_memory_summary(
         "cell_link_library",
         cp=cp,
@@ -8442,8 +8679,23 @@ def _prepare_multi_system_extra_context(
     )
 
     sys_s1528_pattern_context = None
+    # UEMR mode can be carried either at the top-level kwargs (set by the
+    # GUI's run-request builder) or inside pattern_kwargs (set by the
+    # ``isotropic`` antenna model spec). Accept either source.
+    sys_uemr_mode = (
+        bool(sys_kw.get("uemr_mode", False))
+        or bool(sys_pattern_kwargs.get("uemr_mode", False))
+        or bool(sys_pattern_kwargs.get("isotropic", False))
+    )
     if any_power_outputs:
-        if "Lt" in sys_pattern_kwargs:
+        if sys_uemr_mode:
+            # UEMR: isotropic per-satellite source — uses a minimal
+            # pattern context that returns 0 dBi everywhere. Skips the
+            # Lt / Gm / M.2101 parameter checks since none apply.
+            sys_s1528_pattern_context = session.prepare_isotropic_pattern_context(
+                wavelength_m=sys_wavelength_m,
+            )
+        elif "Lt" in sys_pattern_kwargs:
             sys_s1528_pattern_context = session.prepare_s1528_pattern_context(
                 wavelength_m=sys_wavelength_m,
                 lt_m=sys_pattern_kwargs["Lt"],
@@ -8517,11 +8769,15 @@ def _prepare_multi_system_extra_context(
     # Spectrum plan context
     sys_bandwidth_mhz = float(sys_kw.get("bandwidth_mhz", 5.0))
     sys_spectrum_plan = sys_kw.get("spectrum_plan", None)
+    # pfd0_dbw_m2_mhz is the legacy target-PFD baseline; None when the
+    # caller picked Ptx/EIRP. Coerce only if present, otherwise pass
+    # None through (the normaliser treats None as "no baseline").
+    _sys_pfd0 = sys_kw.get("pfd0_dbw_m2_mhz", -83.5)
     sys_power_input = normalize_direct_epfd_power_input(
         bandwidth_mhz=sys_bandwidth_mhz,
         power_input_quantity=sys_kw.get("power_input_quantity", "target_pfd"),
         power_input_basis=sys_kw.get("power_input_basis", "per_mhz"),
-        pfd0_dbw_m2_mhz=float(sys_kw.get("pfd0_dbw_m2_mhz", -83.5)),
+        pfd0_dbw_m2_mhz=None if _sys_pfd0 is None else float(_sys_pfd0),
         target_pfd_dbw_m2_mhz=sys_kw.get("target_pfd_dbw_m2_mhz"),
         target_pfd_dbw_m2_channel=sys_kw.get("target_pfd_dbw_m2_channel"),
         satellite_ptx_dbw_mhz=sys_kw.get("satellite_ptx_dbw_mhz"),
@@ -8700,6 +8956,25 @@ def _prepare_multi_system_extra_context(
     ctx["boresight_theta1_deg"] = sys_boresight_theta1_deg
     ctx["boresight_theta2_deg"] = sys_boresight_theta2_deg
     ctx["boresight_theta2_cell_ids"] = sys_boresight_theta2_cell_ids
+    # UEMR can arrive as a top-level kwarg or via pattern_kwargs
+    # (isotropic / uemr_mode); accept either.
+    _sys_pk = sys_kw.get("pattern_kwargs", {}) or {}
+    ctx["uemr_mode"] = (
+        bool(sys_kw.get("uemr_mode", False))
+        or bool(_sys_pk.get("uemr_mode", False))
+        or bool(_sys_pk.get("isotropic", False))
+    )
+    # Antenna-model identifier for HDF5 per-system attrs. Distinguish
+    # "isotropic" UEMR systems from directive ones in the output file
+    # so post-processing can branch.
+    if ctx["uemr_mode"]:
+        ctx["antenna_model"] = "isotropic"
+    elif "Lt" in _sys_pk:
+        ctx["antenna_model"] = "s1528_rec1_4"
+    elif "N_H" in _sys_pk:
+        ctx["antenna_model"] = "m2101"
+    else:
+        ctx["antenna_model"] = "s1528_rec1_2"
     return ctx
 
 
@@ -8850,7 +9125,9 @@ def _combine_multi_system_power_results_device(
     if not valid_results:
         return None
     if len(valid_results) == 1:
-        return valid_results[0]
+        single = dict(valid_results[0])
+        single.pop("_spatially_uniform", None)
+        return single
 
     # Start from a copy of the first system's result
     combined = dict(valid_results[0])
@@ -8863,13 +9140,50 @@ def _combine_multi_system_power_results_device(
         "Prx_total_W",
         "PFD_total_RAS_STATION_W_m2",
     }
+
+    def _normalize_pair(lhs: Any, rhs: Any) -> tuple[Any, Any]:
+        """Broadcast lhs/rhs to a common shape for linear power summation.
+
+        Handles the three emit shapes produced by the kernels:
+          * (T,)            — 3-D directive non-boresight & UEMR PFD_total
+          * (T, 1, 1)       — legacy UEMR-bypass spatially-uniform
+          * (T, 1, N_sky)   — 4-D directive boresight & sky-aware EPFD/Prx
+        PFD/EPFD/Prx at the antenna site are independent of pointing
+        direction for spatially-uniform emitters, so broadcasting a scalar-
+        per-t quantity across the sky axis is physically correct.
+        """
+        if lhs.shape == rhs.shape:
+            return lhs, rhs
+        # Promote 1-D (T,) to (T, 1, 1) first so both sides are ≥3-D.
+        if lhs.ndim == 1:
+            lhs = lhs[:, None, None]
+        if rhs.ndim == 1:
+            rhs = rhs[:, None, None]
+        if lhs.shape == rhs.shape:
+            return lhs, rhs
+        # Broadcast to the elementwise-max shape (works for (T,1,1) vs
+        # (T,1,N_sky) and similar per-axis subset relations).
+        target = tuple(max(a, b) for a, b in zip(lhs.shape, rhs.shape))
+        return cp.broadcast_to(lhs, target), cp.broadcast_to(rhs, target)
+
     for key in _summable_keys:
-        if key not in combined:
+        if key not in combined or combined[key] is None:
             continue
         for pr in valid_results[1:]:
-            if key in pr and pr[key] is not None:
-                combined[key] = combined[key] + pr[key]
+            if key not in pr or pr[key] is None:
+                continue
+            lhs = combined[key]
+            rhs = pr[key]
+            try:
+                lhs_n, rhs_n = _normalize_pair(lhs, rhs)
+            except Exception as exc:
+                raise ValueError(
+                    f"_combine_multi_system_power_results_device: cannot combine "
+                    f"key {key!r} with shapes {lhs.shape} vs {rhs.shape}: {exc}"
+                ) from exc
+            combined[key] = lhs_n + rhs_n
 
+    combined.pop("_spatially_uniform", None)
     return combined
 
 
@@ -8980,6 +9294,7 @@ def run_gpu_direct_epfd(
     cancel_callback: Callable[[], str | None] | None = None,
     systems: list[dict[str, Any]] | None = None,
     output_system_groups: list[dict[str, Any]] | None = None,
+    uemr_mode: bool = False,
 ) -> dict[str, Any]:
     """
     Run the notebook-facing GPU direct-EPFD workflow.
@@ -9168,11 +9483,18 @@ def run_gpu_direct_epfd(
             split_total_group_denominator_mode
         )
     )
+    # pfd0_dbw_m2_mhz is the legacy target-PFD pass-through — None when
+    # the caller selected Ptx or EIRP. Coerce only if present; otherwise
+    # leave it None for the normaliser (which treats None as "no target
+    # PFD baseline was provided").
+    _pfd0_coerced = (
+        None if pfd0_dbw_m2_mhz is None else float(pfd0_dbw_m2_mhz)
+    )
     power_input = normalize_direct_epfd_power_input(
         bandwidth_mhz=float(bandwidth_mhz),
         power_input_quantity=power_input_quantity,
         power_input_basis=power_input_basis,
-        pfd0_dbw_m2_mhz=float(pfd0_dbw_m2_mhz),
+        pfd0_dbw_m2_mhz=_pfd0_coerced,
         target_pfd_dbw_m2_mhz=target_pfd_dbw_m2_mhz,
         target_pfd_dbw_m2_channel=target_pfd_dbw_m2_channel,
         satellite_ptx_dbw_mhz=satellite_ptx_dbw_mhz,
@@ -9221,8 +9543,24 @@ def run_gpu_direct_epfd(
 
     _emit_prepare("Planning output families and memory schedules...")
 
+    # UEMR mode may arrive via either the top-level ``uemr_mode`` kwarg
+    # (set by the GUI when it knows explicitly) or via pattern_kwargs
+    # (set by the ``isotropic`` antenna model spec in antenna.py). Derive
+    # a single canonical flag and propagate it — without this, the batch
+    # loop would receive uemr_mode=False and run the full beam library,
+    # defeating the bypass even when the kernel would have skipped beams.
+    uemr_mode = (
+        bool(uemr_mode)
+        or bool((pattern_kwargs or {}).get("uemr_mode", False))
+        or bool((pattern_kwargs or {}).get("isotropic", False))
+    )
+    # When UEMR is active, beam-related output families have no data to
+    # write (the beam library is bypassed). Pass uemr_mode through so
+    # ``_resolve_direct_epfd_output_family_plan`` can force them off and
+    # the HDF5 file doesn't carry stale beam artefacts.
     output_family_plan = _resolve_direct_epfd_output_family_plan(
-        _resolve_output_family_configs(output_families=output_families)
+        _resolve_output_family_configs(output_families=output_families),
+        uemr_mode=bool(uemr_mode),
     )
     family_configs = output_family_plan["family_configs"]
     for family_name in ("prx_total_distribution", "prx_elevation_heatmap"):
@@ -9783,7 +10121,21 @@ def run_gpu_direct_epfd(
     _emit_prepare("Preparing antenna patterns and atmosphere...")
 
     if any_power_outputs:
-        if "Lt" in pattern_kwargs:
+        # UEMR isotropic: pattern_kwargs carries ``isotropic=True`` (and
+        # ``uemr_mode=True``) instead of Rec 1.2 / 1.4 / M.2101 keys.
+        # Route to the minimal isotropic pattern context — the UEMR
+        # bypass in _compute_gpu_direct_epfd_batch_device never reads
+        # Gm / Lt / N_H.
+        _single_uemr = (
+            bool(uemr_mode)
+            or bool(pattern_kwargs.get("uemr_mode", False))
+            or bool(pattern_kwargs.get("isotropic", False))
+        )
+        if _single_uemr:
+            s1528_pattern_context = session.prepare_isotropic_pattern_context(
+                wavelength_m=wavelength_m,
+            )
+        elif "Lt" in pattern_kwargs:
             # Rec 1.4 analytical (Taylor/Bessel) pattern
             s1528_pattern_context = session.prepare_s1528_pattern_context(
                 wavelength_m=wavelength_m,
@@ -9973,6 +10325,20 @@ def run_gpu_direct_epfd(
             "boresight_theta1_deg": boresight_theta1_deg,
             "boresight_theta2_deg": boresight_theta2_deg,
             "boresight_theta2_cell_ids": boresight_theta2_cell_ids,
+            "uemr_mode": bool(uemr_mode),
+            # antenna_model identifier for HDF5 per-system attrs. Mirrors
+            # the dispatch in _prepare_multi_system_extra_context so the
+            # PRIMARY system (index 0) carries the same metadata as the
+            # secondaries — otherwise system_0 reads with empty model in
+            # the merged HDF5 output.
+            "antenna_model": (
+                "isotropic" if bool(uemr_mode) or bool((pattern_kwargs or {}).get("isotropic", False))
+                else (
+                    "s1528_rec1_4" if "Lt" in (pattern_kwargs or {})
+                    else ("m2101" if "N_H" in (pattern_kwargs or {})
+                          else "s1528_rec1_2")
+                )
+            ),
         })
         for sys_idx in range(1, len(systems)):
             sys_kw = systems[sys_idx]
@@ -10320,6 +10686,13 @@ def run_gpu_direct_epfd(
                 # For multi-system, plan for worst-case satellite/cell counts
                 _sched_n_sats = n_sats_total
                 _sched_n_cells = n_cells_total
+                _sched_ms_total = 1
+                # Single-system UEMR: the primary system itself bypasses
+                # the beam library, so the scheduler's per-system cost
+                # model must know — otherwise it estimates batch time as
+                # if a full directive run is happening, and the ETA is
+                # 5× too long.
+                _sched_ms_uemr = 1 if bool(uemr_mode) else 0
                 if _multi_system_active:
                     _sched_n_sats = max(
                         n_sats_total,
@@ -10328,6 +10701,18 @@ def run_gpu_direct_epfd(
                     _sched_n_cells = max(
                         n_cells_total,
                         *(ctx["n_cells_total"] for ctx in _multi_system_contexts),
+                    )
+                    # Count primary system + per-batch interleaved systems for
+                    # the planner's multi-system cost-model adjustment. UEMR
+                    # systems bypass the beam library and are ~1/3 as expensive
+                    # as directive systems per the empirical scale factor.
+                    _sched_ms_total = 1 + len(_multi_system_contexts)
+                    _sched_ms_uemr = (
+                        (1 if bool(uemr_mode) else 0)  # primary is UEMR too
+                        + sum(
+                            1 for _c in _multi_system_contexts
+                            if bool(_c.get("uemr_mode", False))
+                        )
                     )
                 iteration_plan = _plan_direct_epfd_iteration_schedule(
                     session=session,
@@ -10366,6 +10751,8 @@ def run_gpu_direct_epfd(
                     allow_warmup_calibration=True,
                     surface_pfd_cap_enabled=bool(max_surface_pfd_enabled),
                     surface_pfd_cap_mode=str(surface_pfd_cap_mode),
+                    multi_system_count=int(_sched_ms_total),
+                    multi_system_uemr_count=int(_sched_ms_uemr),
                 )
                 scheduler_runtime_state = _update_scheduler_runtime_state_from_plan(
                     scheduler_runtime_state,
@@ -10390,6 +10777,10 @@ def run_gpu_direct_epfd(
                 planned_power_sky_slab = int(iteration_plan["sky_slab"])
                 limiting_resource = str(iteration_plan["limiting_resource"])
                 planned_batch_seconds = float(iteration_plan["planned_batch_seconds"])
+                # NOTE: multi-system scale factor is now applied inside the
+                # planner via _estimate_direct_epfd_batch_seconds (see the
+                # multi_system_count / multi_system_uemr_count kwargs threaded
+                # in above). The post-hoc scale here would double-count.
                 n_batches = int(np.ceil(n_steps_total / bulk_timesteps))
                 planned_iteration_seconds = float(planned_batch_seconds) * float(n_batches)
                 remaining_iterations = max(0, int(iteration_count) - int(ii))
@@ -11340,6 +11731,7 @@ def run_gpu_direct_epfd(
                                         write_sat_eligible_mask=bool(store_eligible_mask),
                                         progress_callback=progress_callback,
                                         cancel_callback=cancel_callback,
+                                        uemr_mode=bool(uemr_mode),
                                     )
                                     power_result = compute_payload["power_result"]
                                     sat_idx_g = compute_payload["sat_idx_g"]
@@ -11546,6 +11938,7 @@ def run_gpu_direct_epfd(
                                                     write_sat_eligible_mask=False,
                                                     progress_callback=None,
                                                     cancel_callback=cancel_callback,
+                                                    uemr_mode=bool(_ms_ctx.get("uemr_mode", False)),
                                                 )
                                                 _ms_pr = _ms_compute.get("power_result")
                                                 # Inject beam counts, elevation, and diagnostic data
@@ -13052,9 +13445,21 @@ def run_gpu_direct_epfd(
                             _sg.attrs["system_index"] = int(_ps_write_idx)
                             _sg.attrs["n_sats_total"] = int(_ps_ctx.get("n_sats_total", 0))
                             _sg.attrs["n_cells_total"] = int(_ps_ctx.get("n_cells_total", 0))
-                            _sg.attrs["nco"] = int(_ps_ctx.get("nco", 1))
-                            _sg.attrs["nbeam"] = int(_ps_ctx.get("nbeam", 1))
-                            _sg.attrs["selection_mode"] = str(_ps_ctx.get("selection_mode", ""))
+                            # UEMR systems have no Nco/Nbeam/selection — record
+                            # "n/a" so a downstream HDF5 reader doesn't mistake
+                            # the kernel sentinel for a user-chosen value. Match
+                            # the shared root-attr convention from the GUI.
+                            _ps_uemr = bool(_ps_ctx.get("uemr_mode", False))
+                            _sg.attrs["uemr_mode"] = _ps_uemr
+                            _sg.attrs["antenna_model"] = str(_ps_ctx.get("antenna_model", ""))
+                            if _ps_uemr:
+                                _sg.attrs["nco"] = "n/a"
+                                _sg.attrs["nbeam"] = "n/a"
+                                _sg.attrs["selection_mode"] = "n/a"
+                            else:
+                                _sg.attrs["nco"] = int(_ps_ctx.get("nco", 1))
+                                _sg.attrs["nbeam"] = int(_ps_ctx.get("nbeam", 1))
+                                _sg.attrs["selection_mode"] = str(_ps_ctx.get("selection_mode", ""))
                             _sg.attrs["cell_activity_factor"] = float(_ps_ctx.get("cell_activity_factor", 1.0))
                             _sg.attrs["cell_activity_mode"] = str(_ps_ctx.get("cell_activity_mode", ""))
                             _sg.attrs["wavelength_m"] = float(_ps_ctx.get("wavelength_m", 0.0))

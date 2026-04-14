@@ -5,7 +5,7 @@ long_description = (Path(__file__).parent / "README.md").read_text(encoding="utf
 
 setup(
     name="scepter",
-    version="0.25.0",
+    version="0.25.1",
     description=(
         "SCEPTer — Simulating Constellation Emission Patterns for Telescopes (radio). "
         "A modular Python toolkit for evaluating satellite constellation EPFD impact "

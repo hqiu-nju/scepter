@@ -35,6 +35,10 @@ def test_readme_mentions_core_apis_and_license():
     assert "gui.py" in readme_text
 
 
+@pytest.mark.skip(
+    reason="DEPRECATED / pending review: SCEPTer_simulate.ipynb was removed; "
+    "test retained for future reinstatement once notebook workflow is redefined."
+)
 def test_boresight_workflow_notebook_uses_shared_library_workflow():
     notebook_text = (
         REPO_ROOT / "SCEPTer_simulate.ipynb"
@@ -50,6 +54,10 @@ def test_boresight_workflow_notebook_uses_shared_library_workflow():
         assert token in notebook_text
 
 
+@pytest.mark.skip(
+    reason="DEPRECATED / pending review: SCEPTer_simulate.ipynb was removed; "
+    "test retained for future reinstatement once notebook workflow is redefined."
+)
 def test_boresight_workflow_notebook_code_cells_compile():
     _compile_notebook_code_cells(
         REPO_ROOT / "SCEPTer_simulate.ipynb"
@@ -61,6 +69,10 @@ def test_boresight_workflow_notebook_code_cells_compile():
     [
         "SCEPTer_simulate.ipynb",
     ],
+)
+@pytest.mark.skip(
+    reason="DEPRECATED / pending review: SCEPTer_simulate.ipynb was removed; "
+    "test retained for future reinstatement once notebook workflow is redefined."
 )
 def test_step1_family_notebooks_code_cells_compile(notebook_name: str):
     _compile_notebook_code_cells(REPO_ROOT / notebook_name)

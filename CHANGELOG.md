@@ -2,6 +2,52 @@
 
 All notable user-facing changes are summarized here at a high level.
 
+## v0.25.1
+
+### UEMR (unwanted emissions) mode
+
+- New per-satellite isotropic emission mode for modelling unwanted
+  emissions from internal satellite circuitry that are not coupled to
+  the directive antenna. Each visible satellite radiates the
+  configured Ptx/EIRP isotropically, once per satellite; the beam
+  library, selection strategy, cell activity, coverage tabs,
+  boresight avoidance, and surface-PFD cap are all bypassed because
+  they have no meaning without beams.
+- Enabled via the **Isotropic UEMR mode** checkbox on the Satellite
+  Antennas tab (when the antenna model is set to isotropic).
+- Toggling UEMR hides irrelevant Service & Demand fields and coverage
+  tabs; toggling it off restores them. The transmit emission mask on
+  the Spectrum tab still shapes UEMR power across frequency.
+- **"Set Service Defaults"** populates UEMR-appropriate starting
+  values: EIRP basis, per-MHz, −71 dBW/MHz (CISPR-32 Class B
+  quasi-peak at 3 m, 1 MHz measurement BW, ≈ 2 GHz).
+- UEMR-specific kernel-required defaults are forced automatically:
+  flat (rectangular) transmit emission mask, channel bandwidth =
+  service-band width, power basis = per-MHz, power variation = fixed,
+  integration cutoff = 50 % of service bandwidth (clipping the mask
+  exactly at the service-band edges), reuse factor = 1.
+- Sidebar and tab subtitles for **Spectrum** and **Service** switch
+  to UEMR-appropriate descriptive copy when UEMR is active.
+
+### Plot polish
+
+- Matplotlib rectangular hemisphere maps no longer draw
+  `draw_guides`-style arrow overlays on top of the native axes
+  (these only make sense for the polar projection and produced a
+  duplicated "arrow + spine" look). Opt in on rect via
+  `draw_guides=True`.
+- The operational-range lower elevation (e.g. 15°) is now always
+  ticked on the y-axis of rectangular hemisphere maps — the default
+  locator was hiding the most load-bearing tick in favour of round
+  decades.
+
+### Test suite
+
+- Fixed flaky `test_contour_analyser_updates_guidance_immediately`
+  that depended on module-level state left by other tests. The test
+  now asserts only the robust invariant (analyser completion updates
+  the recommended-spacing label).
+
 ## v0.25.0
 
 ### GPU device selection

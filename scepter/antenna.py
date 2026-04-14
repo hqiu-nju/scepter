@@ -95,6 +95,7 @@ def build_satellite_pattern_spec(
     rec14_far_sidelobe_start_deg: float | None = None,
     rec14_far_sidelobe_level_dbi: float | None = None,
     rec14_gm_dbi: float | None = None,
+    isotropic_uemr_mode: bool = False,
     use_numba: bool = False,
 ) -> tuple[Callable[..., Any], u.Quantity, dict[str, Any]]:
     """Build a pure satellite-pattern spec from normalized S.1528 inputs."""
@@ -148,6 +149,20 @@ def build_satellite_pattern_spec(
             },
         )
 
+    if antenna_model == "isotropic":
+        # Isotropic: Gtx = 0 dBi at every offset angle. ``isotropic`` marks
+        # the model for GPU/scenario dispatch; ``isotropic_uemr_mode`` picks
+        # between the two execution paths:
+        #   False → directive isotropic (per-beam, runs through the normal
+        #           beam library with a flat pattern).
+        #   True  → UEMR bypass (per-satellite, skips the beam library;
+        #           scenario pipeline forks on this flag).
+        return (
+            isotropic_pattern,
+            wavelength,
+            {"isotropic": True, "uemr_mode": bool(isotropic_uemr_mode)},
+        )
+
     if antenna_model == "m2101":
         from pycraf.antenna import imt2020_composite_pattern
         m2101_kwargs = kwargs.get("m2101", {}) if "kwargs" in dir() else {}
@@ -173,8 +188,24 @@ def build_satellite_pattern_spec(
     raise ValueError(f"Unsupported antenna model {antenna_model!r}.")
 
 
-@ranged_quantity_input(offset_angles = (None, None, u.deg), 
-                       Gm = (-500, 500, cnv.dBi), 
+def isotropic_pattern(offset_angles, wavelength=None, **_kwargs):
+    """Return 0 dBi at every offset angle (isotropic UEMR leakage).
+
+    Accepts the same call signature shape as ``s_1528_rec1_2_pattern`` so
+    GUI preview code can invoke it uniformly. Returns an Astropy
+    ``Quantity`` in dBi matching the input shape. ``wavelength`` and any
+    additional kwargs are accepted for signature parity and ignored.
+    """
+    del wavelength, _kwargs
+    angles = np.asarray(
+        offset_angles.to_value(u.deg) if hasattr(offset_angles, "to_value") else offset_angles,
+        dtype=np.float64,
+    )
+    return np.zeros_like(angles) * cnv.dBi
+
+
+@ranged_quantity_input(offset_angles = (None, None, u.deg),
+                       Gm = (-500, 500, cnv.dBi),
                        LN = (-30, -15, cnv.dB),
                        LF = (-500, 500, cnv.dBi),
                        LB = (-500, 500, cnv.dBi),
