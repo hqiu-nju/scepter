@@ -199,3 +199,156 @@ class TestHighOrbitAndEllipticalSupport:
         n_expected = tleforger._compute_mean_motion_rev_day(525_000.0, eccentricity=0.0)
         period_h = 24.0 / n_expected
         assert 1.5 < period_h < 1.7, f"LEO period should be ~1.6h, got {period_h:.2f}h"
+
+
+class TestStartTimeParameter:
+    """Custom ``start_time`` is forwarded to the TLE epoch in every forge helper."""
+
+    # TLE line 1 encodes the epoch as ``YYDDD.DDDDDDDD`` in columns 19-32
+    # (1-based) → Python slice [18:32]. We parse that back to assert the
+    # forger honoured our requested epoch.
+    @staticmethod
+    def _parse_epoch_yyddd(tle_line1: str) -> tuple[int, float]:
+        field = tle_line1[18:32]
+        year_short = int(field[:2])
+        day_of_year = float(field[2:])
+        return year_short, day_of_year
+
+    def test_single_sat_uses_custom_datetime_epoch(self):
+        from datetime import datetime
+        from astropy import units as u
+
+        tleforger.reset_tle_counter()
+        requested = datetime(2030, 3, 15, 12, 0, 0)
+        tle = tleforger.forge_tle_single(
+            altitude=525_000.0 * u.m,
+            inclination_deg=53.0 * u.deg,
+            start_time=requested,
+        )
+        line1 = tle.tle_strings()[1]
+        year_short, day_of_year = self._parse_epoch_yyddd(line1)
+        assert year_short == 30
+        # 2030-03-15 noon → DOY 74.5 (Jan+Feb = 31+28 = 59; +15 = 74; +0.5)
+        assert abs(day_of_year - 74.5) < 1e-3
+
+    def test_single_sat_none_falls_back_to_legacy_epoch(self):
+        from astropy import units as u
+
+        tleforger.reset_tle_counter()
+        tle = tleforger.forge_tle_single(altitude=525_000.0 * u.m, start_time=None)
+        year_short, day_of_year = self._parse_epoch_yyddd(tle.tle_strings()[1])
+        # Legacy default: 2025-01-01T00:00 → YY=25, DOY=1.0
+        assert year_short == 25
+        assert abs(day_of_year - 1.0) < 1e-6
+
+    def test_belt_propagates_custom_start_time(self):
+        from datetime import datetime
+        from astropy import units as u
+
+        tleforger.reset_tle_counter()
+        tles = tleforger.forge_tle_belt(
+            belt_name="EpochBelt",
+            num_sats_per_plane=2,
+            plane_count=2,
+            altitude=525_000.0 * u.m,
+            inclination_deg=53.0 * u.deg,
+            start_time=datetime(2028, 7, 1, 0, 0, 0),
+        )
+        assert tles.size == 4
+        epochs = {self._parse_epoch_yyddd(t.tle_strings()[1]) for t in tles}
+        # All satellites in a belt share one epoch.
+        assert len(epochs) == 1
+        year_short, day_of_year = next(iter(epochs))
+        assert year_short == 28
+        # DOY of 2028-07-01 (leap year): Jan+Feb+Mar+Apr+May+Jun = 31+29+31+30+31+30 = 182, +1 = 183
+        assert abs(day_of_year - 183.0) < 1e-6
+
+    def test_constellation_helper_forwards_start_time_to_every_belt(self):
+        from datetime import datetime
+        from astropy import units as u
+
+        tleforger.reset_tle_counter()
+        belts = [
+            {
+                "belt_name": f"Belt{i}",
+                "num_sats_per_plane": 2,
+                "plane_count": 1,
+                "altitude": (500 + 50 * i) * u.km,
+                "eccentricity": 0.0,
+                "inclination_deg": 53.0 * u.deg,
+                "argp_deg": 0.0 * u.deg,
+                "RAAN_min": 0.0 * u.deg,
+                "RAAN_max": 180.0 * u.deg,
+                "min_elevation": 20.0 * u.deg,
+                "adjacent_plane_offset": False,
+            }
+            for i in range(3)
+        ]
+        constellation = tleforger.forge_tle_constellation_from_belt_definitions(
+            belts, start_time=datetime(2029, 12, 31, 0, 0, 0),
+        )
+        # Every belt's TLEs share the single requested epoch.
+        epochs = {
+            self._parse_epoch_yyddd(t.tle_strings()[1])
+            for t in constellation["tle_list"]
+        }
+        assert len(epochs) == 1
+        year_short, day_of_year = next(iter(epochs))
+        assert year_short == 29
+        # 2029-12-31 → DOY 365 (2029 is not a leap year).
+        assert abs(day_of_year - 365.0) < 1e-6
+
+    def test_constellation_helper_accepts_astropy_time(self):
+        from astropy.time import Time
+        from astropy import units as u
+
+        tleforger.reset_tle_counter()
+        constellation = tleforger.forge_tle_constellation_from_belt_definitions(
+            [
+                {
+                    "belt_name": "LEO",
+                    "num_sats_per_plane": 1,
+                    "plane_count": 1,
+                    "altitude": 525 * u.km,
+                    "eccentricity": 0.0,
+                    "inclination_deg": 53 * u.deg,
+                    "argp_deg": 0 * u.deg,
+                    "RAAN_min": 0 * u.deg,
+                    "RAAN_max": 180 * u.deg,
+                    "min_elevation": 20 * u.deg,
+                    "adjacent_plane_offset": False,
+                },
+            ],
+            start_time=Time("2027-06-15T00:00:00", scale="utc"),
+        )
+        line1 = constellation["tle_list"][0].tle_strings()[1]
+        year_short, day_of_year = self._parse_epoch_yyddd(line1)
+        assert year_short == 27
+        # DOY of 2027-06-15 (not a leap year): 31+28+31+30+31+15 = 166
+        assert abs(day_of_year - 166.0) < 1e-6
+
+    def test_constellation_helper_none_preserves_legacy_behavior(self):
+        from astropy import units as u
+
+        tleforger.reset_tle_counter()
+        constellation = tleforger.forge_tle_constellation_from_belt_definitions(
+            [
+                {
+                    "belt_name": "LEO",
+                    "num_sats_per_plane": 1,
+                    "plane_count": 1,
+                    "altitude": 525 * u.km,
+                    "eccentricity": 0.0,
+                    "inclination_deg": 53 * u.deg,
+                    "argp_deg": 0 * u.deg,
+                    "RAAN_min": 0 * u.deg,
+                    "RAAN_max": 180 * u.deg,
+                    "min_elevation": 20 * u.deg,
+                    "adjacent_plane_offset": False,
+                },
+            ],
+        )
+        line1 = constellation["tle_list"][0].tle_strings()[1]
+        year_short, day_of_year = self._parse_epoch_yyddd(line1)
+        assert year_short == 25
+        assert abs(day_of_year - 1.0) < 1e-6

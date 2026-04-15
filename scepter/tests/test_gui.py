@@ -77,6 +77,12 @@ class _DummyProperty:
     def SetSpecular(self, value: float) -> None:
         self.specular = float(value)
 
+    def SetPointSize(self, value: float) -> None:
+        self.point_size = float(value)
+
+    def SetRenderPointsAsSpheres(self, flag: bool) -> None:
+        self.render_points_as_spheres = bool(flag)
+
 
 class _DummyActor:
     def __init__(self) -> None:
@@ -1798,7 +1804,9 @@ def test_belt_table_model_unique_names_and_remove_last_row() -> None:
     assert model.belts()[1].belt_name == "System3_Belt_2"
     model.duplicate_row(0)
     assert model.belts()[1].belt_name == "System3_Belt_3"
-    name_index = model.index(1, 0)
+    # The Name column follows the synthetic "Show" visibility
+    # indicator column (index 0).
+    name_index = model.index(1, 1)
     assert model.setData(name_index, "Custom")
     assert model.belts()[1].belt_name == "Custom"
     assert model.setData(name_index, "System3_Belt_1")
@@ -2010,6 +2018,141 @@ def test_interpolate_position_frames_midpoint() -> None:
         out,
         0.5 * (frame_set.positions_ecef_km[0] + frame_set.positions_ecef_km[1]),
     )
+
+
+def test_interpolate_position_frames_reuses_out_buffer_without_alloc() -> None:
+    """The in-place blend must return the *same* ``out`` array the caller passed in.
+
+    Regression guard for the ``out = lower + frac*(upper-lower)`` in-place
+    rewrite that replaced the transient ``frac * frame_values[upper_idx]``
+    allocation. Any future change that re-introduces an internal
+    allocation would break identity here.
+    """
+    sample_times_s = np.asarray([0.0, 1.0, 2.0, 3.0], dtype=np.float32)
+    frames = np.zeros((4, 5, 3), dtype=np.float32)
+    frames[0] = 0.0
+    frames[1] = 10.0
+    frames[2] = 20.0
+    frames[3] = 30.0
+    out = np.empty((5, 3), dtype=np.float32)
+    result = sgui._interpolate_position_frames(sample_times_s, frames, 1.25, out=out)
+    assert result is out, "Expected zero-copy return of the caller's buffer"
+    np.testing.assert_allclose(result, np.full((5, 3), 10.0 + 0.25 * 10.0))
+
+
+def test_interpolate_position_frames_extrapolation_clamps() -> None:
+    """Requests before the first frame / after the last clamp to the bounds."""
+    sample_times_s = np.asarray([0.0, 1.0, 2.0], dtype=np.float32)
+    frames = np.stack([np.full((3, 3), i * 5.0, dtype=np.float32) for i in range(3)])
+
+    before = sgui._interpolate_position_frames(sample_times_s, frames, -5.0)
+    np.testing.assert_allclose(before, frames[0])
+
+    after = sgui._interpolate_position_frames(sample_times_s, frames, 99.0)
+    np.testing.assert_allclose(after, frames[-1])
+
+
+def test_interpolate_position_frames_exact_sample_returns_that_frame() -> None:
+    sample_times_s = np.asarray([0.0, 1.0, 2.0], dtype=np.float32)
+    frames = np.stack([np.full((4, 3), i * 7.0, dtype=np.float32) for i in range(3)])
+    out = sgui._interpolate_position_frames(sample_times_s, frames, 1.0)
+    np.testing.assert_allclose(out, frames[1])
+
+
+def test_orbit_tracks_build_populates_vectorized_stacks(
+    monkeypatch: pytest.MonkeyPatch,
+    qapp: QtWidgets.QApplication,
+) -> None:
+    """Build caches contiguous stacks that the per-frame rotate loop needs."""
+    del qapp
+    _stub_scene_assets(monkeypatch)
+    viewer = _make_viewer(state_provider=_tiny_state)
+    viewer._current_frame_set = _manual_frame_set()
+    viewer._applied_frame_view_mode = "ECEF"
+    viewer._current_frame_index = 0
+
+    viewer._build_orbit_tracks()
+
+    n_rings = 2  # tiny state: 1 belt × 2 planes
+    assert len(viewer._orbit_track_polydatas) == n_rings
+    assert len(viewer._orbit_track_pd_views) == n_rings
+    assert viewer._orbit_track_base_xy is not None
+    assert viewer._orbit_track_base_z is not None
+    assert viewer._orbit_track_drift_arr is not None
+    assert viewer._orbit_track_base_xy.shape == (n_rings, 120, 2)
+    assert viewer._orbit_track_base_z.shape == (n_rings, 120)
+    assert viewer._orbit_track_drift_arr.shape == (n_rings,)
+    # Views must expose the *same* memory as the pv.PolyData points
+    # arrays; otherwise the per-frame copyto would update a scratch
+    # buffer that VTK never sees.
+    for view, pd in zip(viewer._orbit_track_pd_views, viewer._orbit_track_polydatas):
+        assert np.shares_memory(view, pd.points)
+
+
+def test_orbit_tracks_rotate_applies_drift_plus_earth_angle(
+    monkeypatch: pytest.MonkeyPatch,
+    qapp: QtWidgets.QApplication,
+) -> None:
+    """_rotate_orbit_tracks fuses GMST + per-plane RAAN drift into one Z rotation."""
+    del qapp
+    _stub_scene_assets(monkeypatch)
+    viewer = _make_viewer(state_provider=_tiny_state)
+    viewer._current_frame_set = _manual_frame_set()
+    viewer._applied_frame_view_mode = "ECEF"
+    viewer._current_frame_index = 0
+    viewer._build_orbit_tracks()
+
+    # Force a deterministic drift rate so the expected rotation is
+    # exact — the real propagation-derived rate is tiny noise in the
+    # manual fixture.
+    n_rings = viewer._orbit_track_base_xy.shape[0]
+    drift_rad_per_s = 0.1
+    viewer._orbit_track_drift_arr = np.full((n_rings,), drift_rad_per_s, dtype=np.float64)
+    viewer._orbit_track_t0_offset_s = 0.0
+
+    earth_angle_deg = 30.0
+    offset_s = 2.0
+    viewer._rotate_orbit_tracks(earth_angle_deg, offset_s=offset_s)
+
+    # Expected combined rotation about +Z: drift*dt + (-earth_angle_rad).
+    total_rad = drift_rad_per_s * offset_s + np.radians(-earth_angle_deg)
+    cos_a = float(np.cos(total_rad))
+    sin_a = float(np.sin(total_rad))
+    for idx, pd in enumerate(viewer._orbit_track_polydatas):
+        base_xy = viewer._orbit_track_base_xy[idx]
+        base_z = viewer._orbit_track_base_z[idx]
+        pts = np.asarray(pd.points)
+        expected_x = cos_a * base_xy[:, 0] - sin_a * base_xy[:, 1]
+        expected_y = sin_a * base_xy[:, 0] + cos_a * base_xy[:, 1]
+        np.testing.assert_allclose(pts[:, 0], expected_x, atol=1e-3)
+        np.testing.assert_allclose(pts[:, 1], expected_y, atol=1e-3)
+        np.testing.assert_allclose(pts[:, 2], base_z, atol=1e-3)
+
+
+def test_orbit_tracks_rotate_eci_view_skips_earth_rotation(
+    monkeypatch: pytest.MonkeyPatch,
+    qapp: QtWidgets.QApplication,
+) -> None:
+    """ECI view: rings only precess by RAAN drift; Earth rotation is zero."""
+    del qapp
+    _stub_scene_assets(monkeypatch)
+    viewer = _make_viewer(state_provider=_tiny_state)
+    viewer._current_frame_set = _manual_frame_set()
+    viewer._applied_frame_view_mode = "ECI"
+    viewer._current_frame_index = 0
+    viewer._build_orbit_tracks()
+
+    n_rings = viewer._orbit_track_base_xy.shape[0]
+    viewer._orbit_track_drift_arr = np.zeros((n_rings,), dtype=np.float64)
+    viewer._orbit_track_t0_offset_s = 0.0
+
+    # With drift=0 and ECI mode, the rotation angle should be zero →
+    # xy output equals base xy regardless of supplied earth_angle_deg.
+    viewer._rotate_orbit_tracks(earth_angle_deg=45.0, offset_s=5.0)
+    for idx, pd in enumerate(viewer._orbit_track_polydatas):
+        pts = np.asarray(pd.points)
+        np.testing.assert_allclose(pts[:, 0], viewer._orbit_track_base_xy[idx, :, 0], atol=1e-3)
+        np.testing.assert_allclose(pts[:, 1], viewer._orbit_track_base_xy[idx, :, 1], atol=1e-3)
 
 
 def test_fast_vs_detailed_mesh_assets_differ() -> None:
@@ -5344,7 +5487,17 @@ def test_uemr_forces_hidden_defaults(
     monkeypatch: pytest.MonkeyPatch,
     qapp: QtWidgets.QApplication,
 ) -> None:
-    """Enabling UEMR must set basis=per_mhz, variation=fixed, cutoff_basis=service_bandwidth, cutoff=100%."""
+    """Enabling UEMR must pin the hidden defaults so the integration
+    window coincides with the service band.
+
+    The kernel builds the integration window as ``[center ± cutoff]``
+    with ``cutoff = cutoff_span × percent / 100``. When ``cutoff_basis``
+    is ``service_bandwidth`` (so ``cutoff_span = service_bandwidth``),
+    ``percent = 50`` yields ``cutoff = 0.5 × service_bandwidth`` and
+    therefore ``2 × cutoff = service_bandwidth`` — i.e. the integration
+    window exactly spans the service band edges, which is the intended
+    UEMR baseline.
+    """
     _stub_scene_assets(monkeypatch)
     window = sgui.ScepterMainWindow()
     window._set_all_antenna_defaults()
@@ -5355,7 +5508,292 @@ def test_uemr_forces_hidden_defaults(
     assert str(window.service_power_basis_combo.currentData()) == "per_mhz"
     assert str(window.service_power_variation_combo.currentData()) == "fixed"
     assert str(window.spectrum_cutoff_basis_combo.currentData()) == "service_bandwidth"
-    assert float(window.spectrum_cutoff_percent_edit.value_or_none() or 0) == 100.0
+    assert float(window.spectrum_cutoff_percent_edit.value_or_none() or 0) == 50.0
+    # "flat" is the UEMR *baseline* mask preset — it should be picked
+    # automatically when no preset is selected yet.
+    assert str(window.spectrum_mask_preset_combo.currentData()) == "flat"
+    window._dirty = False; window.close()
+
+
+def test_uemr_set_spectrum_defaults_resets_mask_to_flat(
+    monkeypatch: pytest.MonkeyPatch,
+    qapp: QtWidgets.QApplication,
+) -> None:
+    """In UEMR mode, "Set Spectrum Defaults" must write ``flat`` for the
+    transmit mask — the directive default preset has no physical
+    meaning for isotropic circuitry leakage. The auto-pick on
+    UEMR entry only fires when no preset is set; the defaults
+    button is the user's explicit "reset to baseline" request and
+    must always land on ``flat`` regardless of the previous
+    selection.
+    """
+    _stub_scene_assets(monkeypatch)
+    window = sgui.ScepterMainWindow()
+    window._set_all_antenna_defaults()
+    idx_iso = window.antenna_model_combo.findData(sgui._ANTENNA_MODEL_ISOTROPIC)
+    window.antenna_model_combo.setCurrentIndex(idx_iso)
+    window.isotropic_uemr_checkbox.setChecked(True)
+    qapp.processEvents()
+
+    # Switch to "custom" to simulate a deviation from the baseline.
+    idx_custom = window.spectrum_mask_preset_combo.findData("custom")
+    window.spectrum_mask_preset_combo.setCurrentIndex(idx_custom)
+    qapp.processEvents()
+    assert str(window.spectrum_mask_preset_combo.currentData()) == "custom"
+
+    # Clicking the defaults button must snap the mask back to flat.
+    window._set_spectrum_defaults()
+    qapp.processEvents()
+    assert str(window.spectrum_mask_preset_combo.currentData()) == "flat"
+    window._dirty = False; window.close()
+
+
+def test_uemr_edit_tx_mask_uses_service_band_width(
+    monkeypatch: pytest.MonkeyPatch,
+    qapp: QtWidgets.QApplication,
+) -> None:
+    """In UEMR mode the Edit Tx Mask dialog must anchor its in-band
+    points at the service-band edges, not at ``service.bandwidth_mhz``.
+
+    The spectral integration window in UEMR is exactly the service
+    band (cutoff_basis=service_bandwidth at 50%, giving
+    ``[center ± 0.5·service_bw]``). The mask editor's half-width
+    parameter must match so the 0-dB anchors stay at ±service_bw/2
+    and attenuation points the user adds are meaningful relative
+    to the same band the kernel integrates over.
+    """
+    _stub_scene_assets(monkeypatch)
+    captured: dict[str, float] = {}
+
+    def _fake_dialog_ctor(*, channel_bandwidth_mhz: float, **_kwargs: object):
+        captured["channel_bandwidth_mhz"] = float(channel_bandwidth_mhz)
+        class _Rejected:
+            def exec(self_inner) -> int:
+                return int(QtWidgets.QDialog.Rejected)
+            def selected_points(self_inner):
+                return []
+        return _Rejected()
+
+    monkeypatch.setattr(sgui, "SpectrumMaskEditorDialog", _fake_dialog_ctor)
+
+    window = sgui.ScepterMainWindow()
+    window._set_all_antenna_defaults()
+    idx_iso = window.antenna_model_combo.findData(sgui._ANTENNA_MODEL_ISOTROPIC)
+    window.antenna_model_combo.setCurrentIndex(idx_iso)
+    window.isotropic_uemr_checkbox.setChecked(True)
+    # Configure a distinctive service band so we can verify the
+    # editor received service_stop - service_start, not the (UEMR-
+    # ignored) channel bandwidth.
+    window.spectrum_service_band_start_edit.set_value(2620.0)
+    window.spectrum_service_band_stop_edit.set_value(2690.0)
+    qapp.processEvents()
+
+    window._edit_custom_mask_points()
+    assert "channel_bandwidth_mhz" in captured, "dialog factory was not called"
+    assert abs(captured["channel_bandwidth_mhz"] - 70.0) < 1e-6, (
+        f"UEMR mask editor should use the 70 MHz service-band width, "
+        f"got {captured['channel_bandwidth_mhz']!r}"
+    )
+    window._dirty = False; window.close()
+
+
+def test_uemr_custom_mask_points_survive_runtime_normalisation(
+    monkeypatch: pytest.MonkeyPatch,
+    qapp: QtWidgets.QApplication,
+) -> None:
+    """Points the user drags outside the displayed in-band region must
+    reach the kernel intact.
+
+    The kernel's ``_normalize_direct_epfd_custom_mask_points`` drops
+    any offset that falls inside ±halfwidth. If the editor displays
+    the mask relative to one half-width but the kernel later
+    interprets the same offsets relative to a different half-width,
+    user-placed attenuation points that were clearly *outside* the
+    displayed in-band region could be silently pruned. This test
+    picks offsets just outside ±35 MHz (the 70 MHz service band)
+    and asserts both survive the full-path normaliser.
+    """
+    from scepter import scenario
+
+    _stub_scene_assets(monkeypatch)
+    window = sgui.ScepterMainWindow()
+    window._set_all_antenna_defaults()
+    idx_iso = window.antenna_model_combo.findData(sgui._ANTENNA_MODEL_ISOTROPIC)
+    window.antenna_model_combo.setCurrentIndex(idx_iso)
+    window.isotropic_uemr_checkbox.setChecked(True)
+    window.spectrum_service_band_start_edit.set_value(2620.0)
+    window.spectrum_service_band_stop_edit.set_value(2690.0)
+    qapp.processEvents()
+    window._apply_uemr_forced_defaults()
+    qapp.processEvents()
+
+    user_points = [(-40.0, 12.0), (45.0, 20.0)]
+    window._spectrum_custom_mask_points = [list(p) for p in user_points]
+    window._set_combo_to_data(window.spectrum_mask_preset_combo, "custom")
+    qapp.processEvents()
+
+    svc_cfg = window.current_state().active_system().service
+    spectrum_cfg = window.current_state().active_system().spectrum
+    plan = sgui._normalize_spectrum_config(svc_cfg, spectrum_cfg, None)
+    points = scenario._resolve_direct_epfd_mask_points_mhz(
+        preset="custom",
+        channel_bandwidth_mhz=float(plan["channel_bandwidth_mhz"]),
+        custom_mask_points=plan.get("custom_mask_points"),
+    )
+    atts = dict((float(pt[0]), float(pt[1])) for pt in points.tolist())
+    for offset, atten in user_points:
+        assert offset in atts, (
+            f"User point at {offset} MHz was dropped by the runtime mask "
+            f"normaliser. Surviving offsets: {sorted(atts)}"
+        )
+        assert abs(atts[offset] - atten) < 1e-9
+    window._dirty = False; window.close()
+
+
+def test_uemr_mask_editor_and_runtime_agree_on_halfwidth(
+    monkeypatch: pytest.MonkeyPatch,
+    qapp: QtWidgets.QApplication,
+) -> None:
+    """End-to-end consistency guard.
+
+    In UEMR mode the kernel's in-band half-width is derived from
+    ``service.bandwidth_mhz``, which the UEMR forced-defaults path
+    auto-syncs to the service-band width. The mask editor must use
+    the *same* half-width so that attenuation points the user drags
+    aren't silently dropped by ``_normalize_direct_epfd_custom_mask_points``
+    (which discards any offset inside ±halfwidth in favour of the
+    fixed 0 dB anchors).
+
+    This test drives the full GUI path: enter service band, let
+    UEMR forced-defaults fire, pull the resulting config, and
+    confirm all three values match:
+      1. The auto-derived ``service.bandwidth_mhz``.
+      2. What the mask editor dialog would be seeded with.
+      3. What the runtime normaliser resolves as ``channel_bandwidth_mhz``.
+    """
+    _stub_scene_assets(monkeypatch)
+    captured: dict[str, float] = {}
+
+    def _fake_dialog_ctor(*, channel_bandwidth_mhz: float, **_kwargs: object):
+        captured["channel_bandwidth_mhz"] = float(channel_bandwidth_mhz)
+        class _Rejected:
+            def exec(self_inner) -> int:
+                return int(QtWidgets.QDialog.Rejected)
+            def selected_points(self_inner):
+                return []
+        return _Rejected()
+
+    monkeypatch.setattr(sgui, "SpectrumMaskEditorDialog", _fake_dialog_ctor)
+
+    window = sgui.ScepterMainWindow()
+    window._set_all_antenna_defaults()
+    idx_iso = window.antenna_model_combo.findData(sgui._ANTENNA_MODEL_ISOTROPIC)
+    window.antenna_model_combo.setCurrentIndex(idx_iso)
+    window.isotropic_uemr_checkbox.setChecked(True)
+    window.spectrum_service_band_start_edit.set_value(2620.0)
+    window.spectrum_service_band_stop_edit.set_value(2690.0)
+    qapp.processEvents()
+    # Make sure UEMR forced defaults have had a chance to fire.
+    window._apply_uemr_forced_defaults()
+    qapp.processEvents()
+
+    expected_width_mhz = 70.0
+
+    # (1) UEMR forced-default path must have written the service-band
+    # width into the Service-tab channel bandwidth field.
+    svc_cfg = window.current_state().active_system().service
+    assert svc_cfg.bandwidth_mhz is not None
+    assert abs(float(svc_cfg.bandwidth_mhz) - expected_width_mhz) < 1e-6
+
+    # (2) Mask editor must be seeded with the same value.
+    window._edit_custom_mask_points()
+    assert abs(captured["channel_bandwidth_mhz"] - expected_width_mhz) < 1e-6
+
+    # (3) Runtime normalisation path must consume the same value: the
+    # spectrum-plan resolver uses ``channel_bandwidth_mhz`` both to
+    # derive ``integration_cutoff_mhz`` (the 2*cutoff kernel window)
+    # and to set ``band_halfwidth_mhz`` for custom mask normalisation.
+    # Build a normalised plan and confirm the stored channel bandwidth.
+    spectrum_cfg = window.current_state().active_system().spectrum
+    ras_cfg = window.current_state().ras_antenna  # RasAntennaConfig
+    # Use the public helper the GUI itself calls for this.
+    plan = sgui._normalize_spectrum_config(svc_cfg, spectrum_cfg, None)
+    assert plan is not None
+    assert abs(float(plan["channel_bandwidth_mhz"]) - expected_width_mhz) < 1e-6
+    # And the cutoff is the service-band edges (2 * cutoff = bandwidth
+    # because cutoff_basis=service_bandwidth at 50%).
+    assert abs(
+        2.0 * float(plan["spectral_integration_cutoff_mhz"]) - expected_width_mhz
+    ) < 1e-6
+    window._dirty = False; window.close()
+
+
+def test_directive_edit_tx_mask_uses_channel_bandwidth(
+    monkeypatch: pytest.MonkeyPatch,
+    qapp: QtWidgets.QApplication,
+) -> None:
+    """Non-UEMR systems must still pass the Service-tab channel
+    bandwidth to the mask editor — that's the correct in-band width
+    for directive modes where every active channel has a well-defined
+    channel_bandwidth."""
+    _stub_scene_assets(monkeypatch)
+    captured: dict[str, float] = {}
+
+    def _fake_dialog_ctor(*, channel_bandwidth_mhz: float, **_kwargs: object):
+        captured["channel_bandwidth_mhz"] = float(channel_bandwidth_mhz)
+        class _Rejected:
+            def exec(self_inner) -> int:
+                return int(QtWidgets.QDialog.Rejected)
+            def selected_points(self_inner):
+                return []
+        return _Rejected()
+
+    monkeypatch.setattr(sgui, "SpectrumMaskEditorDialog", _fake_dialog_ctor)
+
+    window = sgui.ScepterMainWindow()
+    window._set_all_antenna_defaults()
+    # Stay in a directive antenna model (no UEMR).
+    window.service_bandwidth_edit.set_value(250.0)
+    qapp.processEvents()
+
+    window._edit_custom_mask_points()
+    assert "channel_bandwidth_mhz" in captured
+    assert abs(captured["channel_bandwidth_mhz"] - 250.0) < 1e-6
+    window._dirty = False; window.close()
+
+
+def test_uemr_preserves_user_mask_preset_choice(
+    monkeypatch: pytest.MonkeyPatch,
+    qapp: QtWidgets.QApplication,
+) -> None:
+    """UEMR defaults the transmit mask to ``flat`` but must not override
+    an explicit user choice. Once the operator picks another preset
+    (e.g. ``custom`` for a vendor-specific roll-off) the wizard's
+    UEMR-gating pass must keep that value across subsequent
+    re-applies triggered by unrelated control changes.
+    """
+    _stub_scene_assets(monkeypatch)
+    window = sgui.ScepterMainWindow()
+    window._set_all_antenna_defaults()
+    idx_iso = window.antenna_model_combo.findData(sgui._ANTENNA_MODEL_ISOTROPIC)
+    window.antenna_model_combo.setCurrentIndex(idx_iso)
+    window.isotropic_uemr_checkbox.setChecked(True)
+    qapp.processEvents()
+    assert str(window.spectrum_mask_preset_combo.currentData()) == "flat"
+
+    # Operator switches to "custom".
+    idx_custom = window.spectrum_mask_preset_combo.findData("custom")
+    assert idx_custom >= 0, "custom preset must exist"
+    window.spectrum_mask_preset_combo.setCurrentIndex(idx_custom)
+    qapp.processEvents()
+    assert str(window.spectrum_mask_preset_combo.currentData()) == "custom"
+
+    # Trigger the UEMR gating pass again (re-applying the antenna
+    # model is one of several paths that runs it). The user's
+    # "custom" choice must survive.
+    window._apply_uemr_mode_gating(uemr_active=True)
+    qapp.processEvents()
+    assert str(window.spectrum_mask_preset_combo.currentData()) == "custom"
     window._dirty = False; window.close()
 
 
@@ -11518,8 +11956,8 @@ def test_help_menu_and_about_text_expose_v0111(
     menu_titles = [action.text() for action in window.menuBar().actions()]
     assert "&Help" in menu_titles
     assert window.action_about.text() == "About SCEPTer"
-    assert "v0.25.1" in window._about_dialog_text()
-    assert "v0.25.1" in window.windowTitle().lower()
+    assert "v0.25.2" in window._about_dialog_text()
+    assert "v0.25.2" in window.windowTitle().lower()
     window._dirty = False; window.close()
 
 
@@ -12106,9 +12544,12 @@ def test_uemr_set_defaults_buttons_do_not_touch_hidden_fields(
     assert sp.reuse_factor == 1
     assert sp.ras_anchor_reuse_slot == 0
     # Cutoff stays at UEMR-forced full service band (not the directive
-    # default of channel_bandwidth basis).
+    # default of channel_bandwidth basis). See
+    # ``test_uemr_forces_hidden_defaults`` for why ``percent == 50``
+    # is what "integration window equals the service band" encodes
+    # under the kernel's half-width cutoff formula.
     assert sp.spectral_integration_cutoff_basis == "service_bandwidth"
-    assert float(sp.spectral_integration_cutoff_percent) == 100.0
+    assert float(sp.spectral_integration_cutoff_percent) == 50.0
     window._dirty = False; window.close()
 
 

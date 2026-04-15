@@ -8,7 +8,7 @@ A brief description of the package.
 """
 
 __doc__ = "SCEPTer, Simulating Constellation Emission Patterns for Telescopes"
-__version__ = "0.25.1"
+__version__ = "0.25.2"
 
 # On Windows, conda environments require Library/bin on PATH for DLL
 # loading (BLAS, CUDA, OpenSSL, etc.).  Fix this before any C-extension

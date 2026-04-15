@@ -9125,9 +9125,16 @@ def _combine_multi_system_power_results_device(
     if not valid_results:
         return None
     if len(valid_results) == 1:
-        single = dict(valid_results[0])
-        single.pop("_spatially_uniform", None)
-        return single
+        single = valid_results[0]
+        # Only allocate a fresh dict when we actually have to strip the
+        # ``_spatially_uniform`` marker — otherwise return the original
+        # object so callers can rely on identity for the single-system
+        # fast path.
+        if "_spatially_uniform" not in single:
+            return single
+        stripped = dict(single)
+        stripped.pop("_spatially_uniform", None)
+        return stripped
 
     # Start from a copy of the first system's result
     combined = dict(valid_results[0])

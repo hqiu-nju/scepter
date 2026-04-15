@@ -30,6 +30,17 @@ from scepter.scepter_GUI import (
 from scepter import earthgrid, postprocess_recipes
 
 
+@pytest.fixture(scope="module")
+def qapp():
+    """Shared QApplication — any BeltTableModel / QtGui operation below
+    needs a live application instance even for headless use."""
+    from PySide6 import QtWidgets
+    app = QtWidgets.QApplication.instance()
+    if app is None:
+        app = QtWidgets.QApplication([])
+    return app
+
+
 # ──────────────────────────────────────────────────────────────
 #  Bandwidth label formatting helpers
 # ──────────────────────────────────────────────────────────────
@@ -543,3 +554,293 @@ class TestRenderRecipeSystemFilter:
         # by checking the function adds the key
         import types
         assert "systems" in {"systems", "attrs", "const", "iter"}  # key exists in schema
+
+
+class TestBuildConstellationFromStateStartTime:
+    """``build_constellation_from_state`` now threads a ``start_time`` kwarg."""
+
+    def _state_with_one_belt(self):
+        belt = BeltConfig(
+            belt_name="WizardEpochBelt",
+            num_sats_per_plane=1,
+            plane_count=1,
+            altitude_km=525.0,
+            eccentricity=0.0,
+            inclination_deg=53.0,
+            argp_deg=0.0,
+            raan_min_deg=0.0,
+            raan_max_deg=180.0,
+            min_elevation_deg=20.0,
+            adjacent_plane_offset=False,
+        )
+        return ScepterProjectState(systems=[SatelliteSystemConfig(belts=[belt])])
+
+    def _parse_epoch_yyddd(self, line1: str) -> tuple[int, float]:
+        return int(line1[18:20]), float(line1[20:32])
+
+    def test_forwards_datetime_to_tle_epoch(self):
+        from datetime import datetime
+        from scepter import tleforger
+        from scepter.scepter_GUI import build_constellation_from_state
+
+        tleforger.reset_tle_counter()
+        state = self._state_with_one_belt()
+        constellation = build_constellation_from_state(
+            state, start_time=datetime(2026, 4, 15, 0, 0, 0),
+        )
+        year_short, doy = self._parse_epoch_yyddd(
+            constellation["tle_list"][0].tle_strings()[1]
+        )
+        assert year_short == 26
+        # 2026-04-15 (non-leap) → DOY 105
+        assert abs(doy - 105.0) < 1e-6
+
+    def test_default_still_2025_01_01(self):
+        """Omitting ``start_time`` keeps the legacy default for backward compat."""
+        from scepter import tleforger
+        from scepter.scepter_GUI import build_constellation_from_state
+
+        tleforger.reset_tle_counter()
+        state = self._state_with_one_belt()
+        constellation = build_constellation_from_state(state)
+        year_short, doy = self._parse_epoch_yyddd(
+            constellation["tle_list"][0].tle_strings()[1]
+        )
+        assert year_short == 25
+        assert abs(doy - 1.0) < 1e-6
+
+
+class TestBeltTableModelShowColumn:
+    """The "Show" column renders an eye glyph per row and flips on toggle."""
+
+    def _two_row_model(self):
+        belts = [
+            BeltConfig(
+                belt_name="Visible",
+                num_sats_per_plane=1, plane_count=1,
+                altitude_km=525.0, eccentricity=0.0,
+                inclination_deg=53.0, argp_deg=0.0,
+                raan_min_deg=0.0, raan_max_deg=180.0,
+                min_elevation_deg=20.0, adjacent_plane_offset=False,
+            ),
+            BeltConfig(
+                belt_name="Hidden",
+                num_sats_per_plane=1, plane_count=1,
+                altitude_km=600.0, eccentricity=0.0,
+                inclination_deg=60.0, argp_deg=0.0,
+                raan_min_deg=0.0, raan_max_deg=180.0,
+                min_elevation_deg=20.0, adjacent_plane_offset=False,
+            ),
+        ]
+        return BeltTableModel(belts)
+
+    def _show_idx(self, model, row: int):
+        return model.index(row, BeltTableModel._SHOW_COLUMN_INDEX)
+
+    def test_show_column_is_first_and_non_editable(self, qapp):
+        del qapp
+        from PySide6 import QtCore
+        model = self._two_row_model()
+        assert BeltTableModel._SHOW_COLUMN_INDEX == 0
+        flags = model.flags(self._show_idx(model, 0))
+        assert flags & QtCore.Qt.ItemIsEnabled
+        assert flags & QtCore.Qt.ItemIsSelectable
+        assert not (flags & QtCore.Qt.ItemIsEditable)
+
+    def test_show_glyph_reflects_visibility(self, qapp):
+        del qapp
+        from PySide6 import QtCore
+        model = self._two_row_model()
+        # All rows start visible.
+        for row in range(model.rowCount()):
+            assert model.data(self._show_idx(model, row), QtCore.Qt.DisplayRole) == \
+                BeltTableModel._SHOW_GLYPH_VISIBLE
+        model.set_hidden_rows({1})
+        assert model.data(self._show_idx(model, 0), QtCore.Qt.DisplayRole) == \
+            BeltTableModel._SHOW_GLYPH_VISIBLE
+        assert model.data(self._show_idx(model, 1), QtCore.Qt.DisplayRole) == \
+            BeltTableModel._SHOW_GLYPH_HIDDEN
+
+    def test_show_column_tooltip_reflects_state(self, qapp):
+        del qapp
+        from PySide6 import QtCore
+        model = self._two_row_model()
+        visible_tip = str(model.data(self._show_idx(model, 0), QtCore.Qt.ToolTipRole))
+        assert "visible" in visible_tip.lower()
+        assert "hide" in visible_tip.lower()
+        model.set_hidden_rows({0})
+        hidden_tip = str(model.data(self._show_idx(model, 0), QtCore.Qt.ToolTipRole))
+        assert "hidden" in hidden_tip.lower()
+        assert "show" in hidden_tip.lower()
+
+    def test_data_columns_do_not_carry_visibility_decoration(self, qapp):
+        """Data columns (Name, S/P, …) are unstyled regardless of visibility."""
+        del qapp
+        from PySide6 import QtCore
+        model = self._two_row_model()
+        model.set_hidden_rows({1})
+        # ``Name`` column (index 1 now that Show is at 0).
+        name_idx = model.index(1, 1)
+        assert model.data(name_idx, QtCore.Qt.FontRole) is None
+        assert model.data(name_idx, QtCore.Qt.ForegroundRole) is None
+
+    def test_set_hidden_rows_emits_dataChanged_for_show_column_only(self, qapp):
+        del qapp
+        from PySide6 import QtCore
+        model = self._two_row_model()
+
+        signals: list[tuple[int, int, int, int]] = []
+        def _capture(top_left, bottom_right, _roles):
+            signals.append((
+                top_left.row(), top_left.column(),
+                bottom_right.row(), bottom_right.column(),
+            ))
+        model.dataChanged.connect(_capture)
+
+        model.set_hidden_rows({0})
+        assert signals == [(0, 0, 0, 0)]  # just the Show cell on row 0
+
+        signals.clear()
+        # No-op → no signal.
+        model.set_hidden_rows({0})
+        assert signals == []
+
+        signals.clear()
+        model.set_hidden_rows({1})
+        assert sorted(signals) == [(0, 0, 0, 0), (1, 0, 1, 0)]
+
+    def test_out_of_range_hidden_indices_are_ignored(self, qapp):
+        del qapp
+        from PySide6 import QtCore
+        model = self._two_row_model()
+        model.set_hidden_rows({5, 99, 1})
+        assert model.data(self._show_idx(model, 0), QtCore.Qt.DisplayRole) == \
+            BeltTableModel._SHOW_GLYPH_VISIBLE
+        assert model.data(self._show_idx(model, 1), QtCore.Qt.DisplayRole) == \
+            BeltTableModel._SHOW_GLYPH_HIDDEN
+
+    def test_set_data_on_show_column_is_noop(self, qapp):
+        """Visibility is owned by the wizard; setData on the Show column is a no-op."""
+        del qapp
+        from PySide6 import QtCore
+        model = self._two_row_model()
+        idx = self._show_idx(model, 0)
+        assert model.setData(idx, "anything", QtCore.Qt.EditRole) is False
+        # State unchanged.
+        assert model.data(idx, QtCore.Qt.DisplayRole) == \
+            BeltTableModel._SHOW_GLYPH_VISIBLE
+
+
+class TestWizardVisibilityDoesNotRebuild:
+    """Eye-click visibility toggles must not trigger a preview rebuild.
+
+    The classifier used by the wizard's ``dataChanged`` slot is a pure
+    function of the signal's ``QModelIndex`` args, so we can test it
+    without constructing a full wizard + viewer stack.
+    """
+
+    def _two_row_model(self):
+        belts = [
+            BeltConfig(
+                belt_name="A",
+                num_sats_per_plane=1, plane_count=1,
+                altitude_km=525.0, eccentricity=0.0,
+                inclination_deg=53.0, argp_deg=0.0,
+                raan_min_deg=0.0, raan_max_deg=180.0,
+                min_elevation_deg=20.0, adjacent_plane_offset=False,
+            ),
+            BeltConfig(
+                belt_name="B",
+                num_sats_per_plane=1, plane_count=1,
+                altitude_km=600.0, eccentricity=0.0,
+                inclination_deg=60.0, argp_deg=0.0,
+                raan_min_deg=0.0, raan_max_deg=180.0,
+                min_elevation_deg=20.0, adjacent_plane_offset=False,
+            ),
+        ]
+        return BeltTableModel(belts)
+
+    def test_show_column_toggle_classified_as_visibility_only(self, qapp):
+        del qapp
+        model = self._two_row_model()
+        show_col = BeltTableModel._SHOW_COLUMN_INDEX
+        top_left = model.index(0, show_col)
+        bottom_right = model.index(0, show_col)
+        assert ConstellationWizardDialog._is_visibility_only_data_change(
+            (top_left, bottom_right, [])
+        )
+
+    def test_data_column_edit_is_not_visibility_only(self, qapp):
+        """Editing a belt parameter must be classified as a real change."""
+        del qapp
+        model = self._two_row_model()
+        # Name column lives at index 1 after the Show column.
+        name_col = 1
+        top_left = model.index(0, name_col)
+        bottom_right = model.index(0, name_col)
+        assert not ConstellationWizardDialog._is_visibility_only_data_change(
+            (top_left, bottom_right, [])
+        )
+
+    def test_multi_column_range_is_not_visibility_only(self, qapp):
+        """A range that crosses into data columns must not be classified as visibility-only."""
+        del qapp
+        model = self._two_row_model()
+        show_col = BeltTableModel._SHOW_COLUMN_INDEX
+        top_left = model.index(0, show_col)
+        bottom_right = model.index(0, show_col + 2)
+        assert not ConstellationWizardDialog._is_visibility_only_data_change(
+            (top_left, bottom_right, [])
+        )
+
+    def test_empty_args_is_not_visibility_only(self, qapp):
+        """rowsInserted/rowsRemoved shouldn't slip through as visibility-only."""
+        del qapp
+        assert not ConstellationWizardDialog._is_visibility_only_data_change(())
+        assert not ConstellationWizardDialog._is_visibility_only_data_change(
+            (None, None)
+        )
+
+
+class TestUtcDatetimeHelperRoundtrip:
+    """Wizard relies on ``_utc_datetime_to_qdatetime`` to avoid local-time aliasing."""
+
+    def test_tz_aware_datetime_roundtrips_to_same_utc_instant(self, qapp):
+        """
+        Regression guard for the v0.25.2 wizard bug:
+        ``QtCore.QDateTime(tz_aware_datetime)`` interprets the instant in
+        local time and reading it back via ``toSecsSinceEpoch`` could
+        place ``end_utc`` before ``start_utc`` for users east of UTC.
+        ``_utc_datetime_to_qdatetime`` must preserve the UTC instant.
+        """
+        del qapp
+        from datetime import datetime, timezone
+        from scepter.scepter_GUI import (
+            _qdatetime_to_utc_datetime,
+            _utc_datetime_to_qdatetime,
+        )
+        original = datetime(2026, 4, 15, 10, 0, 0, tzinfo=timezone.utc)
+        qdt = _utc_datetime_to_qdatetime(original)
+        roundtrip = _qdatetime_to_utc_datetime(qdt)
+        assert roundtrip == original
+
+    def test_end_is_after_start_after_span_extension(self, qapp):
+        """
+        Simulates the wizard's span-extension path: start is tz-aware UTC,
+        end = start + timedelta. Writing end through the helper and
+        reading it back must leave end_utc > start_utc regardless of
+        the host machine's local timezone.
+        """
+        del qapp
+        from datetime import datetime, timedelta, timezone
+        from scepter.scepter_GUI import (
+            _qdatetime_to_utc_datetime,
+            _utc_datetime_to_qdatetime,
+        )
+        start = datetime(2026, 4, 15, 10, 0, 0, tzinfo=timezone.utc)
+        new_end = start + timedelta(seconds=1920)
+        start_qdt = _utc_datetime_to_qdatetime(start)
+        end_qdt = _utc_datetime_to_qdatetime(new_end)
+        start_utc = _qdatetime_to_utc_datetime(start_qdt)
+        end_utc = _qdatetime_to_utc_datetime(end_qdt)
+        assert end_utc > start_utc

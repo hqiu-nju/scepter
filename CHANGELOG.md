@@ -2,6 +2,198 @@
 
 All notable user-facing changes are summarized here at a high level.
 
+## v0.25.2
+
+### Attributions
+
+- **Third-party notices** — ``THIRD_PARTY_NOTICES.md`` now lists
+  ``vtk`` (BSD-3-Clause) explicitly as the 3D renderer underneath
+  ``pyvista`` / ``pyvistaqt``, and adds a new *SGP4 propagation —
+  algorithmic and implementation references* section with the
+  upstream author names, full paper titles, publication venues,
+  licence terms, upstream URLs (GitHub repos where applicable),
+  and a suggested citation block. Crediting both the analytical
+  model and the C/C++ reference implementations SCEPTer validates
+  against:
+    * **Hoots, F. R. & Roehrich, R. L. (December 1980).** *Models
+      for Propagation of NORAD Element Sets.* Project Spacetrack
+      Report No. 3, Aerospace Defense Command. Archival copy:
+      <https://celestrak.org/NORAD/documentation/spacetrk.pdf>.
+    * **Vallado, D. A., Crawford, P., Hujsak, R. & Kelso, T. S.
+      (2006, rev. 2012).** *Revisiting Spacetrack Report #3* —
+      AIAA 2006-6753. Reference code and errata:
+      <https://celestrak.org/publications/AIAA/2006-6753/>. The
+      SCEPTer GPU ``"vallado"`` backend is validated against this
+      reference.
+    * **Warner, Daniel J.** — SGP4 C++ library, Apache-2.0.
+      Upstream: <https://github.com/dnwrnr/sgp4>. Wrapped by
+      cysgp4 and used as the SCEPTer default propagation backend
+      (``method="dwarner"``).
+    * **Winkel, B.** — cysgp4 (GPL-3.0-or-later), Cython wrapper
+      around Warner's library. Upstream:
+      <https://github.com/bwinkel/cysgp4>.
+    * **Kelso, T. S.** — CelesTrak TLE/SGP4 reference code,
+      errata, and documentation archive:
+      <https://celestrak.org>.
+  The in-GUI *About SCEPTer* dialog (``scepter/appinfo.py``)
+  mirrors the same upstream URLs and licence tags so the
+  attribution is visible at runtime.
+
+### Tests
+
+- **UEMR defaults** — ``test_uemr_forces_hidden_defaults`` and
+  ``test_uemr_set_defaults_buttons_do_not_touch_hidden_fields`` were
+  asserting ``cutoff_percent == 100`` but the actual UEMR baseline
+  (integration window coincides with the service-band edges) is
+  encoded as ``50`` under the kernel's ``cutoff = span × percent /
+  100`` half-width formula. Tests updated to match the real,
+  correct semantic ("at service band edge"), with a comment
+  spelling out why ``50`` is the right number.
+- **New coverage**: tleforger ``start_time`` across all three forge
+  helpers (``datetime``, ``astropy.Time``, legacy fallback);
+  ``build_constellation_from_state`` forwarding; ``BeltTableModel``
+  hidden-row decoration (font, brush, tooltip, narrow
+  ``dataChanged`` emission, out-of-range pruning, default-empty
+  invariant); wizard UTC-datetime round-trip regression guard;
+  ``_interpolate_position_frames`` identity-of-``out`` buffer and
+  clamping edge cases; orbit-track vectorized-stack build + rotate
+  (GMST + drift fusion in ECEF, drift-only in ECI).
+
+### Bug fixes
+
+- **Constellation Wizard** — orbit-track rings no longer appear offset
+  from the satellite markers. Two independent fixes were applied:
+  1. The preview builder now forges TLEs with an epoch equal to
+     the preview start time instead of the hard-wired
+     ``2025-01-01T00:00:00 UTC`` default baked into ``tleforger``.
+     When the simulated instant was months past that fixed epoch,
+     SGP4's richer J2 model accumulated enough secular drift vs.
+     a first-order analytical approximation of the ring to show
+     a visible along-track offset.
+  2. Ring RAAN and inclination are now derived directly from the
+     SGP4-propagated angular momentum (r × v) of a representative
+     satellite in each plane, so even if the TLE epoch is far from
+     the display time (e.g., externally-supplied TLEs) the ring
+     still coincides with the actual orbital plane.
+- **Viewer** — per-frame ``Modified()`` calls now invalidate just
+  the points ``vtkDataArray`` (``polydata.GetPoints().Modified()``)
+  instead of the whole ``vtkPolyData``. The full-polydata bump
+  forced VTK to re-derive bounds, normals, and cell-array
+  bookkeeping every frame; the points-only bump still triggers
+  the GPU coordinate re-upload that the mapper actually needs but
+  reuses everything else. Applied to both the satellite-belt
+  glyph polydata and the orbit-ring polylines (vectorized
+  fast-path and per-ring fallback).
+- **Viewer** — render-window AA / smoothing toggles
+  (``SetMultiSamples(0)``, ``SetLineSmoothing(False)``,
+  ``SetPolygonSmoothing(False)``, ``SetPointSmoothing(False)``)
+  are now set explicitly so the wizard never silently inherits a
+  per-platform default that would burn fillrate without a visual
+  win at this scene scale.
+- **Viewer** — per-frame allocation removed from
+  ``_interpolate_position_frames``: the linear blend between two
+  bracketing frames is now done fully in-place
+  (``out = upper - lower; out *= frac; out += lower``) instead of
+  via a transient ``frac * upper`` array. For the typical
+  3 360-satellite preview that's ~40 KB / frame less GC pressure.
+- **Viewer** — ``_apply_scene_frame_transforms`` now skips the
+  three ``SetOrientation`` calls when the Earth-rotation angle
+  hasn't changed since the previous frame (always the case in
+  ECEF view, which holds the angle at 0). The cache is
+  invalidated on scene rebuild and on frame-mode change.
+- **Constellation Wizard** — orbit-ring rotation per playback frame
+  is now vectorized: rings are packed into a contiguous
+  ``(N_rings, P, 3)`` ECI stack at build time and each frame
+  computes one trig pair plus one broadcast multiply for *all*
+  rings instead of looping in Python and recomputing ``cos/sin``
+  per ring. Per-ring VTK polydata view buffers are cached too, so
+  the only per-ring work left in the playback path is a pair of
+  ``np.copyto`` writes and a ``Modified()`` flag flip. The static
+  z-component is now written exactly once instead of every frame.
+- **Constellation Wizard** — orbit rings now stay locked to satellites
+  for the entire animation, not just the initial frame. Each ring's
+  RAAN is now propagated forward in time using a per-plane secular
+  drift rate extracted from two SGP4 samples (start vs. end of the
+  preview window) rather than being held fixed at the build-time
+  RAAN. Combined with the build-time r × v initialisation this
+  matches SGP4's J2 precession exactly because both the offset and
+  the rate come from the same propagator.
+- **Constellation Wizard** — default real-time playback target raised
+  from 30 s to 120 s, so the initial 64× build covers ~2 h of
+  simulated time instead of 32 min and selecting 256× / 1024× from
+  the speed combo no longer triggers an immediate rebuild for a
+  longer span in the typical case.
+- **TLE forger** — ``forge_tle_constellation_from_belt_definitions``,
+  ``forge_tle_belt``, and ``forge_tle_single`` now all accept an
+  optional ``start_time`` parameter (astropy ``Time`` or Python
+  ``datetime``) that threads through to the TLE epoch. Default
+  handling has been unified: passing ``None`` (or omitting the
+  argument) falls back to ``2025-01-01T00:00:00 UTC`` so existing
+  callers are unaffected.
+- **UEMR mode** — "Edit Tx Mask" dialog now anchors its in-band
+  0-dB points at the **service-band edges** when UEMR is active,
+  not at the (UEMR-ignored) Service-tab channel bandwidth. The
+  kernel's integration window in UEMR is exactly the service band
+  (``cutoff_basis = service_bandwidth`` at 50%), so the mask
+  editor's half-width parameter must match — otherwise the fixed
+  anchors sit at the wrong offsets and any custom attenuation
+  points the user drags in end up relative to a band width the
+  kernel never uses. Non-UEMR (directive) systems still get the
+  Service-tab channel bandwidth, matching legacy behaviour.
+- **UEMR mode** — the transmit unwanted-emission-mask preset is no
+  longer forcibly reset to ``flat`` on every UEMR-gating pass.
+  ``flat`` is still the auto-selected baseline when no preset has
+  been chosen yet (matching the "no out-of-band suppression"
+  physical intuition for isotropic circuitry leakage), but an
+  explicit user choice — e.g. ``custom`` for a vendor-specific
+  roll-off, or any ITU template — is now preserved across
+  re-applies triggered by other control changes. "Set Spectrum
+  Defaults" in UEMR mode still writes ``flat`` regardless of the
+  current selection, so users always have a one-click path back
+  to the UEMR baseline.
+- **Constellation Wizard** — clicking the eye glyph no longer
+  triggers a preview rebuild. Previously *any* ``dataChanged``
+  from the belt model (including the visibility-only flip on the
+  "Show" column) kicked off the debounced ``_refresh_viewer``
+  path, which re-propagated all satellites with SGP4 — turning a
+  ~1 ms actor visibility toggle into a second-scale rebuild and
+  freezing any in-flight animation. The dataChanged handler now
+  classifies the signal: if the change range is confined to the
+  Show column it's treated as a render-only update and the
+  rebuild is skipped, while real edits (Alt / Planes /
+  Eccentricity / …) and row add/remove still rebuild as
+  expected.
+- **Constellation Wizard** — hidden belts are now marked by a
+  dedicated "Show" column at the start of the belt table that
+  renders an eye glyph per row (👁 open = visible, 👁⃠ slashed =
+  hidden). Clicking the eye directly toggles that belt's
+  visibility in the 3D preview — no need to select the row first
+  and press a button. The "Hide belt" button still works and
+  still flips between "Hide belt"/"Show belt" for the selected
+  row. The main-window belt table hides the Show column since it
+  has no per-row visibility toggle. Visibility also survives the
+  initial "stars → Earth → satellites" build sequence: the
+  wizard now pre-sizes the viewer's preview span to match its
+  default 64× playback speed before the first build, collapsing
+  the legacy "build → flash-rebuild" sequence into a single
+  build; the hidden-set is also re-applied on every
+  ``preview_build_completed`` as a belt-and-braces guard for
+  speed changes after the wizard is already open.
+- **Constellation Wizard** — play, reset, and speed-select controls
+  now use an expanding size policy with stretch factors instead of
+  fixed 32-px widths so their glyphs (▶ / ⏮) and the speed combo
+  are no longer truncated on narrow panels. "Hide belt" and "Show
+  all" share the remaining space with a larger stretch weight.
+- **Constellation Wizard** — fixed `ValueError: End UTC must be later
+  than Start UTC.` raised immediately on opening the wizard for users
+  whose system timezone differed from UTC. The auto-extend path in
+  `_on_wizard_speed_changed` constructed the `end_edit` `QDateTime`
+  directly from a tz-aware Python `datetime`, which Qt interpreted as
+  local time; reading the widget back via `toSecsSinceEpoch` then
+  yielded an instant earlier than start by the local UTC offset. The
+  widget is now written through the existing `_utc_datetime_to_qdatetime`
+  helper so the stored instant always matches the intended UTC time.
+
 ## v0.25.1
 
 ### UEMR (unwanted emissions) mode

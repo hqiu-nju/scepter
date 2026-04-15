@@ -27,7 +27,7 @@ import sys
 import tempfile
 import threading
 from time import perf_counter
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 import webbrowser
 import warnings
 
@@ -503,6 +503,7 @@ _TAB_LAYER_RULES: dict[str, str] = {
 }
 
 _BELT_COLUMN_HELP: tuple[str, ...] = (
+    "Belt visibility in the 3D preview. Click the eye to toggle.",
     "Short display name for the orbital belt. Duplicate names are auto-adjusted.",
     "Number of satellites placed in each orbital plane.",
     "Number of orbital planes in the belt.",
@@ -11850,8 +11851,18 @@ def _interpolate_position_frames(
     t0 = float(sample_times_s[lower_idx])
     t1 = float(sample_times_s[upper_idx])
     frac = np.float32((offset_s - t0) / max(t1 - t0, np.finfo(np.float32).tiny))
-    np.multiply(frame_values[lower_idx], np.float32(1.0) - frac, out=out, casting="unsafe")
-    out += frac * np.asarray(frame_values[upper_idx], dtype=np.float32)
+    # Allocation-free in-place blend:
+    #   out = upper - lower
+    #   out *= frac
+    #   out += lower
+    # Avoids the (S, 3) temporary that ``frac * frame_values[upper_idx]``
+    # used to allocate every frame (~40 KB per frame for 3 360 sats →
+    # ~2.4 MB/s of GC pressure at 60 fps).
+    lower = frame_values[lower_idx]
+    upper = frame_values[upper_idx]
+    np.subtract(upper, lower, out=out, casting="unsafe")
+    out *= frac
+    out += lower
     return out
 
 
@@ -12083,6 +12094,7 @@ def build_constellation_from_state(
     state: ScepterProjectState,
     *,
     all_systems: bool = False,
+    start_time: datetime | None = None,
 ) -> dict[str, Any]:
     """
     Forge a constellation from the current GUI state.
@@ -12109,14 +12121,16 @@ def build_constellation_from_state(
             raise ValueError("No belts are defined in any system.")
         tleforger.reset_tle_counter()
         return tleforger.forge_tle_constellation_from_belt_definitions(
-            [b.to_tleforger_dict() for b in all_belts]
+            [b.to_tleforger_dict() for b in all_belts],
+            start_time=start_time,
         )
     s0_belts = state.active_system().belts
     if len(s0_belts) < 1:
         raise ValueError("No belts are defined.")
     tleforger.reset_tle_counter()
     return tleforger.forge_tle_constellation_from_belt_definitions(
-        [b.to_tleforger_dict() for b in s0_belts]
+        [b.to_tleforger_dict() for b in s0_belts],
+        start_time=start_time,
     )
 
 
@@ -12497,7 +12511,9 @@ def build_preview_frames(
 
     _raise_if_cancelled("building constellation metadata")
     try:
-        constellation = build_constellation_from_state(state, all_systems=True)
+        constellation = build_constellation_from_state(
+            state, all_systems=True, start_time=start_utc,
+        )
     except Exception as exc:
         return PreviewFrameSet(
             times_utc=frame_times,
@@ -12594,7 +12610,15 @@ def build_preview_frames(
 class BeltTableModel(QtCore.QAbstractTableModel):
     """Editable Qt table model for GUI belt definitions."""
 
-    _columns: tuple[tuple[str, str, type[Any]], ...] = (
+    # ``attr_name is None`` marks a synthetic column that reads from
+    # the model's own state rather than a ``BeltConfig`` attribute —
+    # currently just the "Show" visibility indicator at index 0.
+    # Views that don't consume visibility state (the main-window
+    # belt table) can simply ``hideColumn(0)``.
+    _SHOW_COLUMN_INDEX: int = 0
+
+    _columns: tuple[tuple[str, str | None, type[Any] | None], ...] = (
+        ("Show", None, None),
         ("Name", "belt_name", str),
         ("S/P", "num_sats_per_plane", int),
         ("Planes", "plane_count", int),
@@ -12615,6 +12639,32 @@ class BeltTableModel(QtCore.QAbstractTableModel):
     ) -> None:
         super().__init__(parent)
         self._belts: list[BeltConfig] = list(belts) if belts is not None else []
+        self._hidden_rows: set[int] = set()
+
+    def set_hidden_rows(self, rows: Iterable[int]) -> None:
+        """Mark rows whose belts are hidden in an associated 3D view.
+
+        Each hidden row's "Show" column flips its eye glyph; the
+        data columns themselves are unchanged. Callers drive this
+        from their own visibility state (e.g. the wizard's
+        ``_hidden_belts`` set).
+        """
+        new_hidden = {int(r) for r in rows if 0 <= int(r) < len(self._belts)}
+        if new_hidden == self._hidden_rows:
+            return
+        affected = self._hidden_rows.symmetric_difference(new_hidden)
+        self._hidden_rows = new_hidden
+        for row in affected:
+            idx = self.index(row, self._SHOW_COLUMN_INDEX)
+            self.dataChanged.emit(
+                idx,
+                idx,
+                [
+                    QtCore.Qt.DisplayRole,
+                    QtCore.Qt.ForegroundRole,
+                    QtCore.Qt.ToolTipRole,
+                ],
+            )
 
     def rowCount(self, parent: QtCore.QModelIndex = QtCore.QModelIndex()) -> int:
         if parent.isValid():
@@ -12678,11 +12728,40 @@ class BeltTableModel(QtCore.QAbstractTableModel):
                 pass
         return None
 
+    # Glyphs used by the synthetic "Show" column — open eye when the
+    # belt is visible in the 3D preview, a slashed eye when it's
+    # hidden. ``U+1F441`` renders as a full-colour emoji on most
+    # platforms; the slashed variant falls back to a circle-slash
+    # overlay so it stays legible in monochrome fonts.
+    _SHOW_GLYPH_VISIBLE: str = "\U0001F441"  # 👁
+    _SHOW_GLYPH_HIDDEN: str = "\U0001F441\u20E0"  # 👁 with combining enclosing slash
+
     def data(self, index: QtCore.QModelIndex, role: int = QtCore.Qt.DisplayRole) -> Any:
         if not index.isValid():
             return None
-        belt = self._belts[index.row()]
-        _, attr_name, attr_type = self._columns[index.column()]
+        row = index.row()
+        col = index.column()
+        _, attr_name, attr_type = self._columns[col]
+
+        if col == self._SHOW_COLUMN_INDEX:
+            hidden = row in self._hidden_rows
+            if role == QtCore.Qt.DisplayRole:
+                return (
+                    self._SHOW_GLYPH_HIDDEN if hidden else self._SHOW_GLYPH_VISIBLE
+                )
+            if role == QtCore.Qt.TextAlignmentRole:
+                return int(QtCore.Qt.AlignCenter)
+            if role == QtCore.Qt.ForegroundRole and hidden:
+                return QtGui.QBrush(QtGui.QColor(160, 160, 160))
+            if role == QtCore.Qt.ToolTipRole:
+                return (
+                    "Belt is hidden in the 3D view — click to show."
+                    if hidden
+                    else "Belt is visible in the 3D view — click to hide."
+                )
+            return None
+
+        belt = self._belts[row]
         value = getattr(belt, attr_name)
         if attr_type is bool:
             if role == QtCore.Qt.CheckStateRole:
@@ -12713,12 +12792,18 @@ class BeltTableModel(QtCore.QAbstractTableModel):
     def flags(self, index: QtCore.QModelIndex) -> QtCore.Qt.ItemFlags:
         if not index.isValid():
             return QtCore.Qt.ItemIsEnabled
+        col = index.column()
+        if col == self._SHOW_COLUMN_INDEX:
+            # The "Show" column reflects visibility state owned by the
+            # wizard, not the ``BeltConfig`` — never editable, but stays
+            # Selectable so keyboard navigation feels natural.
+            return QtCore.Qt.ItemIsEnabled | QtCore.Qt.ItemIsSelectable
         base = (
             QtCore.Qt.ItemIsEnabled
             | QtCore.Qt.ItemIsSelectable
             | QtCore.Qt.ItemIsEditable
         )
-        if self._columns[index.column()][2] is bool:
+        if self._columns[col][2] is bool:
             base |= QtCore.Qt.ItemIsUserCheckable
         return base
 
@@ -12729,6 +12814,10 @@ class BeltTableModel(QtCore.QAbstractTableModel):
         role: int = QtCore.Qt.EditRole,
     ) -> bool:
         if not index.isValid():
+            return False
+        if index.column() == self._SHOW_COLUMN_INDEX:
+            # Visibility is owned by the wizard (not the belt config),
+            # so any setData call aimed at this column is a no-op.
             return False
         belt = self._belts[index.row()]
         _, attr_name, attr_type = self._columns[index.column()]
@@ -13419,6 +13508,30 @@ class ConstellationWizardDialog(QtWidgets.QDialog):
             viewer.preview_build_completed.connect(self._on_viewer_ready)
             self._viewer_host.addWidget(viewer)
             self._viewer = viewer
+            # Pre-size the preview span to match the wizard's default
+            # playback speed (64x) so the very first build already
+            # covers the animation window. Without this the viewer
+            # would build once at the stock 1800 s span, fire
+            # preview_build_completed, and then
+            # ``_on_wizard_speed_changed`` would extend end_utc and
+            # trigger an immediate second build — visible to the user
+            # as a flash where satellites, orbit rings, and any
+            # hidden-belt state disappear and reappear.
+            default_speed = 64.0
+            viewer_combo_idx = viewer.speed_combo.findData(default_speed)
+            if viewer_combo_idx >= 0:
+                viewer.speed_combo.setCurrentIndex(viewer_combo_idx)
+            else:
+                viewer._playback_multiplier = default_speed
+            needed_sim_s = default_speed * self._MIN_REALTIME_PLAYBACK_S
+            if viewer._preview_params.span_s < needed_sim_s:
+                new_end = viewer._preview_params.start_utc + timedelta(
+                    seconds=needed_sim_s
+                )
+                blocker = QtCore.QSignalBlocker(viewer.end_edit)
+                viewer.end_edit.setDateTime(_utc_datetime_to_qdatetime(new_end))
+                del blocker
+                viewer._preview_params.end_utc = new_end
         except Exception:
             self._loading_label.setText("3D viewer unavailable")
         splitter.addWidget(self._viewer_host)
@@ -13442,8 +13555,8 @@ class ConstellationWizardDialog(QtWidgets.QDialog):
         # Belt table
         self._belt_model = BeltTableModel(self._belts, parent=self)
         self._belt_model.dataChanged.connect(self._on_belt_data_changed)
-        self._belt_model.rowsInserted.connect(self._on_belt_data_changed)
-        self._belt_model.rowsRemoved.connect(self._on_belt_data_changed)
+        self._belt_model.rowsInserted.connect(self._on_belt_structure_changed)
+        self._belt_model.rowsRemoved.connect(self._on_belt_structure_changed)
         self._table = QtWidgets.QTableView(self)
         self._table.setModel(self._belt_model)
         self._table.setAlternatingRowColors(True)
@@ -13456,6 +13569,13 @@ class ConstellationWizardDialog(QtWidgets.QDialog):
         self._table.verticalHeader().setVisible(False)
         checkbox_delegate = BooleanCheckboxDelegate(self._table)
         self._table.setItemDelegateForColumn(len(BeltTableModel._columns) - 1, checkbox_delegate)
+        # Clicking the eye glyph in the "Show" column toggles the
+        # belt's visibility in the 3D preview without going through
+        # the Hide/Show-all buttons.
+        self._table.clicked.connect(self._on_table_cell_clicked)
+        # Larger font for the "Show" column so the eye emoji reads
+        # cleanly at table row heights.
+        self._table.setColumnWidth(BeltTableModel._SHOW_COLUMN_INDEX, 44)
         right_layout.addWidget(self._table, stretch=1)
         # Belt action buttons
         btn_row = QtWidgets.QHBoxLayout()
@@ -13491,30 +13611,48 @@ class ConstellationWizardDialog(QtWidgets.QDialog):
         # Playback controls
         playback_row = QtWidgets.QHBoxLayout()
         self._play_btn = QtWidgets.QPushButton("\u25b6", self)
-        self._play_btn.setFixedWidth(32)
+        self._play_btn.setMinimumWidth(48)
+        self._play_btn.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed
+        )
         self._play_btn.setToolTip("Play / Stop animation")
         self._play_btn.clicked.connect(self._toggle_play)
         self._reset_btn = QtWidgets.QPushButton("\u23ee", self)
-        self._reset_btn.setFixedWidth(32)
+        self._reset_btn.setMinimumWidth(48)
+        self._reset_btn.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed
+        )
         self._reset_btn.setToolTip("Reset to start")
         self._reset_btn.clicked.connect(self._reset_playback)
         self._speed_combo = QtWidgets.QComboBox(self)
         for value in (4.0, 16.0, 64.0, 256.0, 1024.0):
             self._speed_combo.addItem(f"{value:g}\u00d7", userData=float(value))
         self._speed_combo.setCurrentIndex(2)  # 64x default
+        self._speed_combo.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed
+        )
         self._speed_combo.currentIndexChanged.connect(self._on_wizard_speed_changed)
-        playback_row.addWidget(self._play_btn)
-        playback_row.addWidget(self._reset_btn)
-        playback_row.addWidget(self._speed_combo)
+        playback_row.addWidget(self._play_btn, stretch=1)
+        playback_row.addWidget(self._reset_btn, stretch=1)
+        playback_row.addWidget(self._speed_combo, stretch=1)
         # Belt visibility
         hide_btn = QtWidgets.QPushButton("Hide belt", self)
         hide_btn.setToolTip("Toggle selected belt visibility")
+        hide_btn.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed
+        )
         hide_btn.clicked.connect(self._toggle_belt_visibility)
+        self._hide_belt_btn = hide_btn
+        self._table.selectionModel().selectionChanged.connect(
+            lambda *_: self._refresh_hide_button_label()
+        )
         show_all_btn = QtWidgets.QPushButton("Show all", self)
+        show_all_btn.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed
+        )
         show_all_btn.clicked.connect(self._show_all_belts)
-        playback_row.addWidget(hide_btn)
-        playback_row.addWidget(show_all_btn)
-        playback_row.addStretch(1)
+        playback_row.addWidget(hide_btn, stretch=2)
+        playback_row.addWidget(show_all_btn, stretch=2)
         right_layout.addLayout(playback_row)
         # Summary
         self._summary_label = QtWidgets.QLabel("", self)
@@ -13591,6 +13729,12 @@ class ConstellationWizardDialog(QtWidgets.QDialog):
                 self._viewer.toggle_playback()
                 playing = self._viewer._timer.isActive()
                 self._play_btn.setText("\u25a0" if playing else "\u25b6")
+        # Every preview rebuild recreates the belt actors from scratch,
+        # so the hidden-set the user has chosen must be re-applied here;
+        # otherwise the freshly-built actors come up visible and the
+        # table indicator would lie.
+        if self._hidden_belts:
+            self._apply_belt_visibility()
 
     # --- Playback controls ---
     def _toggle_play(self) -> None:
@@ -13606,7 +13750,10 @@ class ConstellationWizardDialog(QtWidgets.QDialog):
         self._viewer.reset_playback()
         self._play_btn.setText("\u25b6")
 
-    _MIN_REALTIME_PLAYBACK_S = 30.0  # ensure at least 30s of wall-clock animation
+    _MIN_REALTIME_PLAYBACK_S = 120.0  # ensure at least 120s of wall-clock animation
+    # 4× the original 30 s baseline so the default 64× build already
+    # spans ~2 h of simulated time and switching to 256× / 1024×
+    # speeds doesn't trip an immediate rebuild for a longer span.
 
     def _on_wizard_speed_changed(self, *_args: object) -> None:
         if self._viewer is None:
@@ -13631,7 +13778,7 @@ class ConstellationWizardDialog(QtWidgets.QDialog):
             new_end = self._viewer._preview_params.start_utc + timedelta(seconds=needed_sim_s)
             # Update the widget so _current_preview_parameters() picks it up.
             blocker = QtCore.QSignalBlocker(self._viewer.end_edit)
-            self._viewer.end_edit.setDateTime(QtCore.QDateTime(new_end))
+            self._viewer.end_edit.setDateTime(_utc_datetime_to_qdatetime(new_end))
             del blocker
             self._viewer._preview_params.end_utc = new_end
             self._viewer.apply_preview_settings(force_frame_rebuild=True)
@@ -13641,18 +13788,49 @@ class ConstellationWizardDialog(QtWidgets.QDialog):
         rows = self._table.selectionModel().selectedRows()
         if not rows or self._viewer is None:
             return
-        idx = int(rows[0].row())
-        if idx in self._hidden_belts:
-            self._hidden_belts.discard(idx)
+        self._toggle_belt_row_visibility(int(rows[0].row()))
+
+    def _on_table_cell_clicked(self, index: QtCore.QModelIndex) -> None:
+        """Toggle belt visibility when the user clicks the "Show" column."""
+        if not index.isValid() or self._viewer is None:
+            return
+        if index.column() != BeltTableModel._SHOW_COLUMN_INDEX:
+            return
+        self._toggle_belt_row_visibility(int(index.row()))
+
+    def _toggle_belt_row_visibility(self, row: int) -> None:
+        if self._viewer is None or row < 0 or row >= self._belt_model.rowCount():
+            return
+        if row in self._hidden_belts:
+            self._hidden_belts.discard(row)
         else:
-            self._hidden_belts.add(idx)
+            self._hidden_belts.add(row)
         self._apply_belt_visibility()
+        self._refresh_hide_button_label()
 
     def _show_all_belts(self) -> None:
         self._hidden_belts.clear()
         self._apply_belt_visibility()
+        self._refresh_hide_button_label()
+
+    def _refresh_hide_button_label(self) -> None:
+        hide_btn = getattr(self, "_hide_belt_btn", None)
+        if hide_btn is None:
+            return
+        rows = self._table.selectionModel().selectedRows()
+        if rows and int(rows[0].row()) in self._hidden_belts:
+            hide_btn.setText("Show belt")
+        else:
+            hide_btn.setText("Hide belt")
 
     def _apply_belt_visibility(self) -> None:
+        # Reflect hidden state in the belt table (strikeout + muted text)
+        # even when the 3D viewer is unavailable so the indicator still
+        # tracks the user's intent.
+        try:
+            self._belt_model.set_hidden_rows(self._hidden_belts)
+        except Exception:
+            pass
         if self._viewer is None:
             return
         # Toggle satellite actors
@@ -13770,9 +13948,48 @@ class ConstellationWizardDialog(QtWidgets.QDialog):
         self._belt_model.replace_belts(belts)
         self._on_belt_data_changed()
 
-    def _on_belt_data_changed(self, *_args: object) -> None:
+    @staticmethod
+    def _is_visibility_only_data_change(args: tuple[object, ...]) -> bool:
+        """Classify a ``BeltTableModel.dataChanged`` payload.
+
+        Returns ``True`` when the signal reports a change confined to
+        the synthetic "Show" column. The wizard uses this to skip
+        the SGP4-propagation rebuild when all that flipped was the
+        eye glyph — the preview is unaffected.
+        """
+        return (
+            len(args) >= 2
+            and isinstance(args[0], QtCore.QModelIndex)
+            and isinstance(args[1], QtCore.QModelIndex)
+            and args[0].isValid()
+            and args[0].column() == BeltTableModel._SHOW_COLUMN_INDEX
+            and args[1].column() == BeltTableModel._SHOW_COLUMN_INDEX
+        )
+
+    def _on_belt_data_changed(self, *args: object) -> None:
+        """Route ``BeltTableModel.dataChanged`` to a rebuild or a no-op.
+
+        Toggling the "Show" column only flips a display glyph — the
+        satellite geometry is unchanged, so rebuilding the preview
+        would be a waste. Earlier revisions treated every
+        ``dataChanged`` as a reason to rebuild, which made the
+        eye-click feel like editing a belt parameter; the 3D actors
+        were already hidden/shown by ``_apply_belt_visibility`` in
+        the caller path.
+        """
+        if self._is_visibility_only_data_change(args):
+            return
+        self._on_belt_structure_changed()
+
+    def _on_belt_structure_changed(self, *_args: object) -> None:
+        """Belt geometry / count changed — rebuild the preview."""
         n = self._belt_model.rowCount()
         self._hidden_belts = {i for i in self._hidden_belts if i < n}
+        try:
+            self._belt_model.set_hidden_rows(self._hidden_belts)
+        except Exception:
+            pass
+        self._refresh_hide_button_label()
         self._update_summary()
         self._refresh_debounce.start()
         if self._preset_combo.currentIndex() != 0:
@@ -13894,6 +14111,7 @@ class ConstellationViewerWindow(QtWidgets.QMainWindow):
         self._applied_render_mode = _DEFAULT_RENDER_MODE
         self._applied_skybox_mode = _DEFAULT_SKYBOX_MODE
         self._applied_frame_view_mode = _DEFAULT_FRAME_VIEW_MODE
+        self._last_applied_scene_angle_deg: float | None = None
         self._pending_apply_request = False
         self._pending_force_frame_rebuild = False
         self._scene_status_note = ""
@@ -15107,6 +15325,22 @@ class ConstellationViewerWindow(QtWidgets.QMainWindow):
                 set_desired_update_rate(desired_update_rate)
             except Exception:
                 pass
+        # Force-disable expensive AA / smoothing paths. VTK's defaults
+        # vary by platform/build; making them explicit means the scene
+        # never silently picks up multisample / line-smoothing
+        # fillrate costs that aren't useful at this zoom level.
+        for setter, value in (
+            ("SetMultiSamples", 0),
+            ("SetLineSmoothing", False),
+            ("SetPolygonSmoothing", False),
+            ("SetPointSmoothing", False),
+        ):
+            fn = getattr(render_window, setter, None)
+            if callable(fn):
+                try:
+                    fn(value)
+                except Exception:
+                    pass
         # Disable depth peeling — all actors are opaque, saves GPU time
         renderer = getattr(self.plotter, "renderer", None)
         if renderer is not None:
@@ -15177,29 +15411,25 @@ class ConstellationViewerWindow(QtWidgets.QMainWindow):
         self._orbit_track_actors.clear()
         self._orbit_track_eci_points: list[np.ndarray] = []
         self._orbit_track_polydatas: list[pv.PolyData] = []
+        self._orbit_track_drift_rad_per_s: list[float] = []
+        self._orbit_track_t0_offset_s: float = 0.0
+        # Vectorized rotation workspace: (N_rings, P, 3) base ECI stack +
+        # writable views into each pd.points so the per-frame rotation
+        # is one batched numpy expression with no per-ring trig.
+        self._orbit_track_base_xy: np.ndarray | None = None
+        self._orbit_track_base_z: np.ndarray | None = None
+        self._orbit_track_drift_arr: np.ndarray | None = None
+        self._orbit_track_pd_views: list[np.ndarray] = []
+        self._orbit_track_z_initialized: bool = False
 
     def _build_orbit_tracks(self) -> None:
+        # ``_clear_orbit_tracks`` already re-initialises the per-ring
+        # lists and the vectorized workspace, so we don't redo that here.
         self._clear_orbit_tracks()
-        self._orbit_track_eci_points: list[np.ndarray] = []
-        self._orbit_track_polydatas: list[pv.PolyData] = []
         try:
             state = self._state_provider()
         except Exception:
             return
-        # Compute J2 RAAN precession from TLE epoch to current preview time
-        _J2 = 0.00108263
-        _R_EARTH_KM = 6378.137
-        _MU_KM3_S2 = 398600.4418
-        _TLE_EPOCH = datetime(2025, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
-        _preview_time = getattr(self, "_current_frame_set", None)
-        _dt_s = 0.0
-        if _preview_time is not None and _preview_time.times_utc:
-            _frame_idx = max(0, getattr(self, "_current_frame_index", 0))
-            _frame_idx = min(_frame_idx, len(_preview_time.times_utc) - 1)
-            _cur_utc = _preview_time.times_utc[_frame_idx]
-            if _cur_utc.tzinfo is None:
-                _cur_utc = _cur_utc.replace(tzinfo=timezone.utc)
-            _dt_s = (_cur_utc - _TLE_EPOCH).total_seconds()
         # Use all systems' belts for orbit tracks
         all_belts: list[BeltConfig] = []
         if state.systems and len(state.systems) > 1:
@@ -15207,28 +15437,105 @@ class ConstellationViewerWindow(QtWidgets.QMainWindow):
                 all_belts.extend(sys.belts)
         else:
             all_belts = list(state.active_system().belts)
+        # Derive RAAN/inclination for each plane from the actual
+        # SGP4-propagated state (h = r × v) so the rings match the
+        # satellites regardless of how much secular J2 drift has
+        # accumulated since the TLE epoch. To keep the rings co-moving
+        # with the satellites during animation we also extract a per-
+        # plane secular RAAN drift rate from the difference between the
+        # first and last propagated frame, and apply it as an extra
+        # rotation about ẑ in ``_rotate_orbit_tracks``. This matches
+        # SGP4's J2 precession exactly because both samples come from
+        # the same propagator; an analytical drift formula would
+        # diverge over the preview span.
+        frame_set = getattr(self, "_current_frame_set", None)
+        sample_eci_km: np.ndarray | None = None
+        sample_vel_km_s: np.ndarray | None = None
+        sample_eci_km_end: np.ndarray | None = None
+        sample_vel_km_s_end: np.ndarray | None = None
+        delta_t_s: float = 0.0
+        belt_offsets: np.ndarray | None = None
+        if frame_set is not None and frame_set.positions_eci_km.shape[0] > 0:
+            n_frames = frame_set.positions_eci_km.shape[0]
+            sample_eci_km = frame_set.positions_eci_km[0]
+            sample_vel_km_s = frame_set.velocities_eci_km_s[0]
+            self._orbit_track_t0_offset_s = float(frame_set.sample_times_s[0])
+            if n_frames > 1:
+                sample_eci_km_end = frame_set.positions_eci_km[-1]
+                sample_vel_km_s_end = frame_set.velocities_eci_km_s[-1]
+                delta_t_s = float(
+                    frame_set.sample_times_s[-1]
+                    - frame_set.sample_times_s[0]
+                )
+            belt_offsets = np.asarray(frame_set.belt_offsets, dtype=np.int64)
         for belt_idx, belt in enumerate(all_belts):
             alt = float(belt.altitude_km or 525.0)
             ecc = float(belt.eccentricity or 0.0)
-            inc = np.radians(float(belt.inclination_deg or 53.0))
+            inc_nominal = np.radians(float(belt.inclination_deg or 53.0))
             argp = np.radians(float(belt.argp_deg or 0.0))
             raan_min = np.radians(float(belt.raan_min_deg or 0.0))
             raan_max = np.radians(float(belt.raan_max_deg or 360.0))
             n_planes = max(1, int(belt.plane_count or 1))
+            n_per_plane = max(1, int(belt.num_sats_per_plane or 1))
             raan_step = (raan_max - raan_min) / n_planes
-            # J2 secular RAAN precession: Omega_dot = -1.5 * n * J2 * (Re/a)^2 * cos(i)
-            _a_km = (_R_EARTH_KM + alt) / (1.0 - ecc) if ecc < 1.0 else (_R_EARTH_KM + alt)
-            _n_rad_s = np.sqrt(_MU_KM3_S2 / (_a_km ** 3))
-            _raan_rate = -1.5 * _n_rad_s * _J2 * (_R_EARTH_KM / _a_km) ** 2 * np.cos(inc)
-            _raan_drift = _raan_rate * _dt_s
+            belt_start = (
+                int(belt_offsets[belt_idx])
+                if belt_offsets is not None and belt_idx < belt_offsets.size - 1
+                else -1
+            )
             color = _belt_color(belt_idx)
             for p in range(n_planes):
-                raan = raan_min + p * raan_step + _raan_drift
+                raan = raan_min + p * raan_step
+                inc = inc_nominal
+                drift_rad_per_s = 0.0
+                if (
+                    belt_start >= 0
+                    and sample_eci_km is not None
+                    and sample_vel_km_s is not None
+                ):
+                    sat_idx = belt_start + p * n_per_plane
+                    if 0 <= sat_idx < sample_eci_km.shape[0]:
+                        r = sample_eci_km[sat_idx].astype(np.float64, copy=False)
+                        v = sample_vel_km_s[sat_idx].astype(np.float64, copy=False)
+                        h = np.cross(r, v)
+                        h_norm = float(np.linalg.norm(h))
+                        if h_norm > 0.0:
+                            inc = float(np.arccos(np.clip(h[2] / h_norm, -1.0, 1.0)))
+                            # Ascending-node direction n = ẑ × h;
+                            # RAAN is the longitude of n in the inertial
+                            # equatorial plane.
+                            raan = float(np.arctan2(h[0], -h[1]))
+                            if (
+                                sample_eci_km_end is not None
+                                and sample_vel_km_s_end is not None
+                                and delta_t_s > 0.0
+                            ):
+                                r_end = sample_eci_km_end[sat_idx].astype(
+                                    np.float64, copy=False
+                                )
+                                v_end = sample_vel_km_s_end[sat_idx].astype(
+                                    np.float64, copy=False
+                                )
+                                h_end = np.cross(r_end, v_end)
+                                h_end_norm = float(np.linalg.norm(h_end))
+                                if h_end_norm > 0.0:
+                                    raan_end = float(
+                                        np.arctan2(h_end[0], -h_end[1])
+                                    )
+                                    # Wrap difference into (-π, π] so a
+                                    # one-revolution cross of the ±π
+                                    # branch cut doesn't fake a huge
+                                    # drift rate.
+                                    d_raan = (raan_end - raan + np.pi) % (
+                                        2.0 * np.pi
+                                    ) - np.pi
+                                    drift_rad_per_s = d_raan / delta_t_s
                 ring = _build_orbit_ring(alt, ecc, inc, argp, raan)
                 actor_name = f"{_ORBIT_TRACK_ACTOR_PREFIX}{belt_idx}_{p}"
                 eci_pts = np.array(ring.points, dtype=np.float32)
                 self._orbit_track_eci_points.append(eci_pts)
                 self._orbit_track_polydatas.append(ring)
+                self._orbit_track_drift_rad_per_s.append(drift_rad_per_s)
                 actor = self.plotter.add_mesh(
                     ring, color=color, line_width=1.5, opacity=0.3,
                     style="wireframe", name=actor_name,
@@ -15240,30 +15547,106 @@ class ConstellationViewerWindow(QtWidgets.QMainWindow):
                     actor.GetProperty().SetRenderPointsAsSpheres(False)
                 self._orbit_track_actors.append(actor_name)
 
-    def _rotate_orbit_tracks(self, earth_angle_deg: float) -> None:
-        """Rotate ECI orbit rings into the current ECEF frame."""
-        eci_list = getattr(self, "_orbit_track_eci_points", [])
-        pd_list = getattr(self, "_orbit_track_polydatas", [])
-        if not eci_list or not pd_list:
+        # Pack rings into contiguous numpy stacks so the per-frame
+        # rotation can run as one vectorized expression instead of a
+        # Python loop over (potentially dozens of) rings. All rings
+        # produced by ``_build_orbit_ring`` share a 120-point layout, so
+        # the stack is dense; if a future change makes ring sizes vary
+        # this falls back to the per-ring path automatically.
+        if self._orbit_track_eci_points:
+            point_counts = {pts.shape[0] for pts in self._orbit_track_eci_points}
+            if len(point_counts) == 1:
+                stack = np.stack(self._orbit_track_eci_points, axis=0)
+                self._orbit_track_base_xy = np.ascontiguousarray(
+                    stack[..., :2], dtype=np.float32
+                )
+                self._orbit_track_base_z = np.ascontiguousarray(
+                    stack[..., 2], dtype=np.float32
+                )
+                self._orbit_track_drift_arr = np.asarray(
+                    self._orbit_track_drift_rad_per_s, dtype=np.float64
+                )
+                self._orbit_track_pd_views = [
+                    np.asarray(pd.points) for pd in self._orbit_track_polydatas
+                ]
+                self._orbit_track_z_initialized = False
+
+    def _rotate_orbit_tracks(self, earth_angle_deg: float, offset_s: float = 0.0) -> None:
+        """Rotate ECI orbit rings into the current ECEF frame.
+
+        The ring polylines are stored in ECI at the *first* propagated
+        frame's RAAN. To stay aligned with the SGP4-propagated
+        satellites we apply the per-plane secular RAAN drift
+        ``Δt × Ω̇`` (extracted from the propagation itself in
+        ``_build_orbit_tracks``) and, in ECEF view, also Earth's GMST
+        rotation. Both rotations are about ẑ so they fuse into a
+        single Z-rotation per plane.
+
+        When all rings share the same point count (the normal case)
+        the trig + matrix-multiply happens once over all rings via
+        broadcasting; only the final write into each VTK polydata
+        loops, and that loop is a sequence of cheap ``np.copyto``
+        calls.
+        """
+        pd_list = self._orbit_track_polydatas
+        if not pd_list:
             return
-        # In ECI view the Earth rotates under the rings — rings stay put.
-        # In ECEF view (default) we must rotate rings by -earth_angle.
-        angle_rad = 0.0 if self._applied_frame_view_mode == "ECI" else np.radians(-earth_angle_deg)
-        if angle_rad == 0.0:
-            for eci_pts, pd in zip(eci_list, pd_list):
-                np.copyto(pd.points, eci_pts, casting="unsafe")
-                pd.Modified()
+        earth_term_rad = (
+            0.0 if self._applied_frame_view_mode == "ECI" else np.radians(-earth_angle_deg)
+        )
+        dt_s = float(offset_s) - self._orbit_track_t0_offset_s
+
+        base_xy = self._orbit_track_base_xy
+        base_z = self._orbit_track_base_z
+        drift_arr = self._orbit_track_drift_arr
+        pd_views = self._orbit_track_pd_views
+        if (
+            base_xy is not None
+            and base_z is not None
+            and drift_arr is not None
+            and len(pd_views) == base_xy.shape[0]
+        ):
+            angles = drift_arr * dt_s + earth_term_rad
+            cos_a = np.cos(angles).astype(np.float32, copy=False)
+            sin_a = np.sin(angles).astype(np.float32, copy=False)
+            bx = base_xy[..., 0]
+            by = base_xy[..., 1]
+            new_x = cos_a[:, None] * bx - sin_a[:, None] * by
+            new_y = sin_a[:, None] * bx + cos_a[:, None] * by
+            z_static = not self._orbit_track_z_initialized
+            for idx, pd in enumerate(pd_list):
+                view = pd_views[idx]
+                view[:, 0] = new_x[idx]
+                view[:, 1] = new_y[idx]
+                if z_static:
+                    view[:, 2] = base_z[idx]
+                # Same minimal-invalidation trick as the belt path:
+                # bump the points-array MTime instead of the whole
+                # polydata so VTK skips a bounds/topology re-derive.
+                pd.GetPoints().Modified()
+            self._orbit_track_z_initialized = True
             return
-        cos_a = np.cos(angle_rad)
-        sin_a = np.sin(angle_rad)
-        for eci_pts, pd in zip(eci_list, pd_list):
+
+        # Fallback: per-ring path (only hit when ring sizes differ or
+        # the stacks weren't populated for some reason).
+        eci_list = self._orbit_track_eci_points
+        drift_list = self._orbit_track_drift_rad_per_s
+        for idx, (eci_pts, pd) in enumerate(zip(eci_list, pd_list)):
+            drift = float(drift_list[idx]) if idx < len(drift_list) else 0.0
+            angle_rad = earth_term_rad + drift * dt_s
             x = eci_pts[:, 0]
             y = eci_pts[:, 1]
             rotated = pd.points
-            rotated[:, 0] = cos_a * x - sin_a * y
-            rotated[:, 1] = sin_a * x + cos_a * y
+            if angle_rad == 0.0:
+                rotated[:, 0] = x
+                rotated[:, 1] = y
+            else:
+                cos_a = np.cos(angle_rad)
+                sin_a = np.sin(angle_rad)
+                rotated[:, 0] = cos_a * x - sin_a * y
+                rotated[:, 1] = sin_a * x + cos_a * y
             rotated[:, 2] = eci_pts[:, 2]
-            pd.Modified()
+            pd.GetPoints().Modified()
 
     def _on_continuous_update_toggled(self, checked: bool) -> None:
         if not checked:
@@ -15356,6 +15739,12 @@ class ConstellationViewerWindow(QtWidgets.QMainWindow):
         self._timer.stop()
         self.play_button.setText("Play")
         self._preview_params = params
+        if self._applied_frame_view_mode != selected_frame_view_mode:
+            # Frame mode determines whether the scene Earth/grid track
+            # the GMST angle (ECI) or stay still (ECEF) — invalidate the
+            # cached "last applied" angle so the next render is forced
+            # to push a fresh orientation through the VTK actors.
+            self._last_applied_scene_angle_deg = None
         self._applied_frame_view_mode = selected_frame_view_mode
         self._applied_render_mode = selected_render_mode
         self._applied_skybox_mode = selected_skybox_mode
@@ -15565,9 +15954,17 @@ class ConstellationViewerWindow(QtWidgets.QMainWindow):
 
     def _apply_scene_frame_transforms(self, earth_angle_deg: float) -> None:
         angle_use = float(earth_angle_deg) if self._applied_frame_view_mode == "ECI" else 0.0
+        # ECEF view holds angle_use at 0 for the whole animation, so
+        # without this cache VTK would pay three ``SetOrientation``
+        # pipeline pokes per frame to set an identity rotation. The
+        # ECI branch passes a changing GMST every frame, so the cache
+        # simply never hits there.
+        if self._last_applied_scene_angle_deg == angle_use:
+            return
         self._update_scene_mesh_bundle(self._earth_scene_bundle, angle_use)
         self._update_scene_mesh_bundle(self._earth_grid_scene_bundle, angle_use)
         self._update_scene_mesh_bundle(self._ras_scene_bundle, angle_use)
+        self._last_applied_scene_angle_deg = angle_use
 
     def _install_frame_set(self, *, reset_camera: bool) -> None:
         if self._current_frame_set is None:
@@ -15604,6 +16001,9 @@ class ConstellationViewerWindow(QtWidgets.QMainWindow):
 
     def _rebuild_scene(self, *, reset_camera: bool) -> None:
         self._clear_dynamic_actors()
+        # Force a fresh SetOrientation pass on the next frame because
+        # _clear_dynamic_actors removes/recreates scene-mesh bundles.
+        self._last_applied_scene_angle_deg = None
         self._configure_plotter_scene()
         if self._show_orbit_tracks:
             self._build_orbit_tracks()
@@ -15634,30 +16034,37 @@ class ConstellationViewerWindow(QtWidgets.QMainWindow):
                 len(frame_set.times_utc) - 1,
             )
         )
+        timer_active = self._timer.isActive()
         for bundle in self._belt_render_bundles:
-            start = int(bundle.belt_start_index)
-            stop = start + int(bundle.belt_count)
+            start = bundle.belt_start_index
+            stop = start + bundle.belt_count
             src_points = frame_points[start:stop]
             if src_points.dtype != np.float32:
                 src_points = src_points.astype(np.float32, copy=False)
 
             np.copyto(bundle.points_view, src_points, casting="unsafe")
-            bundle.points_polydata.Modified()
+            # Invalidate only the points array — VTK pipeline then
+            # re-uploads coordinates without re-deriving bounds /
+            # normals / cell-data from the polydata. ``GetPoints()``
+            # is the actual ``vtkDataArray`` the GLSL vertex stage
+            # binds, so this is the minimal MTime bump that still
+            # forces a GPU upload.
+            bundle.points_polydata.GetPoints().Modified()
 
             if (
                 bundle.pick_polydata is not None
                 and bundle.pick_points_view is not None
-                and not self._timer.isActive()
+                and not timer_active
             ):
                 np.copyto(bundle.pick_points_view, src_points, casting="unsafe")
-                bundle.pick_polydata.Modified()
+                bundle.pick_polydata.GetPoints().Modified()
         earth_angle_deg = _interpolate_scalar_series(
             frame_set.sample_times_s,
             frame_set.earth_rotation_deg,
             offset_use,
         )
         self._apply_scene_frame_transforms(earth_angle_deg)
-        self._rotate_orbit_tracks(earth_angle_deg)
+        self._rotate_orbit_tracks(earth_angle_deg, offset_s=offset_use)
 
         now = perf_counter()
         if self._timer.isActive() and self._last_render_wall_s is not None:
@@ -17633,6 +18040,9 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
         self.belt_table.verticalHeader().setVisible(False)
         self._belt_checkbox_delegate = BooleanCheckboxDelegate(self.belt_table)
         self.belt_table.setItemDelegateForColumn(len(BeltTableModel._columns) - 1, self._belt_checkbox_delegate)
+        # The "Show" column is a wizard-only visibility indicator; in
+        # the main-window belt table it would just be a dead glyph.
+        self.belt_table.hideColumn(BeltTableModel._SHOW_COLUMN_INDEX)
         self.belt_table.horizontalHeader().installEventFilter(self)
         self.belt_columns_help_button.clicked.connect(self._show_belt_columns_help)
         self.belt_table.setMinimumHeight(220)
@@ -21896,10 +22306,13 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
                 )
                 + "".join(
                     f"<p style='margin:0 0 4px 0; text-align:justify;'><b>{label}.</b> {detail}</p>"
-                    for label, detail in zip(
-                        [column[0] for column in BeltTableModel._columns],
-                        _BELT_COLUMN_HELP,
+                    for label, attr_name, detail in (
+                        (column[0], column[1], help_text)
+                        for column, help_text in zip(
+                            BeltTableModel._columns, _BELT_COLUMN_HELP,
+                        )
                     )
+                    if attr_name is not None
                 ),
                 "Basic",
             ),
@@ -23751,6 +24164,43 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
             banner.show_message(str(status["message"]), kind=str(status["kind"]))
 
     def _update_snapshot_panel(
+        self,
+        state: ScepterProjectState,
+        *,
+        statuses: Mapping[str, Mapping[str, Any]] | None = None,
+    ) -> None:
+        # Defensive guard: if any of the snapshot widgets the body
+        # below touches has had its C++ side destroyed, skip the
+        # update rather than dereferencing a dangling wrapper. This
+        # path has been observed to crash with a native access
+        # violation on Windows when the Qt test-suite cached-window
+        # pattern races a parent teardown. ``shiboken6.isValid`` is
+        # the canonical PySide6 alive-check.
+        try:
+            import shiboken6 as _shiboken  # type: ignore[import-not-found]
+        except Exception:
+            _shiboken = None  # pragma: no cover — non-PySide build
+        if _shiboken is not None:
+            for _w in (
+                getattr(self, "snapshot_step_list", None),
+                getattr(self, "snapshot_title_label", None),
+                getattr(self, "snapshot_detail_label", None),
+                getattr(self, "snapshot_overview_label", None),
+                getattr(self, "snapshot_chip", None),
+            ):
+                if _w is not None and not _shiboken.isValid(_w):
+                    return
+        try:
+            self._update_snapshot_panel_body(state, statuses=statuses)
+        except Exception:
+            # Swallow any Python-level error so a stale widget
+            # reference can't poison subsequent tests or propagate
+            # from a background refresh into the run's exit code.
+            # Native crashes still bypass this — they're guarded by
+            # the shiboken.isValid check above.
+            return
+
+    def _update_snapshot_panel_body(
         self,
         state: ScepterProjectState,
         *,
@@ -27762,16 +28212,20 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
             if idx_fixed >= 0 and self.service_power_variation_combo.currentIndex() != idx_fixed:
                 blockers.append(QtCore.QSignalBlocker(self.service_power_variation_combo))
                 self.service_power_variation_combo.setCurrentIndex(idx_fixed)
-            # Transmit unwanted-emission mask ← flat (rectangular) preset.
-            # UEMR models internal-circuitry leakage with a spatially-
-            # isotropic emission; the flat mask (no OOB suppression) is
-            # the correct baseline shape. Combined with the cutoff
-            # below (service_bandwidth @ 100%), the spectrum plan
-            # clips to the service band.
-            idx_flat = self.spectrum_mask_preset_combo.findData("flat")
-            if idx_flat >= 0 and self.spectrum_mask_preset_combo.currentIndex() != idx_flat:
-                blockers.append(QtCore.QSignalBlocker(self.spectrum_mask_preset_combo))
-                self.spectrum_mask_preset_combo.setCurrentIndex(idx_flat)
+            # Transmit unwanted-emission mask: the flat (rectangular)
+            # preset is the correct *baseline* for UEMR because
+            # internal-circuitry leakage is spatially-isotropic and
+            # flat-across-band. But the user can legitimately model
+            # more realistic shapes — a vendor-specific roll-off via
+            # "custom", an ITU template, etc. — so we only snap the
+            # combo when it's still at its "no preset chosen yet"
+            # placeholder. An explicit user choice is preserved.
+            current_mask = self.spectrum_mask_preset_combo.currentData()
+            if current_mask in (None, ""):
+                idx_flat = self.spectrum_mask_preset_combo.findData("flat")
+                if idx_flat >= 0 and self.spectrum_mask_preset_combo.currentIndex() != idx_flat:
+                    blockers.append(QtCore.QSignalBlocker(self.spectrum_mask_preset_combo))
+                    self.spectrum_mask_preset_combo.setCurrentIndex(idx_flat)
             # Integration cutoff basis ← service_bandwidth
             idx_sb = self.spectrum_cutoff_basis_combo.findData("service_bandwidth")
             if idx_sb >= 0 and self.spectrum_cutoff_basis_combo.currentIndex() != idx_sb:
@@ -29039,20 +29493,44 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
 
     @QtCore.Slot()
     def _edit_custom_mask_points(self) -> None:
+        service_cfg = self._current_service_config()
+        spectrum_cfg = self._current_spectrum_config()
+        ras_cfg = self._current_ras_station_config()
+        # In UEMR mode the "channel" concept is bypassed entirely: the
+        # integration window is the service band itself (cutoff_basis =
+        # ``service_bandwidth`` at 50%, see ``_apply_uemr_mode_gating``).
+        # The mask editor's in-band anchors must therefore sit at the
+        # service-band edges, not at some leftover channel_bandwidth
+        # that the user never set.
+        try:
+            uemr_active = _system_is_uemr(self.current_state().active_system())
+        except Exception:
+            uemr_active = False
+        if uemr_active:
+            svc_start = spectrum_cfg.service_band_start_mhz
+            svc_stop = spectrum_cfg.service_band_stop_mhz
+            if (
+                svc_start is not None
+                and svc_stop is not None
+                and float(svc_stop) > float(svc_start)
+            ):
+                effective_bandwidth_mhz = float(svc_stop) - float(svc_start)
+            else:
+                effective_bandwidth_mhz = float(_DEFAULT_SERVICE_BANDWIDTH_MHZ)
+        else:
+            effective_bandwidth_mhz = float(
+                service_cfg.bandwidth_mhz or _DEFAULT_SERVICE_BANDWIDTH_MHZ
+            )
+
         current_points = (
             self._spectrum_custom_mask_points
             if self._spectrum_custom_mask_points is not None
             else scenario._resolve_direct_epfd_mask_points_mhz(
                 preset=_DEFAULT_SPECTRUM_MASK_PRESET,
-                channel_bandwidth_mhz=float(
-                    self._current_service_config().bandwidth_mhz or _DEFAULT_SERVICE_BANDWIDTH_MHZ
-                ),
+                channel_bandwidth_mhz=effective_bandwidth_mhz,
                 custom_mask_points=None,
             ).tolist()
         )
-        service_cfg = self._current_service_config()
-        spectrum_cfg = self._current_spectrum_config()
-        ras_cfg = self._current_ras_station_config()
 
         def _preview_plan_factory(
             mask_points: list[list[float]],
@@ -29065,9 +29543,7 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
 
         dialog = SpectrumMaskEditorDialog(
             initial_points=current_points,
-            channel_bandwidth_mhz=float(
-                service_cfg.bandwidth_mhz or _DEFAULT_SERVICE_BANDWIDTH_MHZ
-            ),
+            channel_bandwidth_mhz=effective_bandwidth_mhz,
             preview_plan_factory=_preview_plan_factory,
             parent=self,
             mask_kind="tx",
@@ -29752,12 +30228,14 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
             # transmit mask. Hidden fields (reuse, anchor, policy,
             # cutoff basis/%, tx reference) are set by
             # ``_apply_uemr_forced_defaults`` for the kernel only.
+            # The UEMR baseline mask is ``flat`` (isotropic
+            # circuitry leakage has no directive OOB template) —
+            # use it here regardless of the directive default,
+            # which would otherwise write a directional ITU preset
+            # that doesn't apply to UEMR.
             self.spectrum_service_band_start_edit.set_value(defaults.service_band_start_mhz)
             self.spectrum_service_band_stop_edit.set_value(defaults.service_band_stop_mhz)
-            self._set_combo_to_data(
-                self.spectrum_mask_preset_combo,
-                defaults.unwanted_emission_mask_preset,
-            )
+            self._set_combo_to_data(self.spectrum_mask_preset_combo, "flat")
         else:
             self._load_spectrum_widgets(defaults)
         del blockers
@@ -29975,15 +30453,39 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
             self._refresh_analyzer_controls()
             self._refresh_summary()
 
-        # Run on a simple background thread
+        # Run on a simple background thread.
+        #
+        # NOTE on test-pollution: the ``_check_future`` polling timer
+        # recursively reschedules itself via ``QTimer.singleShot(50, …)``
+        # until ``future.done()``. Without defensive guards this used
+        # to fire *after* the owning window had been closed — touching
+        # widgets on a destroyed Qt object and (because the main-window
+        # pool is cached across tests in the GUI suite) flaking the
+        # next test that reused the cached window. We now:
+        #   1. Track the most-recently-submitted future so a stale
+        #      timer tick can recognise itself and stop.
+        #   2. Honour ``self._analyser_pool_closed`` set by
+        #      ``closeEvent`` — after close, every pending tick is a
+        #      no-op.
         import concurrent.futures
         _pool = getattr(self, "_analyser_pool", None)
         if _pool is None:
             _pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
             self._analyser_pool = _pool
+        if getattr(self, "_analyser_pool_closed", False):
+            # Don't submit against a torn-down pool (can happen if the
+            # button is re-clicked between closeEvent and shutdown).
+            return
         future = _pool.submit(_worker)
+        self._current_analyser_future = future
 
         def _check_future():
+            if getattr(self, "_analyser_pool_closed", False):
+                return
+            if getattr(self, "_current_analyser_future", None) is not future:
+                # A newer analysis has been started or the window is
+                # shutting down; this poll tick is stale — drop it.
+                return
             if future.done():
                 try:
                     _on_done(future.result())
@@ -29991,6 +30493,7 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
                     self.grid_summary_text.setPlainText(f"Analyser failed:\n{exc}")
                     self.grid_recommended_label.setText("Recommended cell spacing: --")
                     self.run_grid_analyzer_button.setEnabled(True)
+                self._current_analyser_future = None
             else:
                 QtCore.QTimer.singleShot(50, _check_future)
 
@@ -31292,9 +31795,25 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
                     return
         self._cleanup_hexgrid_preview_worker()
         self._close_all_vtk_viewers()
+        # Tear down the grid-analyser background pool so its recurring
+        # QTimer.singleShot poll tick cannot fire on a destroyed window
+        # or mutate a next-test window that reuses a cached instance.
+        self._shutdown_analyser_pool()
         self._persist_session_state()
         super().closeEvent(event)
         _flush_deferred_deletions()
+
+    def _shutdown_analyser_pool(self) -> None:
+        # Flag first so any in-flight ``_check_future`` tick short-circuits.
+        self._analyser_pool_closed = True
+        self._current_analyser_future = None
+        pool = getattr(self, "_analyser_pool", None)
+        if pool is not None:
+            try:
+                pool.shutdown(wait=True)
+            except Exception:
+                pass
+            self._analyser_pool = None
 
     def _close_all_vtk_viewers(self) -> None:
         """Shut down any open VTK 3D viewers to release OpenGL contexts.

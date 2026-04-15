@@ -94,6 +94,22 @@ def _index_to_piece(idx: int) -> str:
     return "".join(reversed(letters))
 
 
+_LEGACY_START_EPOCH = datetime(2025, 1, 1, 0, 0, 0)
+
+
+def _resolve_start_time(start_time: Time | datetime | None) -> Time:
+    """Normalise ``start_time`` input to an astropy ``Time``.
+
+    ``None`` falls back to the historical 2025-01-01 epoch so callers that
+    omit the argument keep the pre-``start_time``-parameter behaviour.
+    """
+    if start_time is None:
+        return Time(_LEGACY_START_EPOCH)
+    if isinstance(start_time, Time):
+        return start_time
+    return Time(start_time)
+
+
 def _build_epoch_string(start_time: Time) -> tuple[int, str]:
     """Return (2-digit year, TLE epoch field) for a given start time."""
     year_short = start_time.datetime.year % 100
@@ -306,6 +322,7 @@ def normalize_and_validate_belt_definitions(
 
 def forge_tle_constellation_from_belt_definitions(
     belt_definitions: Iterable[Mapping[str, Any]],
+    start_time: Time | datetime | None = None,
 ) -> dict[str, Any]:
     """
     Forge a full multi-belt constellation and derived geometry metadata.
@@ -323,6 +340,13 @@ def forge_tle_constellation_from_belt_definitions(
         `eccentricity`, `inclination_deg`, `argp_deg`, `RAAN_min`,
         `RAAN_max`, `min_elevation`, and `adjacent_plane_offset`.
         Unit-bearing angular/length values are expected as astropy quantities.
+    start_time : astropy.time.Time or datetime, optional
+        Common TLE epoch for every forged belt. Defaults to
+        ``2025-01-01T00:00:00 UTC`` when ``None`` is passed, preserving the
+        historical behaviour. Callers that drive SGP4 propagation from a
+        specific simulation start should pass that instant here so the
+        TLE epoch is close to the propagation window and secular
+        perturbations have little time to accumulate.
 
     Returns
     -------
@@ -369,6 +393,7 @@ def forge_tle_constellation_from_belt_definitions(
       therefore emit per-satellite arrays aligned to the forged TLE order
     """
     belt_definitions_norm = normalize_and_validate_belt_definitions(belt_definitions)
+    start_time_q = _resolve_start_time(start_time)
 
     belt_names: list[str] = []
     belt_sats: list[int] = []
@@ -400,6 +425,7 @@ def forge_tle_constellation_from_belt_definitions(
             inclination_deg=belt_cfg["inclination_deg"],
             argp_deg=belt_cfg["argp_deg"],
             adjacent_plane_offset=belt_cfg["adjacent_plane_offset"],
+            start_time=start_time_q,
         )
 
         expected_sats = int(belt_cfg["num_sats_per_plane"]) * int(belt_cfg["plane_count"])
@@ -738,7 +764,7 @@ def forge_tle_single(
     raan_deg: float = 0.0 * u.deg,
     argp_deg: float = 0.0 * u.deg,
     anomaly_deg: float = 0.0 * u.deg,
-    start_time: Time = Time(datetime(2025, 1, 1, 0, 0, 0)),
+    start_time: Time | datetime | None = None,
     mm_dot: float = 0.0,
     mm_ddot: float = 0.0,
     bstar: float = 0.00,
@@ -837,7 +863,7 @@ def forge_tle_single(
         Checksums for lines 1 and 2 are computed with `_compute_tle_checksum()`
         and appended as column 69.
     """
-    year_short, epoch_str = _build_epoch_string(start_time)
+    year_short, epoch_str = _build_epoch_string(_resolve_start_time(start_time))
     mean_motion_rev_day = _compute_mean_motion_rev_day(float(altitude), eccentricity=float(eccentricity))
 
     return _forge_tle_single_core(
@@ -874,7 +900,7 @@ def forge_tle_belt(
     eccentricity: float = 0,
     inclination_deg: float = 87.9 * u.deg,
     argp_deg: float = 0 * u.deg,
-    start_time: Time = Time(datetime(2025, 1, 1, 0, 0, 0)),
+    start_time: Time | datetime | None = None,
     mm_dot: float = 0.0,
     mm_ddot: float = 0.0,
     bstar: float = 0.00,
@@ -973,7 +999,7 @@ def forge_tle_belt(
     altitude_m = _to_float_m(altitude)
     inclination_deg_f = _to_float_deg(inclination_deg)
     argp_deg_f = _to_float_deg(argp_deg)
-    year_short, epoch_str = _build_epoch_string(start_time)
+    year_short, epoch_str = _build_epoch_string(_resolve_start_time(start_time))
     mean_motion_rev_day = _compute_mean_motion_rev_day(altitude_m, eccentricity=float(eccentricity))
     mm_dot_string = _format_mm_dot(mm_dot)
     mm_ddot_string = _format_tle_exp(mm_ddot)
