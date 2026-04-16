@@ -9,6 +9,13 @@ and analyzing potential radio frequency interference (RFI) in radio astronomy ob
 It combines satellite propagation calculations with antenna gain patterns to model the
 impact of satellite constellations on radio telescope observations.
 
+Authors
+-------
+- Hao Qiu <https://github.com/hqiu-nju>
+
+This module remains part of the GPLv3-licensed SCEPTer project. The author
+attribution above does not change the project-wide license.
+
 Overview
 --------
 The module implements a multi-dimensional simulation approach to evaluate satellite emissions

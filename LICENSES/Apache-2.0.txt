@@ -1,0 +1,7 @@
+Apache License, Version 2.0
+
+The full text is available at:
+https://www.apache.org/licenses/LICENSE-2.0
+
+This file is a reference pointer.  The canonical licence text is maintained
+by the Apache Software Foundation.

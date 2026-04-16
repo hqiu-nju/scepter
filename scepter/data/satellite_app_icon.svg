@@ -1,0 +1,76 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" fill="none">
+  <!-- Background -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="128" y2="128" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#0C1A30"/>
+      <stop offset="1" stop-color="#071020"/>
+    </linearGradient>
+    <linearGradient id="orbit_g" x1="26" y1="74" x2="97" y2="54" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#0EA5E9"/>
+      <stop offset="1" stop-color="#38BDF8"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="8" y="8" width="112" height="112" rx="32" fill="url(#bg)"/>
+  <rect x="9" y="9" width="110" height="110" rx="31"
+        stroke="#38BDF8" stroke-opacity="0.18" stroke-width="1"/>
+
+  <!-- Stars -->
+  <circle cx="24" cy="26" r="0.8" fill="#E2E8F0" opacity="0.45"/>
+  <circle cx="45" cy="20" r="0.6" fill="#E2E8F0" opacity="0.35"/>
+  <circle cx="100" cy="24" r="0.7" fill="#E2E8F0" opacity="0.40"/>
+  <circle cx="20" cy="54" r="0.5" fill="#E2E8F0" opacity="0.25"/>
+  <circle cx="106" cy="65" r="0.6" fill="#E2E8F0" opacity="0.30"/>
+
+  <!-- Orbit arc — glow -->
+  <path d="M24 76C34 58 52 47 72 47C83 47 92 49.5 99 53"
+        stroke="#38BDF8" stroke-width="13" stroke-linecap="round" stroke-opacity="0.06"/>
+  <!-- Orbit arc — main -->
+  <path d="M24 76C34 58 52 47 72 47C83 47 92 49.5 99 53"
+        stroke="url(#orbit_g)" stroke-width="6" stroke-linecap="round"/>
+
+  <!-- Earth horizon arc -->
+  <path d="M28 90C37 103 50 110 65 110C77 110 87 106 95 99"
+        stroke="#E2F1FF" stroke-width="5" stroke-linecap="round"/>
+  <!-- Earth fill -->
+  <path d="M28 90C37 103 50 110 65 110C77 110 87 106 95 99L100 116H20Z"
+        fill="#0B2847" opacity="0.35"/>
+
+  <!-- Crosshairs -->
+  <line x1="32" y1="90" x2="96" y2="90" stroke="#E2F1FF"
+        stroke-width="3" stroke-linecap="round" stroke-opacity="0.65"/>
+  <line x1="64" y1="58" x2="64" y2="110" stroke="#E2F1FF"
+        stroke-width="3" stroke-linecap="round" stroke-opacity="0.65"/>
+
+  <!-- RAS telescope -->
+  <g transform="translate(64,51)">
+    <line x1="0" y1="3" x2="0" y2="9" stroke="#D6E4F0" stroke-width="2.2" stroke-linecap="round"/>
+    <path d="M-8 2Q-6 -5 0 -8Q6 -5 8 2" stroke="#E2F1FF" stroke-width="2.5"
+          stroke-linecap="round" fill="none"/>
+    <circle cx="0" cy="-2.5" r="1.8" fill="#E2F1FF"/>
+  </g>
+
+  <!-- Satellite 1 (on the orbit, upper right) -->
+  <g transform="translate(92,50) rotate(20)">
+    <rect x="-5.5" y="-5.5" width="11" height="11" rx="2.8" fill="#38BDF8"/>
+    <circle cx="0" cy="-7.5" r="1.5" fill="#7DD3FC"/>
+    <line x1="0" y1="-5.5" x2="0" y2="-7.5" stroke="#7DD3FC" stroke-width="1" stroke-linecap="round"/>
+    <rect x="-15" y="-2.5" width="7" height="5" rx="1" fill="#E0F2FE"/>
+    <rect x="8" y="-2.5" width="7" height="5" rx="1" fill="#E0F2FE"/>
+    <line x1="-5.5" y1="0" x2="-8" y2="0" stroke="#94A3B8" stroke-width="0.8" stroke-linecap="round" opacity="0.7"/>
+    <line x1="5.5" y1="0" x2="8" y2="0" stroke="#94A3B8" stroke-width="0.8" stroke-linecap="round" opacity="0.7"/>
+  </g>
+
+  <!-- Satellite 2 (smaller, further along orbit, gives sense of constellation) -->
+  <g transform="translate(48,60) rotate(-30)" opacity="0.55">
+    <rect x="-3.5" y="-3.5" width="7" height="7" rx="1.8" fill="#38BDF8"/>
+    <rect x="-10" y="-1.5" width="4.5" height="3" rx="0.8" fill="#E0F2FE"/>
+    <rect x="5.5" y="-1.5" width="4.5" height="3" rx="0.8" fill="#E0F2FE"/>
+  </g>
+
+  <!-- Signal waves -->
+  <path d="M82 55Q76 59 72 57" stroke="#38BDF8" stroke-width="1"
+        stroke-linecap="round" fill="none" opacity="0.18"/>
+  <path d="M80 58Q74 62 70 60" stroke="#38BDF8" stroke-width="0.8"
+        stroke-linecap="round" fill="none" opacity="0.12"/>
+</svg>

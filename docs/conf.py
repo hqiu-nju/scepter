@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 project = "SCEPTer"
-author = "Harry Qiu"
-release = "0.1"
+author = "SCEPTer contributors"
+release = "0.25.2"
 
 extensions: list[str] = []
 

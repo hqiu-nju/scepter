@@ -1,0 +1,5 @@
+The full text of the GNU General Public License v3.0 is available at:
+https://www.gnu.org/licenses/gpl-3.0.txt
+
+SCEPTer is distributed under GPL-3.0-or-later.
+See the top-level LICENSE file for the project's own copyright notice.

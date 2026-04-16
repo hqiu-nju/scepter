@@ -1,0 +1,10 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+addopts = "--basetemp=.pytest-tmp"
+markers = [
+    "slow_leakage_math: exhaustive leakage-math verification sweeps",
+    "xdist_group(name): group tests for parallel execution (pytest-xdist)",
+]

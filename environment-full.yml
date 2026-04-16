@@ -1,28 +1,72 @@
+# SCEPTer — full development environment
+#
+# Everything in the standard environment plus:
+#   - Cartopy map projections for geographic cell-status maps
+#   - Trame 3D remote rendering for notebook-embedded viewers
+#
+# Create:   conda env create -f environment-full.yml
+# Activate: conda activate scepter-dev-full
+# Update:   conda env update -n scepter-dev-full -f environment-full.yml
+#
+# GPU requirements (same as standard):
+#   - NVIDIA GPU with CUDA Compute Capability >= 7.0 (Volta or newer)
+#   - Minimum 4 GB VRAM; 8+ GB recommended for large constellations
+#   - NVIDIA CUDA drivers must be installed at the system level
+#
+# All packages are sourced from conda-forge.
+
 name: scepter-dev-full
 channels:
   - conda-forge
 dependencies:
-  - python=3.10
-  - conda-build
-  - cysgp4
+  - python=3.13
+  - "setuptools<81"
+
+  # --- Core simulation ---
+  - numpy
+  - scipy
+  - matplotlib
+  - astropy
   - pycraf
+  - cysgp4
+  - pandas
+  - h5py
+  - shapely
+  - psutil
+
+  # --- GPU acceleration ---
+  - numba
+  - numba-cuda
+  - cupy
+  - "cuda-version>=12.0"
+  - cuda-cudart
+  - cuda-nvcc             # NVVM + libdevice for numba-cuda JIT
+  - cuda-nvrtc            # CuPy ElementwiseKernel / RawKernel compilation
+
+  # --- Desktop GUI ---
+  - pyside6
+  - pyvista
+  - pyvistaqt
+  - plotly
+  - python-kaleido
+
+  # --- Development & testing ---
+  - pytest
+  - pytest-timeout
+
+  # --- Notebook support ---
   - ipykernel
   - "ipywidgets>=7.0,<8.0"
   - tqdm
   - seaborn
   - ipympl
-  # Documentation tooling
-  - sphinx
-  - sphinx-rtd-theme
-  # Optional visualization stack
+
+  # --- Cartopy map projections (full only) ---
+  - cartopy
+
+  # --- Trame 3D remote rendering (full only) ---
   - trame
   - trame-jupyter-extension
   - jupyter-server-proxy
   - trame-vtk
   - trame-vuetify
-  # Optional accelerators and GPU-enabled visualization support
-  - numba
-  - "cuda-version>=12.0"
-  - pyvista
-  - plotly
-  - python-kaleido
