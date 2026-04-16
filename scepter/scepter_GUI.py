@@ -278,6 +278,8 @@ _KNOWN_OBSERVATORIES: tuple[tuple[str, dict[str, float]], ...] = (
     ("VLA (USA)", dict(longitude_deg=-107.6177, latitude_deg=34.0787, elevation_m=2124.0)),
     ("ALMA (Chile)", dict(longitude_deg=-67.7532, latitude_deg=-23.0193, elevation_m=5000.0)),
     ("Parkes (Australia)", dict(longitude_deg=148.2635, latitude_deg=-32.9984, elevation_m=415.0)),
+    ("Mopra (Australia)", dict(longitude_deg=149.0997, latitude_deg=-31.2678, elevation_m=866.0)),
+    ("ATCA / Narrabri (Australia)", dict(longitude_deg=149.5501, latitude_deg=-30.3128, elevation_m=237.0)),
 )
 _CAMERA_MIN_RADIUS_KM = _EARTH_RADIUS_KM * 1.1
 _CAMERA_DEFAULT_RADIUS_KM = _EARTH_RADIUS_KM * 3.2
