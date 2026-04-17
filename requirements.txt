@@ -1,6 +1,31 @@
-numpy
-matplotlib
-astropy
-pycraf
-cysgp4
-pandas
+# Core runtime dependencies for SCEPTer.
+# Install with: pip install -r requirements.txt
+#
+# Note: GPU acceleration (numba-cuda, cupy) and the CUDA toolkit libraries
+# are best installed via conda.  For a complete environment use:
+#   conda env create -f environment.yml
+#
+# For Cartopy maps and Trame 3D remote rendering, use:
+#   conda env create -f environment-full.yml
+
+# Simulation core
+numpy>=1.24
+scipy>=1.10
+matplotlib>=3.7
+astropy>=5.3
+pycraf>=2.0
+cysgp4>=0.3
+pandas>=2.0
+h5py>=3.8
+shapely>=2.0
+psutil>=5.9
+
+# GPU acceleration
+numba>=0.58
+cupy>=13.0
+
+# Desktop GUI & visualization
+PySide6>=6.5
+pyvista>=0.42
+pyvistaqt>=0.11
+plotly>=5.18
