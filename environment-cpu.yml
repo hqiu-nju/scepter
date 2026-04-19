@@ -1,0 +1,60 @@
+# SCEPTer — CPU-only / cross-platform environment
+#
+# Use this environment on machines WITHOUT an NVIDIA GPU (macOS, Linux
+# without CUDA, Windows without CUDA drivers).  Lets you:
+#   - Edit and save simulation configurations
+#   - Inspect saved HDF5 result files from a previous run
+#   - Render postprocess recipes (CCDFs, heatmaps, overlays)
+#
+# Running simulations is DISABLED in this environment — the Run button
+# in the GUI is gated by a CUDA-runtime check.  To run a simulation,
+# install environment.yml (or environment-full.yml) on a machine with
+# a supported NVIDIA GPU.
+#
+# Create:   conda env create -f environment-cpu.yml
+# Activate: conda activate scepter-dev-cpu
+# Update:   conda env update -n scepter-dev-cpu -f environment-cpu.yml
+#
+# All packages are sourced from conda-forge.
+
+name: scepter-dev-cpu
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - "setuptools<81"
+
+  # --- Core simulation (CPU-side pieces only) ---
+  - numpy
+  - scipy
+  - matplotlib
+  - astropy
+  - pycraf
+  - cysgp4
+  - pandas
+  - h5py
+  - shapely
+  - psutil
+
+  # --- Numba (CPU JIT for satsim / earthgrid / visualise) ---
+  # numba-cuda and cupy deliberately omitted — the GUI is fully
+  # functional without them and the Run button is auto-disabled.
+  - numba
+
+  # --- Desktop GUI ---
+  - pyside6
+  - pyvista
+  - pyvistaqt
+  - plotly
+  - python-kaleido
+
+  # --- Development & testing ---
+  - pytest
+  - pytest-timeout
+
+  # --- Notebook support ---
+  - ipykernel
+  - "ipywidgets>=7.0,<8.0"
+  - tqdm
+  - seaborn
+  - ipympl

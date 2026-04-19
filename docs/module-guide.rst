@@ -60,9 +60,6 @@ repository.
      - CUDA-based accelerators for large angular-distance and propagation tasks.
      - ``true_angular_distance_gpu_nd``, ``true_angular_distance_auto``,
        ``gpu_topo``, ``gpu_sat_azel``, ``propagate_many_gpu``
-   * - ``scepter.gpu_accel_dev``
-     - Experimental and validation helpers for GPU acceleration work.
-     - ``true_angular_distance_CUDA``, ``_self_test_small``
 
 Suggested reading order
 -----------------------

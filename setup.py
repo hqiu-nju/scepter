@@ -5,7 +5,7 @@ long_description = (Path(__file__).parent / "README.md").read_text(encoding="utf
 
 setup(
     name="scepter",
-    version="0.25.2",
+    version="0.25.3",
     description=(
         "SCEPTer — Simulating Constellation Emission Patterns for Telescopes (radio). "
         "A modular Python toolkit for evaluating satellite constellation EPFD impact "
@@ -33,11 +33,18 @@ setup(
             "data/*.svg",
             "data/*.ico",
             "data/*.jpg",
+            "data/*.png",
+            "data/custom_patterns/*.json",
         ],
     },
     license_files=("LICENSE", "AUTHORS.md", "THIRD_PARTY_NOTICES.md"),
     python_requires=">=3.10",
     install_requires=[
+        # Base dependencies — cross-platform (Windows / Linux / macOS).
+        # The GUI, configuration editing, HDF5 result inspection, and
+        # postprocessing all run with just these.  CUDA-only dependencies
+        # (cupy, numba-cuda) are in the ``gpu`` extra — ``pip install
+        # scepter[gpu]`` pulls them in on machines with a CUDA toolchain.
         "numpy>=1.24",
         "matplotlib>=3.7",
         "astropy>=5.3",
@@ -49,19 +56,26 @@ setup(
         "shapely>=2.0",
         "psutil>=5.9",
         "numba>=0.58",
-        "cupy>=13.0",
         "PySide6>=6.5",
         "pyvista>=0.42",
         "pyvistaqt>=0.11",
         "plotly>=5.18",
     ],
     extras_require={
+        "gpu": [
+            # CUDA-only.  Required to actually RUN simulations.  On a
+            # machine without a CUDA toolchain the GUI still imports and
+            # can open existing HDF5 results — only new runs fail.
+            "cupy>=13.0",
+            "numba-cuda>=0.2",
+        ],
         "cartopy": [
             "cartopy>=0.22",
         ],
         "dev": [
             "pytest>=7.0",
             "pytest-timeout>=2.0",
+            "rich>=13.0",
         ],
     },
     entry_points={

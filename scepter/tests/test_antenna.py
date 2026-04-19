@@ -33,19 +33,19 @@ def test_lazy_numba_loader_only_imports_after_explicit_opt_in(monkeypatch) -> No
 
     monkeypatch.setattr(antenna.importlib, "import_module", _import_module)
 
-    default_gain = antenna.s_1528_rec1_2_pattern(np.asarray([0.2, 0.4]) * u.deg)[0]
+    default_gain = antenna.s_1528_rec1_2_pattern(np.asarray([0.2, 0.4]) * u.deg)
     assert calls == []
     assert default_gain.shape == (2,)
 
     accelerated_gain = antenna.s_1528_rec1_2_pattern(
         np.asarray([0.2, 0.4]) * u.deg,
         use_numba=True,
-    )[0]
+    )
     assert calls == ["numba"]
     assert antenna._HAVE_NUMBA is True
     assert accelerated_gain.shape == (2,)
 
-    cached_gain = antenna.s_1528_rec1_2_pattern(np.asarray([0.2, 0.4]) * u.deg)[0]
+    cached_gain = antenna.s_1528_rec1_2_pattern(np.asarray([0.2, 0.4]) * u.deg)
     assert calls == ["numba"]
     assert cached_gain.shape == (2,)
 

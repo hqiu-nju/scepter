@@ -22,6 +22,7 @@ import signal
 import subprocess
 import sys
 import threading
+import warnings
 from collections import deque
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, replace
@@ -2827,9 +2828,18 @@ def _direct_epfd_relative_mask_points(
     to ±2.5 × B_N from centre.  Beyond that the spurious domain (SM.329)
     applies at a frequency-dependent attenuation level.
     """
-    # --- Flat preset: no suppression (UEMR baseline) ---
+    # --- Flat preset: rectangular within the service band, zero outside ---
+    # 0 dB up to exactly the band edge (0.5 × BW from centre), then a
+    # sharp drop to -200 dB (effectively -∞). This ensures that when
+    # the RAS band sits outside the service band, the integrated
+    # leakage fraction is zero.
+    # The normaliser inserts fixed 0 dB anchors at exactly ±0.5·BW
+    # (the band edges). Points inside that range are in-band (0 dB).
+    # To make the OOB suppression steep, place a 200 dB point just
+    # outside the edge (0.501 × BW ≈ band_edge + 0.07 MHz for a
+    # typical 70 MHz service band) so the ramp is near-vertical.
     if preset == "flat":
-        return [(0.5, 0.0), (1000.0, 0.0)]
+        return [(0.49999, 0.0), (0.501, 200.0), (1000.0, 200.0)]
     # --- SM.1541-7 Annex 5 §2 (FSS) and §3 (MSS) OoB masks ---
     # ITU formula (dBsd, reference bandwidth 4 kHz below 15 GHz,
     # 1 MHz above 15 GHz):
@@ -3331,6 +3341,11 @@ def _resolve_direct_epfd_enabled_channel_indices(
             for channel_index in range(int(full_channel_count))
             if int(channel_index) not in disabled_indices
         ]
+        if not enabled_indices:
+            raise ValueError(
+                "All channels are disabled — at least one channel must "
+                "remain enabled for spectral integration."
+            )
         return enabled_indices, int(max_groups_per_cell)
 
     groups_cap_raw = spectrum_plan.get("channel_groups_per_cell_cap", 1)
@@ -3537,8 +3552,13 @@ def normalize_direct_epfd_spectrum_plan(
         plan.get("spectral_integration_cutoff_basis")
     )
     cutoff_percent = float(plan.get("spectral_integration_cutoff_percent", 250.0))
-    if not np.isfinite(cutoff_percent) or cutoff_percent <= 0.0:
-        raise ValueError("spectral_integration_cutoff_percent must be finite and > 0.")
+    if not np.isfinite(cutoff_percent) or cutoff_percent < 0.0:
+        raise ValueError("spectral_integration_cutoff_percent must be finite and >= 0.")
+    # ITU-R SM.329 convention: the percentage is the distance from the
+    # CENTRE frequency of the emission. 50% = band edge (in-band only),
+    # 250% = start of the spurious domain. The integration window is
+    # [centre − cutoff_mhz, centre + cutoff_mhz] so the value here
+    # is the absolute half-width from centre.
     cutoff_span_mhz = (
         channel_bandwidth if cutoff_basis == "channel_bandwidth" else service_bandwidth_total_mhz
     )
@@ -4537,9 +4557,8 @@ def _visible_beam_statistics_device(
         counts_samples_dev,
         np.int64(0),
     ).sum(axis=1, dtype=np.int64)
-    visible_sample_count = int(cp.count_nonzero(visibility_mask_dev))
-    if visible_sample_count <= 0:
-        return np.zeros(1, dtype=np.int64), visible_total_dev
+    # Avoid a count_nonzero D2H sync here; _bincount_device_to_host handles
+    # the empty-samples case internally.
     visible_samples_dev = counts_samples_dev[visibility_mask_dev]
     visible_hist = _bincount_device_to_host(
         cp,
@@ -5472,45 +5491,73 @@ def _estimate_direct_epfd_power_bytes_per_timestep(
     # Surface-PFD cap: the hoisted cap factor tensor is allocated per slab
     # alongside the main power arrays.  Per-beam mode allocates a full
     # (T, [N_sky,] S, K) float32 tensor; per-satellite aggregate allocates
-    # (T, [N_sky,] S) float32 plus ~3× that for the aggregate helper's
-    # intermediate candidates+geometry (conservatively budgeted as 4×S×K
-    # per timestep for memory safety even though the helper dynamically
-    # sizes itself against free VRAM at runtime).
+    # (T, [N_sky,] S) float32 plus the aggregate helper's intermediate
+    # candidates+geometry.  The aggregate helper now auto-chunks its
+    # transient working set (``_compute_aggregate_surface_pfd_cap_cp``
+    # sizes itself to 25 % of free VRAM, clipped to [64 MB, 1 GB]), so
+    # its peak cost is bounded at ~1 GB regardless of how large
+    # (sat × beam × sky) is.  The estimate below reflects that cap so
+    # the planner doesn't needlessly shrink bulk_timesteps for configs
+    # with very large sat × beam × sky products.
     cap_mode = str(surface_pfd_cap_mode or "per_beam").strip().lower()
     cap_bytes_per_timestep = 0
     if surface_pfd_cap_enabled:
         if cap_mode == "per_beam":
-            # Hoisted (T, [N_sky,] S, K) cap factor + K lookup + peak_pfd
+            # Hoisted (T, [N_sky,] S, K) cap factor + K lookup + peak_pfd.
+            # Scales linearly with (sky, sat, beam) — no helper chunking.
             cap_bytes_per_timestep = sky_factor * sat_visible_i * beam_count_i * 4 * 3
         else:
-            # Hoisted (T, [N_sky,] S) cap factor + aggregate helper transient
-            # (candidates × K_act × 4 × 3 floats — conservatively budgeted)
+            # Hoisted (T, [N_sky,] S) cap factor — the persistent aggregate
+            # result tensor.
             cap_bytes_per_timestep = sky_factor * sat_visible_i * 4
-            cap_bytes_per_timestep += sky_factor * sat_visible_i * beam_count_i * 4 * 3
+            # Aggregate helper transient (candidates × K_act × 4 floats).
+            # Conservative upper bound; the helper's internal chunker
+            # caps this at ~1 GB total across a batch, so we amortise
+            # ~333 MB over typical bulk_timesteps=3.
+            helper_transient_cap_per_batch = 1024 * 1024 * 1024
+            helper_full_estimate = sky_factor * sat_visible_i * beam_count_i * 4 * 3
+            cap_bytes_per_timestep += min(
+                helper_full_estimate,
+                helper_transient_cap_per_batch // max(1, 3),
+            )
 
-    # The fused kernels (TX trig geometry, beam→ground geometry, atmosphere
-    # LUT, RX angular distance + RAS pattern) eliminate most intermediate
-    # arrays for the fp32 path.  The estimator below reflects the post-fusion
-    # reality: only the fused kernel outputs (beam_sinb, beam_cosb,
-    # cos_gamma_tx, d_target, e_target_deg, valid_geom, gtx_rel_lin,
-    # gtx_abs_lin, atm) and the power-stage results (emitted_eirp, eirp_sum,
-    # scale_w_channel, fspl_lin, vis_horizon) are simultaneously live.
+    # Fused-kernel coverage (current as of 2026-04; regression-guarded by
+    # ``test_direct_epfd_fused_kernel_coverage_matrix``):
     #
-    # For fp64 profiles the sequential fallback path still allocates more
-    # intermediates — the old (pre-fusion) estimate is used for those.
+    #   Path                3-D (non-boresight)    4-D (boresight)
+    #   -------------------  ---------------------- ------------------------
+    #   TX trig geometry     ``_get_tx_trig_...``   ``_get_4d_trig_kernel``
+    #   Beam→ground / EIRP   fused                   ``_get_4d_eirp_kernel``
+    #   Atmosphere LUT       fused                   fused
+    #   RX + RAS pattern     fused (fp32)            fused (fp32)
+    #   Custom-2D body eval  body-frame mega kernel  body-frame mega kernel
+    #   Surface-PFD cap      hoisted once/batch      hoisted once/batch
+    #
+    # Each fusion mostly reduces *transient* allocations — the kernel
+    # outputs still live simultaneously so the memory model remains the
+    # same sum over live arrays.  The key effect is that delta_alpha /
+    # intermediate trig arrays are no longer materialized separately
+    # (they live in registers inside the fused kernel).
+    #
+    # For fp64 profiles the sequential fallback path still allocates
+    # intermediate arrays — the unfused estimate is used for those.
     is_fused = bool(pwr_b == 4 and trig_b == 4)
 
     if boresight_active:
         beam_rows = sky_factor * sat_visible_i * beam_count_i
         sat_rows = sky_factor * sat_visible_i
-        # The 4-D boresight path uses sparse active-beam gather which
-        # compacts to only the active beams.  The TX trig and beam
-        # geometry fusions do NOT apply to this path (they are 3-D only).
-        # The fused RX + RAS pattern kernel DOES apply when fp32.
-        # The fused atmosphere LUT also applies.  Net effect: the 4-D
-        # path has fewer fused intermediates than the 3-D path, so we
-        # use a slightly higher estimate.
-        total = beam_rows * (6 * trig_b + 8 * pwr_b + 4 * 1)
+        # 4-D sparse active-beam gather: live arrays per active beam are
+        # beam_sinb, beam_cosb, cos_gamma_tx, sin_da, cos_da (5 trig
+        # outputs, NOT 6 — delta_alpha is fused internally via
+        # ``_get_4d_trig_kernel``), gtx_rel_lin, gtx_abs_lin,
+        # d_target, e_target_deg, valid_geom, emitted_eirp, and a few
+        # per-beam masks.
+        if is_fused:
+            # Fused 4-D path: 5 trig outputs + 8 power outputs + 4 byte
+            # flags per active beam.  Saves beam_rows × 4 bytes vs unfused.
+            total = beam_rows * (5 * trig_b + 8 * pwr_b + 4 * 1)
+        else:
+            total = beam_rows * (6 * trig_b + 8 * pwr_b + 4 * 1)
         total += sat_rows * (4 * pwr_b + 4 * trig_b + 1)
         total += sat_visible_i * (6 * pwr_b + 6 * trig_b + 1)
         total += sky_factor * (4 * pwr_b)
@@ -5618,6 +5665,70 @@ def _estimate_direct_epfd_orbit_state_gpu_bytes(
     return int(total)
 
 
+def _estimate_direct_epfd_lut_overhead_bytes(
+    *,
+    sat_antenna_model: str | None = None,
+    sat_antenna_is_asymmetric: bool = False,
+    ras_antenna_model: str | None = None,
+    sat_custom_lut_bytes: int = 0,
+    ras_custom_lut_bytes: int = 0,
+    surface_pfd_cap_enabled: bool = False,
+    surface_pfd_cap_lut_is_2d: bool = False,
+    include_atmosphere: bool = False,
+    pattern_is_fp16: bool = False,
+) -> int:
+    """Estimate persistent GPU LUT overhead that sits resident across batches.
+
+    These LUTs are built once per session at prepare-time and stay on the
+    GPU until teardown.  They aren't counted by ``_estimate_context_bytes``
+    (which only tracks TLE + observer ECEF).  Most LUTs are small (<1 MB),
+    but the 2-D variants (asymmetric S.1528, M.2101 element, Custom-2D
+    loaded at high density) can collectively reach ~20 MB — enough to
+    matter when the GPU budget is tight (e.g. ``--gpu-gb 2`` on a laptop).
+
+    Conservative overestimate — callers should pass this into the
+    setup_bytes calculation so the planner leaves a small cushion.
+    """
+    total = 0
+    model = (sat_antenna_model or "").strip().lower()
+    pat_byte = 2 if pattern_is_fp16 else 4
+
+    # S.1528 gain LUT (built by ``_ensure_s1528_gain_lut_1d`` / ``_2d``).
+    if model in {"s1528_rec1_2", "s1528_rec1_4", "s672"}:
+        # 1-D: 180,002-entry table at 0.001° resolution.  fp32=720 KB, fp16=360 KB.
+        total += 180_002 * pat_byte
+        if model == "s1528_rec1_4" and sat_antenna_is_asymmetric:
+            # Asymmetric 2-D LUT: 361 × 181 (θ × φ at 0.5° resolution).
+            total += 361 * 181 * pat_byte
+
+    # M.2101 element-pattern LUT (``_ensure_m2101_element_lut_2d``).
+    if model == "m2101":
+        # 2-D LUT in α, β at ~0.5° resolution (~720 × 360).
+        total += 720 * 360 * pat_byte
+
+    # Custom-2D LUT uploaded from the project file; caller provides size.
+    total += int(max(0, sat_custom_lut_bytes))
+
+    # Atmosphere LUT: 90-element elevation × 1 column at fp32 (small).
+    if include_atmosphere:
+        total += 90 * 4 * 2  # 2 columns (station + target) on some paths
+
+    # RAS pattern LUT (``_ensure_ra1631_pattern_lut``).
+    ras_model_lower = (ras_antenna_model or "").strip().lower()
+    if ras_model_lower == "ra1631":
+        total += 180_002 * pat_byte  # same resolution as S.1528 1-D
+    total += int(max(0, ras_custom_lut_bytes))
+
+    # Peak-PFD surface-cap K-LUT (per-beam 1-D) or K(α, β) 2-D for M.2101.
+    if surface_pfd_cap_enabled:
+        if surface_pfd_cap_lut_is_2d or model == "m2101":
+            total += 720 * 360 * 4  # K(α, β) at fp32 for M.2101 2-D cap
+        else:
+            total += 2 * 2048 * 4  # 1-D K(β) table per (α bin × β bin)
+
+    return int(total)
+
+
 def _estimate_direct_epfd_setup_gpu_bytes(
     *,
     time_count: int,
@@ -5628,6 +5739,7 @@ def _estimate_direct_epfd_setup_gpu_bytes(
     need_pointings: bool,
     need_beam_demand: bool,
     demand_count_dtype: Any,
+    lut_overhead_bytes: int = 0,
 ) -> int:
     total = 0
     time_count_i = int(max(0, time_count))
@@ -5642,6 +5754,12 @@ def _estimate_direct_epfd_setup_gpu_bytes(
         total += _shape_nbytes((time_count_i,), demand_count_dtype)
     if need_pointings:
         total += 2 * _shape_nbytes((time_count_i, sky_total_i), np.float32)
+    # Session-resident LUTs (S.1528 gain LUT, atmosphere LUT, RAS pattern
+    # LUT, surface-PFD K-LUT, M.2101 element LUT, Custom-2D LUT).  These
+    # are allocated once at session prepare and stay resident; the caller
+    # provides an estimate so we can account for them in the per-batch
+    # peak — small for most configs, but 10-20 MB when 2-D LUTs are in play.
+    total += int(max(0, lut_overhead_bytes))
     return int(total)
 
 
@@ -5961,6 +6079,7 @@ def _estimate_direct_epfd_combined_gpu_peaks(
     activity_gpu_resident_bytes: int | None = None,
     activity_gpu_peak_bytes: int | None = None,
     uemr_mode: bool = False,
+    lut_overhead_bytes: int = 0,
 ) -> dict[str, int]:
     orbit_state_bytes = _estimate_direct_epfd_orbit_state_gpu_bytes(
         time_count=int(batch_timesteps),
@@ -5976,6 +6095,7 @@ def _estimate_direct_epfd_combined_gpu_peaks(
         need_pointings=bool(need_pointings),
         need_beam_demand=bool(need_beam_demand),
         demand_count_dtype=demand_count_dtype,
+        lut_overhead_bytes=int(max(0, lut_overhead_bytes)),
     )
     visible_bytes = _estimate_direct_epfd_visible_resident_gpu_bytes(
         time_count=int(batch_timesteps),
@@ -7475,6 +7595,23 @@ def _plan_direct_epfd_iteration_schedule(
     }
 
 
+def _radio_horizon_visibility_threshold_deg(
+    frequency_ghz: float,
+    radio_horizon_tec: float,
+) -> float:
+    """Return the visibility elevation threshold (deg) for radio-horizon mode.
+
+    Combines tropospheric refraction (ITU-R P.834, ~0.57° independent of
+    frequency) with ionospheric refraction (~0.0256 * TEC/30 / f_GHz²).
+    The result is negative — it extends visibility below the geometric horizon.
+    """
+    tropo_deg = 0.57
+    freq_ghz_sq = float(frequency_ghz) ** 2
+    tec_factor = max(0.0, float(radio_horizon_tec)) / 30.0
+    iono_deg = 0.0256 * tec_factor / freq_ghz_sq if freq_ghz_sq > 0 else 0.0
+    return -(tropo_deg + iono_deg)
+
+
 def _compute_gpu_direct_epfd_batch_device(
     *,
     session: Any,
@@ -7647,6 +7784,28 @@ def _compute_gpu_direct_epfd_batch_device(
         _uemr_topo = _sat_topo_visible[:, :, :3]
         _tel_az = None if pointings is None else pointings["azimuth_deg"]
         _tel_el = None if pointings is None else pointings["elevation_deg"]
+        # Compute the emission-mask leakage fraction into the RAS band.
+        # For a flat mask with non-overlapping bands this is 0; for
+        # overlapping bands it captures the mask-shaped power fraction.
+        _uemr_slab_fraction = 1.0
+        if spectrum_plan_context is not None:
+            try:
+                # The spectrum plan stores pre-integrated cell leakage
+                # factors. For UEMR (reuse=1, one slot) the first cell's
+                # factor IS the mask-integrated overlap fraction.
+                _uemr_slab_fraction = float(
+                    spectrum_plan_context.cell_leakage_factors[0]
+                )
+            except Exception:
+                _uemr_slab_fraction = 1.0
+        # Attribute UEMR power-kernel time to 'power_accumulation' in
+        # the stage breakdown.  Without this block, the UEMR GPU work
+        # completes asynchronously and its wall-clock time is absorbed
+        # into export_copy's first D2H sync, producing misleading
+        # breakdowns (power=0.0s, export_copy inflated).  The explicit
+        # synchronize() here is the same sync the first D2H would do
+        # anyway, so no performance cost; it just moves the attribution.
+        _uemr_power_t0 = perf_counter() if profile_stages else None
         _uemr_result = _uemr_accum(
             uemr_pattern_context=s1528_pattern_context,
             ras_pattern_context=ras_pattern_context,
@@ -7660,14 +7819,28 @@ def _compute_gpu_direct_epfd_batch_device(
             target_pfd_dbw_m2_channel=power_input.get("target_pfd_dbw_m2_channel"),
             satellite_ptx_dbw_channel=power_input.get("satellite_ptx_dbw_channel"),
             satellite_eirp_dbw_channel=power_input.get("satellite_eirp_dbw_channel"),
-            eirp_slab_fraction_lin=1.0,
+            eirp_slab_fraction_lin=float(_uemr_slab_fraction),
             visibility_elev_threshold_deg=float(visibility_elev_threshold_deg),
             include_epfd=bool(write_epfd),
             include_prx_total=bool(write_prx_total),
             include_per_satellite_prx=bool(write_per_satellite_prx_ras_station),
             include_total_pfd=bool(write_total_pfd_ras_station),
             include_per_satellite_pfd=bool(write_per_satellite_pfd_ras_station),
+            random_power_variation=bool(power_input.get("uemr_random_power", False)),
+            power_dtype=getattr(session, "power_dtype", np.float32),
+            pattern_dtype=getattr(session, "pattern_dtype", np.float32),
         )
+        if (
+            profile_stages
+            and stage_timings is not None
+            and _uemr_power_t0 is not None
+        ):
+            cp.cuda.Stream.null.synchronize()
+            _accumulate_profile_timing(
+                stage_timings,
+                "power_accumulation",
+                perf_counter() - float(_uemr_power_t0),
+            )
         # The UEMR kernel produces tensors with the SAME layout as the
         # directive kernel: (T, 1, N_sky) for Prx_total / EPFD,
         # (T, 1, 1) for PFD_total, (T, S) for per-satellite. Across
@@ -7991,6 +8164,7 @@ def _compute_gpu_direct_epfd_batch_device(
             "sat_azel_visible": sat_azel_visible,
             "orbit_radius_eff": orbit_radius_eff,
             "sat_beam_counts_used_full": None,
+            "sat_eligible_mask": None,
             "diag_result": None,
             "debug_direct_epfd_stats": debug_direct_epfd_stats,
             "beam_finalize_substage_timings": {},
@@ -8136,6 +8310,7 @@ def _compute_gpu_direct_epfd_batch_device(
                 scheduler_target_profile="high_throughput",
                 debug_direct_epfd=bool(debug_direct_epfd),
                 return_device=True,
+                visibility_elev_threshold_deg=float(visibility_elev_threshold_deg),
             )
         except Exception as exc:
             stage_name = str(getattr(exc, "stage", "beam_finalize") or "beam_finalize")
@@ -8649,6 +8824,8 @@ def _prepare_multi_system_extra_context(
     normalized_split_denominator_mode: str,
     n_cells_total: int,
     sys_idx: int,
+    use_radio_horizon: bool = False,
+    radio_horizon_tec: float = 30.0,
 ) -> dict[str, Any]:
     """Prepare per-system GPU contexts for a secondary system in multi-system mode.
 
@@ -8688,6 +8865,10 @@ def _prepare_multi_system_extra_context(
         or bool(sys_pattern_kwargs.get("isotropic", False))
     )
     if any_power_outputs:
+        # Custom-1D / Custom-2D take precedence when the scenario supplies
+        # a ``custom_pattern`` kwarg — they can't be expressed as Lt/Lr or
+        # N_H/N_V, and the loaded LUT fully defines the pattern.
+        _custom_pat = sys_pattern_kwargs.get("custom_pattern")
         if sys_uemr_mode:
             # UEMR: isotropic per-satellite source — uses a minimal
             # pattern context that returns 0 dBi everywhere. Skips the
@@ -8695,6 +8876,22 @@ def _prepare_multi_system_extra_context(
             sys_s1528_pattern_context = session.prepare_isotropic_pattern_context(
                 wavelength_m=sys_wavelength_m,
             )
+        elif _custom_pat is not None:
+            from scepter.custom_antenna import KIND_1D as _KIND_1D
+            # ``system_id=("tx", sys_idx)`` tags this entry so every
+            # system's LRU bucket is disjoint from the others (and
+            # disjoint from the RAS-side bucket for the same system
+            # when the user picks a different custom pattern there).
+            if getattr(_custom_pat, "kind", None) == _KIND_1D:
+                sys_s1528_pattern_context = session.prepare_custom_pattern_1d_context(
+                    pattern=_custom_pat, wavelength_m=float(sys_wavelength_m),
+                    system_id=("tx", sys_idx),
+                )
+            else:
+                sys_s1528_pattern_context = session.prepare_custom_pattern_2d_context(
+                    pattern=_custom_pat, wavelength_m=float(sys_wavelength_m),
+                    system_id=("tx", sys_idx),
+                )
         elif "Lt" in sys_pattern_kwargs:
             sys_s1528_pattern_context = session.prepare_s1528_pattern_context(
                 wavelength_m=sys_wavelength_m,
@@ -8745,11 +8942,31 @@ def _prepare_multi_system_extra_context(
     else:
         sys_ras_station_ant_diam_m = None
     sys_ras_pattern_context = None
-    if any_receive_outputs and sys_ras_station_ant_diam_m is not None:
-        sys_ras_pattern_context = session.prepare_ras_pattern_context(
-            diameter_m=sys_ras_station_ant_diam_m,
-            wavelength_m=sys_wavelength_m,
-        )
+    sys_ras_custom_pattern = sys_kw.get("ras_custom_pattern")
+    if any_receive_outputs:
+        if sys_ras_custom_pattern is not None:
+            # User-supplied RAS pattern takes precedence over the
+            # analytical RA.1631 form. Stage 14 made
+            # ``_evaluate_ras_pattern_cp`` polymorphic so the downstream
+            # power path consumes the custom context transparently.
+            from scepter.custom_antenna import KIND_1D as _RAS_KIND_1D
+            if getattr(sys_ras_custom_pattern, "kind", None) == _RAS_KIND_1D:
+                sys_ras_pattern_context = session.prepare_custom_pattern_1d_context(
+                    pattern=sys_ras_custom_pattern,
+                    wavelength_m=float(sys_wavelength_m),
+                    system_id=("ras", sys_idx),
+                )
+            else:
+                sys_ras_pattern_context = session.prepare_custom_pattern_2d_context(
+                    pattern=sys_ras_custom_pattern,
+                    wavelength_m=float(sys_wavelength_m),
+                    system_id=("ras", sys_idx),
+                )
+        elif sys_ras_station_ant_diam_m is not None:
+            sys_ras_pattern_context = session.prepare_ras_pattern_context(
+                diameter_m=sys_ras_station_ant_diam_m,
+                wavelength_m=sys_wavelength_m,
+            )
 
     # Atmosphere context (per-system if frequency differs)
     sys_atmosphere_context = None
@@ -8787,6 +9004,11 @@ def _prepare_multi_system_extra_context(
         power_variation_mode=sys_kw.get("power_variation_mode", "fixed"),
         power_range_min_db=sys_kw.get("power_range_min_db"),
         power_range_max_db=sys_kw.get("power_range_max_db"),
+    )
+    # UEMR random power variation — injected into the power dict so
+    # the UEMR kernel can read it. Non-UEMR systems ignore it.
+    sys_power_input["uemr_random_power"] = bool(
+        sys_kw.get("uemr_random_power", False)
     )
     # Per-system cell count from the system's own active grid
     if "active_cell_longitudes" in sys_kw:
@@ -8938,6 +9160,11 @@ def _prepare_multi_system_extra_context(
         else None,
         "ras_service_cell_index": int(sys_kw.get("ras_service_cell_index", 0)),
         "ras_service_cell_active": bool(sys_kw.get("ras_service_cell_active", False)),
+        "effective_ras_pointing_mode": (
+            str(sys_kw.get("ras_pointing_mode", "ras_station"))
+            if bool(sys_kw.get("ras_service_cell_active", False))
+            else "cell_center"
+        ),
         "system_name": str(sys_kw.get("_system_name", f"System {sys_idx + 1}")),
         "storage_attrs": sys_kw.get("storage_attrs", {}),
     }
@@ -8975,6 +9202,14 @@ def _prepare_multi_system_extra_context(
         ctx["antenna_model"] = "m2101"
     else:
         ctx["antenna_model"] = "s1528_rec1_2"
+    # Per-system radio-horizon visibility threshold. Each system may
+    # operate at a different frequency → different ionospheric refraction.
+    if use_radio_horizon:
+        ctx["visibility_elev_threshold_deg"] = _radio_horizon_visibility_threshold_deg(
+            sys_frequency_ghz, radio_horizon_tec,
+        )
+    else:
+        ctx["visibility_elev_threshold_deg"] = 0.0
     return ctx
 
 
@@ -9206,6 +9441,7 @@ def run_gpu_direct_epfd(
     pattern_kwargs: Mapping[str, Any],
     wavelength: u.Quantity | float,
     ras_station_ant_diam: u.Quantity | float,
+    ras_custom_pattern: Any | None = None,
     frequency: u.Quantity | float,
     ras_station_elev_range: tuple[Any, Any],
     observer_alt_km_ras_station: float,
@@ -9302,6 +9538,7 @@ def run_gpu_direct_epfd(
     systems: list[dict[str, Any]] | None = None,
     output_system_groups: list[dict[str, Any]] | None = None,
     uemr_mode: bool = False,
+    uemr_random_power: bool = False,
 ) -> dict[str, Any]:
     """
     Run the notebook-facing GPU direct-EPFD workflow.
@@ -9512,6 +9749,9 @@ def run_gpu_direct_epfd(
         power_range_min_db=power_range_min_db,
         power_range_max_db=power_range_max_db,
     )
+    # UEMR random power variation — inject into the power dict so the
+    # UEMR kernel can read it (mirrors _prepare_multi_system_extra_context).
+    power_input["uemr_random_power"] = bool(uemr_random_power)
     spectrum_plan_effective = normalize_direct_epfd_spectrum_plan(
         spectrum_plan=spectrum_plan,
         channel_bandwidth_mhz=float(power_input["bandwidth_mhz"]),
@@ -9677,11 +9917,9 @@ def run_gpu_direct_epfd(
     # daytime).  The user can override TEC via radio_horizon_tec.
     # Significant below ~300 MHz, negligible above ~1 GHz.
     if bool(use_radio_horizon):
-        _tropo_deg = 0.57
-        _freq_ghz_sq = float(frequency_ghz) ** 2
-        _tec_factor = max(0.0, float(radio_horizon_tec)) / 30.0
-        _iono_deg = 0.0256 * _tec_factor / _freq_ghz_sq if _freq_ghz_sq > 0 else 0.0
-        visibility_elev_threshold_deg = -(_tropo_deg + _iono_deg)
+        visibility_elev_threshold_deg = _radio_horizon_visibility_threshold_deg(
+            frequency_ghz, radio_horizon_tec,
+        )
     else:
         visibility_elev_threshold_deg = 0.0
     atmosphere_max_path_length_km = float(
@@ -9773,12 +10011,27 @@ def run_gpu_direct_epfd(
         ):
             storage_attrs_effective.pop(_rmk, None)
     storage_attrs_effective["wavelength_m"] = float(wavelength_m)
-    storage_attrs_effective["ras_station_ant_diam_m"] = float(ras_station_ant_diam_m)
-    # Store max RAS gain for optional S.1586 normalization in postprocess.
-    _d_wlen = float(ras_station_ant_diam_m) / float(wavelength_m)
-    storage_attrs_effective["ras_max_gain_dbi"] = float(
-        10.0 * np.log10(float(np.pi * _d_wlen) ** 2)
-    )
+    # For a Custom RAS pattern the ``diameter_m`` + ``wavelength_m``
+    # parameterisation is not meaningful — the peak and sidelobe
+    # shape come entirely from the LUT. Flag the diameter with NaN
+    # rather than writing the placeholder 1 m value the GUI kwargs
+    # builder feeds in (``scepter_GUI.py:_build_run_kwargs``), so
+    # postprocess tools and anyone inspecting the HDF5 attrs see
+    # "not applicable" instead of a confusing plausible number. The
+    # ``ras_max_gain_dbi`` attr below still carries the authoritative
+    # peak — that's what S.1586 normalization actually reads.
+    if ras_custom_pattern is not None and hasattr(ras_custom_pattern, "peak_gain_dbi"):
+        storage_attrs_effective["ras_station_ant_diam_m"] = float("nan")
+        storage_attrs_effective["ras_max_gain_dbi"] = float(ras_custom_pattern.peak_gain_dbi)
+        storage_attrs_effective["ras_custom_pattern_kind"] = str(
+            getattr(ras_custom_pattern, "kind", "unknown")
+        )
+    else:
+        storage_attrs_effective["ras_station_ant_diam_m"] = float(ras_station_ant_diam_m)
+        _d_wlen = float(ras_station_ant_diam_m) / float(wavelength_m)
+        storage_attrs_effective["ras_max_gain_dbi"] = float(
+            10.0 * np.log10(float(np.pi * _d_wlen) ** 2)
+        )
     if spectrum_plan_effective is not None:
         storage_attrs_effective.update(
             {
@@ -10138,10 +10391,28 @@ def run_gpu_direct_epfd(
             or bool(pattern_kwargs.get("uemr_mode", False))
             or bool(pattern_kwargs.get("isotropic", False))
         )
+        _single_custom_pat = pattern_kwargs.get("custom_pattern")
         if _single_uemr:
             s1528_pattern_context = session.prepare_isotropic_pattern_context(
                 wavelength_m=wavelength_m,
             )
+        elif _single_custom_pat is not None:
+            from scepter.custom_antenna import KIND_1D as _KIND_1D
+            # The single-system path handles system 0 in both
+            # single-system and multi-system runs, so tag the
+            # bucket with ``("tx", 0)`` to match the convention
+            # used by _prepare_multi_system_extra_context for
+            # the secondaries.
+            if getattr(_single_custom_pat, "kind", None) == _KIND_1D:
+                s1528_pattern_context = session.prepare_custom_pattern_1d_context(
+                    pattern=_single_custom_pat, wavelength_m=float(wavelength_m),
+                    system_id=("tx", 0),
+                )
+            else:
+                s1528_pattern_context = session.prepare_custom_pattern_2d_context(
+                    pattern=_single_custom_pat, wavelength_m=float(wavelength_m),
+                    system_id=("tx", 0),
+                )
         elif "Lt" in pattern_kwargs:
             # Rec 1.4 analytical (Taylor/Bessel) pattern
             s1528_pattern_context = session.prepare_s1528_pattern_context(
@@ -10183,14 +10454,32 @@ def run_gpu_direct_epfd(
             )
     else:
         s1528_pattern_context = None
-    ras_pattern_context = (
-        session.prepare_ras_pattern_context(
-            diameter_m=ras_station_ant_diam_m,
-            wavelength_m=wavelength_m,
+    if any_receive_outputs and ras_custom_pattern is not None:
+        # Single-system Custom RAS: matches the multi-system dispatch
+        # in the earlier branch. Custom-1D routes to the 1-D session
+        # preparer; Custom-2D goes to the 2-D preparer (which the
+        # downstream ``_evaluate_ras_pattern_cp`` currently rejects —
+        # see Stage 14 — but the preparation itself is well-defined).
+        from scepter.custom_antenna import KIND_1D as _RAS_KIND_1D_LOC
+        if getattr(ras_custom_pattern, "kind", None) == _RAS_KIND_1D_LOC:
+            ras_pattern_context = session.prepare_custom_pattern_1d_context(
+                pattern=ras_custom_pattern, wavelength_m=float(wavelength_m),
+                system_id=("ras", 0),
+            )
+        else:
+            ras_pattern_context = session.prepare_custom_pattern_2d_context(
+                pattern=ras_custom_pattern, wavelength_m=float(wavelength_m),
+                system_id=("ras", 0),
+            )
+    else:
+        ras_pattern_context = (
+            session.prepare_ras_pattern_context(
+                diameter_m=ras_station_ant_diam_m,
+                wavelength_m=wavelength_m,
+            )
+            if any_receive_outputs
+            else None
         )
-        if any_receive_outputs
-        else None
-    )
     atmosphere_context = (
         session.prepare_atmosphere_lut_context(
             frequency_ghz=frequency_ghz,
@@ -10210,6 +10499,15 @@ def run_gpu_direct_epfd(
     # Surface-PFD cap LUT for system 0 (primary contexts).  Honours the
     # host run's atmosphere toggle automatically because we pass the
     # already-prepared atmosphere_context (or None).
+    # When the cap is disabled at the project/runtime level, zero out
+    # the per-MHz / per-channel limit values so they don't leak into
+    # the power kernel (which rejects a limit without a matching
+    # ``peak_pfd_lut_context``).  The GUI disables the *toggle* but
+    # still serialises the last-used threshold values, so the kwargs
+    # arrive here with non-None limits even though the cap is off.
+    if not bool(max_surface_pfd_enabled):
+        max_surface_pfd_dbw_m2_mhz = None
+        max_surface_pfd_dbw_m2_channel = None
     peak_pfd_lut_context = None
     if bool(max_surface_pfd_enabled) and any_power_outputs and s1528_pattern_context is not None:
         try:
@@ -10346,6 +10644,7 @@ def run_gpu_direct_epfd(
                           else "s1528_rec1_2")
                 )
             ),
+            "visibility_elev_threshold_deg": float(visibility_elev_threshold_deg),
         })
         for sys_idx in range(1, len(systems)):
             sys_kw = systems[sys_idx]
@@ -10370,6 +10669,8 @@ def run_gpu_direct_epfd(
                 normalized_split_denominator_mode=str(normalized_split_denominator_mode),
                 n_cells_total=n_cells_total,
                 sys_idx=sys_idx,
+                use_radio_horizon=bool(use_radio_horizon),
+                radio_horizon_tec=float(radio_horizon_tec),
             )
             _multi_system_contexts.append(sys_ctx)
         # If any secondary system has boresight, we need pointings even if
@@ -11071,7 +11372,7 @@ def run_gpu_direct_epfd(
                         None
                         if cell_activity_seed_base is None
                         else int(
-                            (int(cell_activity_seed_base) + ii * 1_000_000 + bi * 10_000)
+                            hash((int(cell_activity_seed_base), ii, bi))
                             % (2**32 - 1)
                         )
                     )
@@ -11577,6 +11878,8 @@ def run_gpu_direct_epfd(
                                 profile_stage_timings_summary[name] = (
                                     float(profile_stage_timings_summary.get(name, 0.0)) + float(value)
                                 )
+                            _batch_wall = perf_counter() - _batch_loop_t0
+                            _stage_sum = sum(float(v) for v in stage_timings.values())
                             _emit_direct_epfd_progress(
                                 progress_callback,
                                 kind="batch_done",
@@ -11586,9 +11889,9 @@ def run_gpu_direct_epfd(
                                 batch_index=int(bi),
                                 batch_total=int(n_batches),
                                 stage_timings={k: float(v) for k, v in stage_timings.items()},
+                                batch_elapsed_seconds=float(_batch_wall),
+                                **{k: float(v) for k, v in stage_timings.items()},
                             )
-                            _batch_wall = perf_counter() - _batch_loop_t0
-                            _stage_sum = sum(float(v) for v in stage_timings.values())
                             print(f"[batch {bi}] wall={_batch_wall:.3f}s stages={_stage_sum:.3f}s overhead={_batch_wall - _stage_sum:.3f}s")
                         cancel_mode = _query_direct_epfd_cancel_mode(cancel_callback)
                         if cancel_mode in {"graceful", "force"}:
@@ -11782,8 +12085,12 @@ def run_gpu_direct_epfd(
                                             )
                                             _ms_sat_topo = cp.asarray(_ms_ras_result["topo"])[:, 0, :, :]
                                             _ms_sat_azel = cp.asarray(_ms_ras_result["sat_azel"])[:, 0, :, :]
+                                            _ms_vis_threshold = float(_ms_ctx.get(
+                                                "visibility_elev_threshold_deg",
+                                                visibility_elev_threshold_deg,
+                                            ))
                                             _ms_sat_keep = cp.any(
-                                                _ms_sat_topo[..., 1] > cp.float32(visibility_elev_threshold_deg), axis=0,
+                                                _ms_sat_topo[..., 1] > cp.float32(_ms_vis_threshold), axis=0,
                                             )
                                             _ms_has_visible = bool(int(cp.any(_ms_sat_keep).get()) != 0)
 
@@ -11798,7 +12105,7 @@ def run_gpu_direct_epfd(
                                             _ms_cell_seed = (
                                                 None if _ms_seed is None
                                                 else int(
-                                                    (int(_ms_seed) + ii * 1_000_000 + bi * 10_000 + _ms_idx * 100)
+                                                    hash((int(_ms_seed), ii, bi, _ms_idx))
                                                     % (2**32 - 1)
                                                 )
                                             )
@@ -11845,7 +12152,9 @@ def run_gpu_direct_epfd(
                                                     cell_spectral_weight_dev=None,
                                                     dynamic_spectrum_state=None,
                                                     ras_service_cell_index=_ms_ctx["ras_service_cell_index"],
-                                                    effective_ras_pointing_mode=effective_ras_pointing_mode,
+                                                    effective_ras_pointing_mode=str(
+                                                        _ms_ctx.get("effective_ras_pointing_mode", effective_ras_pointing_mode)
+                                                    ),
                                                     ras_guard_angle_rad=ras_guard_angle_rad,
                                                     boresight_active=bool(_ms_ctx.get("boresight_active", False)),
                                                     boresight_theta1_deg=_ms_ctx.get("boresight_theta1_deg"),
@@ -11925,7 +12234,7 @@ def run_gpu_direct_epfd(
                                                     ),
                                                     power_sky_slab=batch_power_sky_slab,
                                                     spectral_slab=int(batch_plan_for_retry.get("spectral_slab", 1)),
-                                                    visibility_elev_threshold_deg=float(visibility_elev_threshold_deg),
+                                                    visibility_elev_threshold_deg=float(_ms_vis_threshold),
                                                     debug_direct_epfd=False,
                                                     write_epfd=bool(output_family_plan["needs_epfd"]),
                                                     write_prx_total=bool(output_family_plan["needs_total_prx"]),
@@ -12015,7 +12324,7 @@ def run_gpu_direct_epfd(
                                                         )
                                                         _ms_net_total = _beam_total_over_time_device(cp, _ms_beam_dev)
                                                         _ms_vis_mask = cp.asarray(
-                                                            _ms_sat_topo[..., 1] > cp.float32(visibility_elev_threshold_deg),
+                                                            _ms_sat_topo[..., 1] > cp.float32(_ms_vis_threshold),
                                                             dtype=bool,
                                                         )
                                                         _ms_vis_hist, _ = _visible_beam_statistics_device(
@@ -12818,12 +13127,28 @@ def run_gpu_direct_epfd(
                                 db_offset_db=0.0,
                             )
 
+                        # Async D2H for the outputs that are only stored
+                        # in ``batch_payload`` and forwarded to the writer
+                        # (EPFD, Prx_total, PFD_total).  The host buffers
+                        # become valid after ``session.sync_export_stream()``
+                        # at the end of this export block; between queue
+                        # and sync the other host-side work can proceed.
+                        # Per-satellite outputs stay synchronous because
+                        # they are immediately reshaped / padded here.
+                        # Falls back to the blocking helper for sessions
+                        # (test stubs, alternative backends) that don't
+                        # expose the async method.
+                        _d2h_async = getattr(
+                            session, "copy_device_to_host_async", None,
+                        )
+                        if _d2h_async is None:
+                            _d2h_async = gpu_module.copy_device_to_host
                         if write_epfd:
-                            batch_payload["EPFD_W_m2"] = gpu_module.copy_device_to_host(
+                            batch_payload["EPFD_W_m2"] = _d2h_async(
                                 power_result["EPFD_W_m2"]
                             )
                         if write_prx_total:
-                            batch_payload["Prx_total_W"] = gpu_module.copy_device_to_host(
+                            batch_payload["Prx_total_W"] = _d2h_async(
                                 power_result["Prx_total_W"]
                             )
                         if write_per_satellite_prx_ras_station:
@@ -12843,7 +13168,7 @@ def run_gpu_direct_epfd(
                                 int(n_sats_total), fill=0.0,
                             )
                         if write_total_pfd_ras_station:
-                            batch_payload["PFD_total_RAS_STATION_W_m2"] = gpu_module.copy_device_to_host(
+                            batch_payload["PFD_total_RAS_STATION_W_m2"] = _d2h_async(
                                 power_result["PFD_total_RAS_STATION_W_m2"]
                             )
                         if write_per_satellite_pfd_ras_station:
@@ -12957,14 +13282,31 @@ def run_gpu_direct_epfd(
                                 _combined_vis,
                             )
                         else:
-                            _append_series_segment(
-                                beam_stats_collector["network_total_beams_over_time"],
-                                gpu_module.copy_device_to_host(network_total_dev),
-                            )
-                            _append_series_segment(
-                                beam_stats_collector["visible_total_beams_over_time"],
-                                gpu_module.copy_device_to_host(visible_total_dev),
-                            )
+                            # Batch the two (T,) D2H transfers into one to
+                            # save a sync round-trip per batch. Both tensors
+                            # are int64 and time-aligned.
+                            if network_total_dev.dtype == visible_total_dev.dtype:
+                                _nv_dev = cp.stack(
+                                    (network_total_dev, visible_total_dev), axis=0
+                                )
+                                _nv_host = gpu_module.copy_device_to_host(_nv_dev)
+                                _append_series_segment(
+                                    beam_stats_collector["network_total_beams_over_time"],
+                                    _nv_host[0],
+                                )
+                                _append_series_segment(
+                                    beam_stats_collector["visible_total_beams_over_time"],
+                                    _nv_host[1],
+                                )
+                            else:
+                                _append_series_segment(
+                                    beam_stats_collector["network_total_beams_over_time"],
+                                    gpu_module.copy_device_to_host(network_total_dev),
+                                )
+                                _append_series_segment(
+                                    beam_stats_collector["visible_total_beams_over_time"],
+                                    gpu_module.copy_device_to_host(visible_total_dev),
+                                )
 
                         # Combined beam demand: sum across all systems
                         if _multi_system_active and _per_system_beam_stats_collectors:
@@ -13033,6 +13375,17 @@ def run_gpu_direct_epfd(
                             sat_eligible_mask,
                             dtype=np.bool_,
                         )
+
+                    # Wait for any async export-stream D2H copies (EPFD,
+                    # Prx_total, PFD_total) to finish before handing the
+                    # host buffers to the writer.  The sync covers every
+                    # buffer queued via ``session.copy_device_to_host_async``
+                    # above; the synchronous per-satellite D2Hs already
+                    # blocked before the padding/collapse step.  Safe no-op
+                    # for test-stub sessions that lack the method.
+                    _sync_export = getattr(session, "sync_export_stream", None)
+                    if callable(_sync_export):
+                        _sync_export()
 
                     export_stage_summary = _update_direct_epfd_stage_memory_summary(
                         export_stage_summary,
@@ -13182,6 +13535,18 @@ def run_gpu_direct_epfd(
                     if profile_stages and stage_timings:
                         _batch_wall = perf_counter() - _batch_loop_t0
                         _stage_sum = sum(float(v) for v in stage_timings.values())
+                        _emit_direct_epfd_progress(
+                            progress_callback,
+                            kind="batch_done",
+                            phase="compute",
+                            iteration_index=int(ii),
+                            iteration_total=int(iteration_count),
+                            batch_index=int(bi),
+                            batch_total=int(n_batches),
+                            stage_timings={k: float(v) for k, v in stage_timings.items()},
+                            batch_elapsed_seconds=float(_batch_wall),
+                            **{k: float(v) for k, v in stage_timings.items()},
+                        )
                         print(f"[batch {bi}] wall={_batch_wall:.3f}s stages={_stage_sum:.3f}s overhead={_batch_wall - _stage_sum:.3f}s")
                     if scheduler_runtime_state.get("gpu_effective_budget_lowered"):
                         configured_gpu_cap_bytes = int(
@@ -13496,8 +13861,14 @@ def run_gpu_direct_epfd(
                             _sg = _sf.require_group(_gc_prefix.rstrip("/"))
                             _sg.attrs["group_name"] = str(_gc_write["name"])
                             _sg.attrs["system_indices"] = np.array(_gc_indices, dtype=np.int32)
-                except Exception:
-                    pass
+                except Exception as _exc_grpmeta:  # noqa: BLE001 - surfaced via warning
+                    warnings.warn(
+                        f"Failed to write multi-system group metadata attrs at "
+                        f"{_gc_prefix!r}: {type(_exc_grpmeta).__name__}: {_exc_grpmeta}. "
+                        "Postprocess may be unable to locate this group's metadata.",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
 
                 # Per-group heatmap writes
                 _gc_hm_colls = _gc_write["heatmap_collectors"]
@@ -13691,8 +14062,14 @@ def run_gpu_direct_epfd(
                                                 _cg.create_dataset(_sak, data=_sav)
                                         else:
                                             _cg.attrs[_sak] = _sav
-                                    except Exception:
-                                        pass
+                                    except Exception as _exc_satt:  # noqa: BLE001
+                                        warnings.warn(
+                                            f"Could not write per-system storage attr "
+                                            f"{_sak!r} under {_gc_prefix}const: "
+                                            f"{type(_exc_satt).__name__}: {_exc_satt}",
+                                            RuntimeWarning,
+                                            stacklevel=2,
+                                        )
                                 # Write per-system constant datasets
                                 for _cds_name, _cds_key, _cds_dtype in [
                                     ("sat_orbit_radius_m_per_sat", "orbit_radius_host", np.float32),
@@ -13705,8 +14082,15 @@ def run_gpu_direct_epfd(
                                         _cds_arr = np.asarray(_cds_val, dtype=_cds_dtype)
                                         if _cds_name not in _cg:
                                             _cg.create_dataset(_cds_name, data=_cds_arr)
-                        except Exception:
-                            pass
+                        except Exception as _exc_syscnst:  # noqa: BLE001
+                            warnings.warn(
+                                f"Failed to write per-system constants at "
+                                f"{_gc_prefix}const: {type(_exc_syscnst).__name__}: "
+                                f"{_exc_syscnst}. Postprocess may miss per-system "
+                                "orbit/antenna/belt metadata.",
+                                RuntimeWarning,
+                                stacklevel=2,
+                            )
 
             # Write output_system_groups metadata to HDF5 for postprocess
             try:
@@ -13722,8 +14106,15 @@ def run_gpu_direct_epfd(
                         )
                     _gf.attrs["output_group_names"] = ";".join(_group_names_list)
                     _gf.attrs["output_group_prefixes"] = ";".join(_group_prefixes_list)
-            except Exception:
-                pass
+            except Exception as _exc_outgrp:  # noqa: BLE001
+                warnings.warn(
+                    "Failed to write root-level output_system_groups metadata "
+                    f"(output_group_count / output_group_names / output_group_prefixes): "
+                    f"{type(_exc_outgrp).__name__}: {_exc_outgrp}. "
+                    "Postprocess may be unable to enumerate multi-system groups.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
 
         writer = _get_registered_writer(storage_filename)
         _set_direct_epfd_progress_phase(
@@ -14060,11 +14451,11 @@ def init_simulation_results(
         pass
     with _WRITER_REGISTRY_LOCK:
         _FAILED_WRITER_REGISTRY.pop(filename, None)
-    _WRITER_DEFAULTS[filename] = {
-        "write_mode": write_mode,
-        "writer_queue_max_items": max(1, int(writer_queue_max_items)),
-        "writer_queue_max_bytes": max(1, int(writer_queue_max_bytes)),
-    }
+        _WRITER_DEFAULTS[filename] = {
+            "write_mode": write_mode,
+            "writer_queue_max_items": max(1, int(writer_queue_max_items)),
+            "writer_queue_max_bytes": max(1, int(writer_queue_max_bytes)),
+        }
     if write_mode == "async":
         _ensure_async_writer(
             filename,
@@ -15287,10 +15678,12 @@ class _AsyncH5Writer:
 
 def _get_writer_defaults(filename: str) -> dict[str, Any]:
     """Return per-file writer defaults or the module defaults if none were configured."""
+    with _WRITER_REGISTRY_LOCK:
+        per_file = dict(_WRITER_DEFAULTS.get(filename, {}))
     return {
-        "write_mode": _WRITER_DEFAULTS.get(filename, {}).get("write_mode", "async"),
-        "writer_queue_max_items": int(_WRITER_DEFAULTS.get(filename, {}).get("writer_queue_max_items", _DEFAULT_WRITER_QUEUE_MAX_ITEMS)),
-        "writer_queue_max_bytes": int(_WRITER_DEFAULTS.get(filename, {}).get("writer_queue_max_bytes", _DEFAULT_WRITER_QUEUE_MAX_BYTES)),
+        "write_mode": per_file.get("write_mode", "async"),
+        "writer_queue_max_items": int(per_file.get("writer_queue_max_items", _DEFAULT_WRITER_QUEUE_MAX_ITEMS)),
+        "writer_queue_max_bytes": int(per_file.get("writer_queue_max_bytes", _DEFAULT_WRITER_QUEUE_MAX_BYTES)),
     }
 
 
@@ -15603,6 +15996,8 @@ def _merge_multi_system_hdf5(
         )
 
         # Copy each system's data into /system_N/ groups
+        failed_indices: list[int] = []
+        failed_details: list[str] = []
         for sys_idx, (sys_file, sys_name) in enumerate(zip(per_system_files, system_names)):
             sys_group_name = f"system_{sys_idx}"
             try:
@@ -15622,8 +16017,24 @@ def _merge_multi_system_hdf5(
                     # Copy preaccumulated
                     if "preaccumulated" in src_f:
                         src_f.copy("preaccumulated", sys_group, name="preaccumulated")
-            except Exception:
-                pass  # Skip systems whose files are missing/corrupt
+            except Exception as exc:  # noqa: BLE001 - surfaced via warning + out_f attrs
+                # Remove any partially-created group so readers don't see half-copied state.
+                if sys_group_name in out_f:
+                    try:
+                        del out_f[sys_group_name]
+                    except Exception:
+                        pass
+                failed_indices.append(int(sys_idx))
+                failed_details.append(f"{sys_idx}:{sys_name}:{type(exc).__name__}:{exc}")
+                warnings.warn(
+                    f"_merge_multi_system_hdf5: system_{sys_idx} ({sys_name!r}) "
+                    f"could not be merged from {sys_file!r}: {type(exc).__name__}: {exc}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+        if failed_indices:
+            out_f.attrs["multi_system_failed_indices"] = np.array(failed_indices, dtype=np.int32)
+            out_f.attrs["multi_system_failed_details"] = ";".join(failed_details)
 
 
 # -----------------------------------------------------------------------------
@@ -16436,10 +16847,30 @@ def _summarize_direct_epfd_progress_events(
     predicted_gpu_spectrum_context_bytes_max = 0
     compute_budget_utilization_fraction_max = 0.0
     export_budget_utilization_fraction_max = 0.0
+    # Per-batch telemetry for benchmark post-processing (steady-state,
+    # percentile, and A/B comparisons).  Captured from batch_done events.
+    per_batch_events: list[dict[str, Any]] = []
 
     for event in progress_events:
         payload = dict(event)
         kind = str(payload.get("kind", "")).strip().lower()
+        if kind == "batch_done":
+            _batch_row: dict[str, Any] = {
+                "iteration_index": int(payload.get("iteration_index", 0) or 0),
+                "batch_index": int(payload.get("batch_index", 0) or 0),
+            }
+            if payload.get("batch_elapsed_seconds") is not None:
+                _batch_row["batch_elapsed_seconds"] = float(payload["batch_elapsed_seconds"])
+            for _k in (
+                "orbit_propagation", "ras_geometry", "cell_link_library",
+                "beam_finalize", "power_accumulation", "export_copy",
+                "write_enqueue", "pointings", "cell_activity_setup",
+                "spectrum_activity_weighting", "cll_derive_from_eci",
+                "cll_add_chunk",
+            ):
+                if payload.get(_k) is not None:
+                    _batch_row[_k] = float(payload[_k])
+            per_batch_events.append(_batch_row)
         if kind == "warning":
             warning_count += 1
         retry_count = max(retry_count, int(payload.get("scheduler_retry_count", 0) or 0))
@@ -16524,6 +16955,7 @@ def _summarize_direct_epfd_progress_events(
             export_budget_utilization_fraction_max
         ),
         "underfill_reasons": tuple(sorted(underfill_reasons)),
+        "per_batch_events": tuple(per_batch_events),
     }
 
 
@@ -16753,9 +17185,20 @@ def _build_direct_epfd_run_request_from_gui_state(
     window._load_state_into_widgets(state)
     current_state = window.current_state()
     constellation = sgui_module.build_constellation_from_state(current_state)
-    antenna_func, wavelength, pattern_kwargs = sgui_module._satellite_antenna_pattern_spec(
-        current_state.active_system().satellite_antennas
-    )
+    s0 = current_state.active_system()
+    _is_uemr = sgui_module._system_is_uemr(s0)
+    if _is_uemr:
+        from scepter.antenna import isotropic_pattern
+        antenna_func = isotropic_pattern
+        _ras_freq = current_state.ras_antenna.frequency_mhz
+        wavelength = (29979.2458 / float(_ras_freq)) * u.cm if _ras_freq else 15.0 * u.cm
+        pattern_kwargs = {"uemr_mode": True}
+    else:
+        antenna_func, wavelength, pattern_kwargs = sgui_module._satellite_antenna_pattern_spec(
+            s0.satellite_antennas.to_antennas_config(
+                ras=current_state.ras_antenna,
+            )
+        )
     contour_summary = window._build_run_contour_summary(
         current_state,
         constellation,
@@ -16792,7 +17235,17 @@ def _build_direct_epfd_run_request_from_gui_state(
             sys_state = window.current_state()
             sys_constellation = sgui_module.build_constellation_from_state(sys_state)
             sys_ant = sys_state.active_system().satellite_antennas
-            _, sys_wl, sys_pk = sgui_module._satellite_antenna_pattern_spec(sys_ant)
+            _sys_is_uemr = sgui_module._system_is_uemr(sys_state.active_system())
+            if _sys_is_uemr:
+                from scepter.antenna import isotropic_pattern as _iso_pat
+                _ = _iso_pat
+                _sys_ras_freq = sys_state.ras_antenna.frequency_mhz
+                sys_wl = (29979.2458 / float(_sys_ras_freq)) * u.cm if _sys_ras_freq else 15.0 * u.cm
+                sys_pk = {"uemr_mode": True}
+            else:
+                _, sys_wl, sys_pk = sgui_module._satellite_antenna_pattern_spec(
+                    sys_ant.to_antennas_config(ras=sys_state.ras_antenna)
+                )
             sys_contour = window._build_run_contour_summary(
                 sys_state, sys_constellation, _, sys_wl, sys_pk,
             )
@@ -17170,10 +17623,33 @@ def benchmark_direct_epfd_runs(
         started = float(time_func())
         gpu_metric_samples: tuple[dict[str, Any], ...] = tuple()
         gpu_sampler.start()
+        # Multi-system GUI configs return kwargs carrying the
+        # `_multi_system=True` dispatch marker (set by
+        # ``_build_multi_system_run_request``) plus the nested
+        # `_system_run_kwargs` payloads.  The GUI runtime peels these
+        # off and calls :func:`run_gpu_multi_system_epfd`; the
+        # benchmark helper needs to do the same so UEMR /
+        # multi-system configs don't silently hit an unknown-kwarg
+        # error against :func:`run_gpu_direct_epfd`.
+        is_multi_system = bool(run_kwargs.pop("_multi_system", False))
         try:
             if graceful_stop_after_batch_count is not None or callable(user_cancel_callback):
                 run_kwargs["cancel_callback"] = _capture_cancel
-            result = runner_fn(progress_callback=_capture_progress, **run_kwargs)
+            if is_multi_system and runner is None:
+                system_run_kwargs = run_kwargs.pop("_system_run_kwargs", []) or []
+                system_names = run_kwargs.pop("_system_names", []) or []
+                output_system_groups = run_kwargs.pop(
+                    "_output_system_groups", None
+                )
+                result = run_gpu_multi_system_epfd(
+                    system_run_kwargs=system_run_kwargs,
+                    shared_run_kwargs=run_kwargs,
+                    system_names=system_names,
+                    output_system_groups=output_system_groups,
+                    progress_callback=_capture_progress,
+                )
+            else:
+                result = runner_fn(progress_callback=_capture_progress, **run_kwargs)
         except Exception as exc:
             elapsed_seconds = max(0.0, float(time_func()) - started)
             gpu_metric_samples = gpu_sampler.stop()

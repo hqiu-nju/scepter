@@ -8,7 +8,8 @@ A brief description of the package.
 """
 
 __doc__ = "SCEPTer, Simulating Constellation Emission Patterns for Telescopes"
-__version__ = "0.25.2"
+__version__ = "0.25.3"
+__codename__ = "Patterns Strike Back"
 
 # On Windows, conda environments require Library/bin on PATH for DLL
 # loading (BLAS, CUDA, OpenSSL, etc.).  Fix this before any C-extension
@@ -89,5 +90,14 @@ import matplotlib.pyplot as plt
 # Import the submodule here
 
 # Optionally, add the submodule to the __all__ list
-__all__ = ['skynet','obs','tlefinder','tleforger','antenna','earthgrid','satsim','scenario','visualise','gpu_accel']
+__all__ = [
+    'skynet', 'obs', 'tlefinder', 'tleforger',
+    'antenna', 'earthgrid', 'satsim', 'scenario',
+    'visualise', 'gpu_accel',
+    # Custom-antenna-pattern surface (schema v1) —
+    # loader/validator, analytical-to-LUT fixture helpers, and
+    # the matplotlib preview factory. See the ``scepter.custom_antenna``
+    # module docstring for the authoritative format.
+    'custom_antenna', 'analytical_fixtures', 'custom_antenna_preview',
+]
 

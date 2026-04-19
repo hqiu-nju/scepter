@@ -600,7 +600,7 @@ def gridmatch(az,el,grid_info):
     used_grids = np.where(grid_indx.sum(axis=1) > 0)[0]
     return used_grids, grid_indx[used_grids]
 
-def plantime(epochs,cadence,trange,tint,startdate=cysgp4.PyDateTime()):
+def plantime(epochs, cadence, trange, tint, startdate=None):
     '''
     Description: This function generates the time grid for the simulation
 
@@ -612,17 +612,26 @@ def plantime(epochs,cadence,trange,tint,startdate=cysgp4.PyDateTime()):
         cadence between epochs
     trange: astropy quantity
         time range of the simulation
-    tint: astropy quantity  
-        sample integration time of the simulation 
-    startdate: cysgp4 PyDateTime object
-        start date of the simulation, default cysgp4.PyDateTime() for current date and time
+    tint: astropy quantity
+        sample integration time of the simulation
+    startdate: cysgp4 PyDateTime object or None
+        start date of the simulation.  ``None`` (default) means
+        "current date and time at call time" — evaluated fresh on
+        every call.  Previously the default was the class call
+        ``cysgp4.PyDateTime()`` in the signature itself, but Python
+        evaluates default arguments **once** at function-definition
+        time (module import), so every call re-used the same
+        import-time instant.  This also emitted the
+        ``datetime.utcnow()`` deprecation warning at import.  The
+        ``None`` sentinel pattern defers the call to ``plantime``
+        body, so each call genuinely captures the current time.
 
     Returns:
     mjds: numpy array
-        a 2d array of time intervals for the simulation, first dimension is the number of epochs, 
+        a 2d array of time intervals for the simulation, first dimension is the number of epochs,
         second dimension is the separate time stamps for each integration time sample, in MJD
     '''
-    pydt = startdate ## take current date and time
+    pydt = cysgp4.PyDateTime() if startdate is None else startdate
     start_mjd=pydt.mjd  ## get mjd step
     niters = epochs
 
@@ -638,7 +647,11 @@ def plantime(epochs,cadence,trange,tint,startdate=cysgp4.PyDateTime()):
                 td[np.newaxis,np.newaxis,np.newaxis,np.newaxis,:,np.newaxis])
     return mjds
 
-def plotgrid(val, grid_info,  point_az=[], point_el=[],elmin=30, elmax=85,zlabel='PFD average / cell [dB(W/m2)]',xlabel='Azimuth [deg]',ylabel='Elevation [deg]',azmin=0,azmax=360):
+def plotgrid(val, grid_info,  point_az=None, point_el=None,elmin=30, elmax=85,zlabel='PFD average / cell [dB(W/m2)]',xlabel='Azimuth [deg]',ylabel='Elevation [deg]',azmin=0,azmax=360):
+    if point_az is None:
+        point_az = []
+    if point_el is None:
+        point_el = []
     fig = plt.figure(figsize=(12, 4))
     # val = pfd_avg.to_value(cnv.dB_W_m2)
     vmin, vmax = val.min(), val.max()

@@ -2,6 +2,242 @@
 
 All notable user-facing changes are summarized here at a high level.
 
+## v0.25.3 — *“Patterns Strike Back”*
+
+Starting with this release, Simulation Studio versions carry a short
+thematic codename alongside the numeric version; it appears in the
+window title bar and in the About box.
+
+### Features
+
+- **2-D pattern editor improvements** — The editor now shows the RBF-
+  reconstructed surface from the start (no surprise jump on first
+  edit), regenerates on interpolation method changes, and caches the
+  Delaunay triangulation across drag moves for faster interaction.
+  New density tier "Ultimate" (3601x1801, 0.1 deg). Preview and
+  heatmap display resolution matches the pattern grid for honest
+  bilinear representation.
+
+- **New antenna pattern templates** — 1-D editor: ITU-R S.580-6,
+  S.1428-1, SA.509-3, F.1336-5 omnidirectional, Airy/jinc, cosine-
+  tapered aperture. 2-D editor: ITU-R F.1336-5 sectoral, uniform
+  rectangular aperture (sinc x sinc).
+
+- **Dynamic GPU LUT resolution** — Custom 2-D and M.2101 pattern LUTs
+  now match or exceed the pattern's own grid step. M.2101 element LUT
+  refined from 0.5 deg to 0.1 deg. Safety cap at 16M elements (~64 MB).
+
+- **Satellite custom pattern UI** — Custom 1-D/2-D models now have a
+  dedicated parameter page with Edit/Load/Clear buttons, status label,
+  and per-kind stash/restore on model switching. Frequency/wavelength
+  fields hidden when not needed.
+
+- **UEMR random power variation** — Optional checkbox on the Service
+  tab that applies a per-satellite per-timestep uniform random factor
+  ``U(0, P_tx)`` to UEMR emissions, modelling stochastic unwanted
+  radiation. Satellite antenna tab cleaned up for UEMR mode (no
+  frequency/wavelength inputs shown, corrected description text).
+
+- **MSS mode renamed** — "MSS with User Terminals" renamed to "MSS
+  Directive (Cell Illumination)" with updated schematic showing
+  hexagonal cell cluster instead of user terminal pictogram.
+
+- **Cross-platform GUI (import-only on non-CUDA machines)** — the
+  desktop GUI now imports cleanly on macOS, Linux-without-NVIDIA, and
+  Windows-without-CUDA so users can author / save simulation
+  configurations, inspect saved HDF5 results, and render post-process
+  recipes on any machine with PySide6 support. Simulation itself still
+  requires an NVIDIA GPU: when CUDA isn't available the Runtime tab
+  shows a persistent warning banner, the Run Simulation button stays
+  disabled, and a one-shot startup dialog explains. New
+  ``environment-cpu.yml`` conda env for this use case. ``cupy`` and
+  ``numba-cuda`` are now in the ``gpu`` extra
+  (``pip install scepter[gpu]``) instead of the base install.
+
+- **Help-popup schematics improved** — the "Use radio horizon" and
+  "Include atmosphere" help popups were partially clipped (labels
+  overflowed canvas, caption truncated on both ends). The radio-horizon
+  earth now reads as a gentle horizon arc rather than a cartoonish
+  dome, labels have proper clearance, and the atmosphere inset now
+  carries tick marks + 1 dB / 3 dB reference lines. Amber segments in
+  the atmosphere schematic now end exactly at the ray-atmosphere-shell
+  intersection (previously capped at an arbitrary 110 px), so the "low
+  elevation traverses more atmosphere" story is physically literal.
+
+- **Test Runner stop button** — in the in-app Testing Suite dialog,
+  hitting Stop mid-run no longer paints the cancelled categories green
+  as if they'd passed. New ⏹ icon marks cancelled categories and the
+  "Tests stopped by user." status line is preserved (not overwritten
+  with a pass/fail summary).
+
+- **Bench CLI VRAM / host budget flags** — ``.claude/benchmarks/bench_cli.py``
+  ``run`` and ``run-all`` subcommands gained ``--gpu-gb`` and
+  ``--host-gb`` arguments so benchmark runs can be pinned to a fixed
+  memory envelope (useful when another workload is contending for the
+  GPU).
+
+- **Custom mask JSON I/O** — the "Edit Tx Mask" and the RAS custom
+  receiver-response editors now expose *Import* and *Export* buttons
+  at the top of the dialog. Masks are round-trippable as small JSON
+  files so users can version-control them, share vendor-specific
+  roll-offs, or reuse an ITU template customisation across runs.
+
+### Bug fixes
+
+- **F.1245 evaluator** — Fixed ``phi_r`` formula for D/lambda <= 100
+  (was ``39.8*(D/lambda)^(-0.6)``, corrected to ITU-specified
+  ``100/(D/lambda)``). Eliminated ~10 dB discontinuity.
+
+- **JSON round-trip for 2-D patterns** — ``peak_gain_dbi`` now tracks
+  surface maximum to prevent peak-consistency check rejection on load
+  after RBF overshoot.
+
+- **Pattern eval mode rename** — ``_s1528_pattern_eval_mode`` renamed
+  to ``_pattern_eval_mode`` since it controls M.2101 evaluation too.
+
+- **RAS tab responsiveness** — Eliminated per-keystroke JSON round-trip
+  of the RAS antenna config that froze the UI with dense custom
+  patterns.
+
+- **theta/phi grid bounds** — Editor theta_phi mode phi range corrected
+  from [0, 180] to [-180, 180] to match the JSON schema.
+
+- **Model switching clears stale context** — Switching between Custom
+  1-D/2-D on both RAS and satellite tabs now stashes/restores the
+  correct pattern per kind. Clear button no longer reverts to
+  analytical model.
+
+- **Show RAS pattern without elevation** — Pattern preview no longer
+  requires operational elevation angles (those drive sky-cell scanning,
+  not the gain shape). 2-D patterns use fast direct-grid rendering.
+
+- **Pattern editor "Generic starter"** — the 1-D editor's generic
+  starter produced a non-physical pattern (``∫G dΩ / 4π ≈ 1.82``, +2.6
+  dB over the lossless limit) for the default 34 dBi peak, causing
+  "Accept" to pop a "Non-physical pattern" confirmation modal before
+  any tweak. Starter is now a peak-scaled Gaussian (σ = √(2·η / G_peak))
+  + uniform 20 % floor, giving ratio 0.74-0.89 across peaks 10-70 dBi.
+
+- **Pattern plausibility warning — ITU envelope note** — the "pattern
+  exceeds lossless limit" warning (both 1-D and 2-D editors) now
+  explicitly flags that ITU regulatory masks (S.1528 Rec 1.4, RA.1631,
+  etc.) are envelopes bounding any conforming antenna — not physical
+  patterns — and commonly integrate above 4π by design. Users
+  authoring regulatory masks no longer see it as an error.
+
+- **Bench config ``cust1d_s1528`` / ``cust1d_bore`` oversized earthgrid** —
+  the grid auto-analyser sized cells from the custom pattern's 55 dBi
+  peak, producing 495 K / 1.44 M earthgrid cells (vs typical ~6 K),
+  which triggered ``analytic_fallback`` mode with ``bulk_timesteps=1``
+  and suppressed per-batch stage events. Added ``cell_size_override_km``
+  support to ``_build_system`` in the bench config registry; both
+  configs now pin 500 km cells, yielding 198 cells and normal planner
+  output.
+
+- **Scheduler / planner fusion-awareness refresh** — the power-stage
+  memory estimator's 4-D path carried a stale comment claiming "TX
+  trig and beam geometry fusions do NOT apply" (they do, via the
+  dedicated 4-D fused trig + EIRP kernels). Documentation corrected,
+  plus: the 4-D trig estimate now reflects that delta_alpha is fused
+  internally (one fewer live array per active beam); the aggregate
+  surface-PFD cap estimate reflects the helper's auto-chunking (25 %
+  of free VRAM, clipped to [64 MB, 1 GB]) rather than the unbounded
+  worst case; and a new ``_estimate_direct_epfd_lut_overhead_bytes``
+  helper captures session-resident LUT overhead (S.1528 gain, M.2101
+  element, RAS pattern, Custom-2D, atmosphere, peak-PFD K) which was
+  previously invisible to the setup-bytes calculation.
+
+- **Cython / wheel infrastructure removed** — the
+  ``scepter._finalize_accel`` Cython module was written to eliminate
+  Python interpreter overhead between CuPy calls in the finalize hot
+  loop, but benchmarking showed 0.00 ms improvement (within noise) —
+  the dispatch loop is dominated by CUDA launch latency, not Python
+  overhead. All of the related complexity has been removed: the
+  ``.pyx`` / ``.c`` / ``.pyd`` files, the ``scepter/wheels/``
+  redistribution directory, ``build_wheels.py``, ``python313.def``
+  (needed for Windows mingw-w64 Python linking), the ``setup.py``
+  Extension branch, ``pyproject.toml`` Cython build-system entry,
+  and the ``build-wheels.yml`` GitHub Actions matrix (which built
+  Cython wheels for 8 OS × Python combinations at every tag). The
+  package is now pure-Python: ``pip install .`` works on any OS
+  without needing pre-built wheels or a C compiler.
+
+- **Custom antenna patterns** — SCEPTer now accepts user-supplied
+  antenna patterns via a dedicated ``scepter_antenna_pattern_format=v1``
+  JSON schema (authoritative definition in ``scepter.custom_antenna``'s
+  module docstring). Supports
+  both 1-D axisymmetric (``G(θ)``) and 2-D (``G(az, el)`` or
+  ``G(θ, φ)``) patterns, with per-axis wrap/clip policy, step-
+  discontinuity support via duplicate grid points, and the ITU-
+  friendly ``absolute`` / ``relative`` normalisation + ``explicit`` /
+  ``lut`` peak-gain-source combinations.
+    * Both satellite (TX) and RAS-station (RX) antennas can use
+      custom patterns; the Satellite Antennas combo exposes two new
+      entries, ``Custom 1-D (axisymmetric LUT)`` and
+      ``Custom 2-D (θ, φ / az, el LUT)``.
+    * The GPU pipeline accepts Custom contexts end-to-end: power
+      kernels in both the 3-D non-boresight and 4-D boresight-
+      avoidance paths, the aggregate and per-beam surface-PFD caps,
+      and the spectral-slab hoist all dispatch correctly.
+    * The custom-2D surface-PFD cap K-LUT is 1-D in β rather than
+      the original plan's 2-D K(α, β) — the aperture rotates with
+      the beam (unlike M.2101's body-frame-fixed element pattern),
+      so K is α-invariant and storage is ``n_beta`` floats per
+      shell, not ``n_alpha × n_beta``.
+    * Bundled example JSON files under
+      ``scepter/data/custom_patterns/`` — an RA.1631 25 m / 1.4 GHz
+      axisymmetric pattern and an S.1528 Rec 1.4 asymmetric
+      2-D pattern. Both are synthetic fixtures round-trippable
+      through the loader.
+    * A pure-matplotlib preview factory (
+      ``scepter.custom_antenna_preview.build_custom_pattern_preview_figure``)
+      produces polar plots (1-D) or heatmaps + principal-plane cuts
+      (2-D) — embed-ready in any Qt canvas, savable to PNG, runs
+      headless for testing.
+    * Analytical-to-LUT fixture pipeline (
+      ``scepter.analytical_fixtures``) lets tests and power users
+      sample any of RA.1631, S.1528 Rec 1.2 / Rec 1.4, M.2101, or
+      S.672 onto a chosen grid and dump to the schema's JSON format.
+    * Loaded patterns may be mutated in place without a save-and-
+      reload round trip — the session's custom-pattern context
+      cache keys on a BLAKE2b-128 content fingerprint, so any edit
+      to ``gain_db`` / grid / peak metadata produces a natural
+      cache miss on the next ``prepare_custom_pattern_*_context``
+      call. The cache is two-level — each system (TX or RAS) in a
+      multi-system project gets its own 5-slot LRU bucket, so
+      interactive edits or mutations in one system never evict
+      another system's warm contexts. Analytical systems don't
+      contribute to the custom-pattern cache footprint at all.
+
+### Fixes
+
+- **S.1528 Rec 1.4 asymmetric (``lt_m != lr_m``)** — the LUT path
+  silently collapsed to the φ=0 slice, losing all ``lt_m``
+  dependence. A new 2-D ``(θ, φ)`` LUT builder, bilinear lookup
+  kernel with quarter-symmetry φ folding, and end-to-end φ
+  threading through the 3-D + 4-D power kernels and the
+  aggregate surface-PFD cap now give correct gains for any
+  asymmetric aperture. Asymmetric configs are supported in both
+  boresight-avoidance modes — they are *not* forced into 4-D.
+- **``s_1528_rec1_2_pattern`` ``return_extras``** — the flag was
+  silently ignored (function always returned a 3-tuple). Now
+  honoured: the default call returns the gain array only;
+  ``return_extras=True`` returns the full ``(gains, Gm, psi_b)``
+  tuple.
+- **Polymorphic-context attribute leaks** — three latent hotspots
+  where the surface-PFD cap hoist, main power kernel, and RAS
+  fused fast-paths accessed S.1528-specific attributes (``gm_db``,
+  ``diameter_m``, …) directly rather than via the canonical type-
+  aware resolver (``_pattern_peak_gain_linear`` / type-gated
+  fused kernels). Would have silently produced wrong peak EIRPs
+  / crashed for Custom contexts. All three now dispatch through
+  the type-aware path.
+- **GUI pre-commit validator whitelist** — ``isotropic`` was
+  missing from the antenna-model whitelist (pre-existing latent
+  bug: isotropic mode was valid per the config validator but the
+  validator whitelist would reject it at save time). Added both
+  ``isotropic`` and the new ``custom_1d`` / ``custom_2d`` entries.
+
 ## v0.25.2
 
 ### Attributions

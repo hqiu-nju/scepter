@@ -50,6 +50,11 @@ warnings.filterwarnings(
     message=r"^pkg_resources is deprecated as an API",
     category=UserWarning,
 )
+warnings.filterwarnings(
+    "ignore",
+    category=RuntimeWarning,
+    module=r"shibokensupport\.signature\.parser",
+)
 
 from PySide6 import QtCore, QtWidgets
 
@@ -96,7 +101,7 @@ def _show_startup_error(
 
 def main() -> int:
     """Launch the desktop GUI and return the Qt exit code.
-
+Y
     The heavy import and window creation are scheduled as deferred event-loop
     callbacks so the splash screen animation stays fluid throughout.  Each
     heavy step is wrapped in a ``QTimer.singleShot(0, ...)`` call which

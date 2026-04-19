@@ -59,5 +59,9 @@ docs/_build/
 CLAUDE.md
 
 # Agent scratchpad (interim benchmarks, verification scripts, saved
-# project fixtures used during development — not part of the public repo)
+# project fixtures, scratch GUI project configs) — not part of the
+# public repo.
 .claude/
+
+# One-shot dev helper for re-rendering the README schematic PNGs.
+.render_schematics.py

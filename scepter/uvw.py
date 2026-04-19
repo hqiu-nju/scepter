@@ -666,17 +666,20 @@ def compute_uvw_from_observers(ref_observer, ant_observer, ra_deg, dec_deg, obs_
     if not CYSGP4_AVAILABLE:
         raise ImportError(
             "cysgp4 is required for compute_uvw_from_observers. "
-            "Install with: pip install cysgp4"
+            "Install via conda: conda install -c conda-forge cysgp4 "
+            "(or pip install cysgp4)"
         )
     if not PYCRAF_AVAILABLE:
         raise ImportError(
             "pycraf is required for compute_uvw_from_observers. "
-            "Install with: pip install pycraf"
+            "Install via conda: conda install -c conda-forge pycraf "
+            "(or pip install pycraf)"
         )
     if not ASTROPY_AVAILABLE:
         raise ImportError(
             "astropy is required for compute_uvw_from_observers. "
-            "Install with: pip install astropy"
+            "Install via conda: conda install -c conda-forge astropy "
+            "(or pip install astropy)"
         )
     
     # Step 1: Get ITRF baseline using pycraf
@@ -829,7 +832,8 @@ def compute_uvw_astropy(ref_location, ant_location, ra_deg, dec_deg, obs_times):
     if not ASTROPY_AVAILABLE:
         raise ImportError(
             "astropy is required for compute_uvw_astropy. "
-            "Install with: pip install astropy"
+            "Install via conda: conda install -c conda-forge astropy "
+            "(or pip install astropy)"
         )
     
     # Step 1: Get ITRF baseline from EarthLocation objects
@@ -987,7 +991,8 @@ def compute_uvw_array(antennas, ra_deg, dec_deg, obs_times):
     if not ASTROPY_AVAILABLE:
         raise ImportError(
             "astropy is required for compute_uvw_array. "
-            "Install with: pip install astropy"
+            "Install via conda: conda install -c conda-forge astropy "
+            "(or pip install astropy)"
         )
     
     # Detect antenna type from first element
@@ -999,7 +1004,8 @@ def compute_uvw_array(antennas, ra_deg, dec_deg, obs_times):
         if not PYCRAF_AVAILABLE:
             raise ImportError(
                 "pycraf is required for compute_uvw_array with PyObserver. "
-                "Install with: pip install pycraf"
+                "Install via conda: conda install -c conda-forge pycraf "
+            "(or pip install pycraf)"
             )
         use_pyobserver = True
     elif ASTROPY_AVAILABLE and isinstance(first_antenna, EarthLocation):
