@@ -1,0 +1,52 @@
+# SCEPTer — CPU-only development environment
+#
+# Core simulation, desktop GUI, and notebook support, without any GPU or CUDA
+# dependencies.  Suitable for machines without an NVIDIA GPU or where CUDA
+# drivers are unavailable (e.g. laptops, CI runners, cloud VMs).
+#
+# GPU-accelerated simulation paths (gpu_accel.py) are not available in this
+# environment.  CPU-based workflows, postprocessing, and the desktop GUI work
+# fully.
+#
+# Create:   conda env create -f environment-nogpu.yml
+# Activate: conda activate scepter-nogpu
+# Update:   conda env update -n scepter-nogpu -f environment-nogpu.yml
+#
+# All packages are sourced from conda-forge.
+
+name: scepter-nogpu
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - "setuptools<81"
+
+  # --- Core simulation ---
+  - numpy
+  - scipy
+  - matplotlib
+  - astropy
+  - pycraf
+  - cysgp4
+  - pandas
+  - h5py
+  - shapely
+  - psutil
+
+  # --- Desktop GUI ---
+  - pyside6
+  - pyvista
+  - pyvistaqt
+  - plotly
+  - python-kaleido
+
+  # --- Development & testing ---
+  - pytest
+  - pytest-timeout
+
+  # --- Notebook support ---
+  - ipykernel
+  - "ipywidgets>=7.0,<8.0"
+  - tqdm
+  - seaborn
+  - ipympl
