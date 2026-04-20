@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 """
-TLE archive discovery helpers for SCEPTer workflows.
+SKAO TLE archive search tool for SCEPTer workflows.
 
 Authors
 -------
