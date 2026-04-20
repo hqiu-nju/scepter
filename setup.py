@@ -48,8 +48,6 @@ setup(
         "pandas>=2.0",
         "shapely>=2.0",
         "psutil>=5.9",
-        "numba>=0.58",
-        "cupy>=13.0",
         "PySide6>=6.5",
         "pyvista>=0.42",
         "pyvistaqt>=0.11",
