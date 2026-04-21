@@ -17,7 +17,7 @@
 #
 # All packages are sourced from conda-forge.
 
-name: scepter
+name: scepter-dev
 channels:
   - conda-forge
 dependencies:

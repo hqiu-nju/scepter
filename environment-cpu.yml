@@ -8,13 +8,13 @@
 # environment.  CPU-based workflows, postprocessing, and the desktop GUI work
 # fully.
 #
-# Create:   conda env create -f environment-nogpu.yml
-# Activate: conda activate scepter-nogpu
-# Update:   conda env update -n scepter-nogpu -f environment-nogpu.yml
+# Create:   conda env create -f environment-cpu.yml
+# Activate: conda activate scepter-cpu
+# Update:   conda env update -n scepter-cpu -f environment-cpu.yml
 #
 # All packages are sourced from conda-forge.
 
-name: scepter
+name: scepter-cpu
 channels:
   - conda-forge
 dependencies:
