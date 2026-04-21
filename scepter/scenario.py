@@ -482,6 +482,8 @@ def _runtime_gpu_adapter_memory_snapshot(cp: Any) -> dict[str, Any] | None:
             ],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=1.5,
             check=False,
         )
@@ -558,6 +560,8 @@ def _runtime_gpu_process_memory_snapshot(cp: Any) -> dict[str, Any] | None:
             ],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=1.5,
             check=False,
         )
@@ -17043,6 +17047,8 @@ def _benchmark_gpu_metric_snapshot(*, device_index: int = 0) -> dict[str, Any] |
             ],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=1.5,
             check=False,
         )
