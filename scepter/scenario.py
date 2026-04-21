@@ -70,6 +70,17 @@ _DIRECT_EPFD_CANDIDATE_BYTES_PER_PAIR_EST = 32
 _DIRECT_EPFD_GPU_OOM_MARGIN_BYTES = 256 * 1024**2
 _DIRECT_EPFD_GPU_BUDGET_RECOVERY_STEP_BYTES = 512 * 1024**2
 _NVIDIA_SMI_PATH = shutil.which("nvidia-smi")
+# On Windows under ``pythonw.exe`` (no console), every ``subprocess.run``
+# that inherits the parent's STARTUPINFO pops a new ``cmd`` window for
+# the spawned child (``nvidia-smi`` is sampled once per second during a
+# run, so without this the desktop fills with flashing black windows).
+# ``CREATE_NO_WINDOW`` tells Windows not to allocate a console for the
+# child process.  The flag is Windows-only, so we feed ``0`` elsewhere.
+_SUBPROCESS_NO_WINDOW_FLAG = (
+    int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    if sys.platform == "win32"
+    else 0
+)
 _DIRECT_EPFD_POWER_INPUT_QUANTITIES = frozenset(
     {"target_pfd", "satellite_ptx", "satellite_eirp"}
 )
@@ -486,6 +497,7 @@ def _runtime_gpu_adapter_memory_snapshot(cp: Any) -> dict[str, Any] | None:
             errors="replace",
             timeout=1.5,
             check=False,
+            creationflags=_SUBPROCESS_NO_WINDOW_FLAG,
         )
     except Exception:
         return None
@@ -564,6 +576,7 @@ def _runtime_gpu_process_memory_snapshot(cp: Any) -> dict[str, Any] | None:
             errors="replace",
             timeout=1.5,
             check=False,
+            creationflags=_SUBPROCESS_NO_WINDOW_FLAG,
         )
     except Exception:
         return None
@@ -17051,6 +17064,7 @@ def _benchmark_gpu_metric_snapshot(*, device_index: int = 0) -> dict[str, Any] |
             errors="replace",
             timeout=1.5,
             check=False,
+            creationflags=_SUBPROCESS_NO_WINDOW_FLAG,
         )
     except Exception:
         return None

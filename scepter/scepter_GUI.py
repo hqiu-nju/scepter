@@ -2121,6 +2121,7 @@ class RunMonitorWidget(QtWidgets.QFrame):
                 errors="replace",
                 timeout=1.5,
                 check=False,
+                creationflags=scenario._SUBPROCESS_NO_WINDOW_FLAG,
             )
         except Exception:
             return None
@@ -2177,6 +2178,7 @@ class RunMonitorWidget(QtWidgets.QFrame):
                 errors="replace",
                 timeout=1.5,
                 check=False,
+                creationflags=scenario._SUBPROCESS_NO_WINDOW_FLAG,
             )
         except Exception:
             return None
@@ -23121,19 +23123,59 @@ class HexgridPreviewWorker(QtCore.QObject):
 
 
 class _ProgressStreamProxy:
+    # Expose an ``encoding``/``errors`` pair so third-party libraries that
+    # probe ``file.encoding`` on the injected stream (tqdm, warnings
+    # fallback, etc.) see UTF-8 instead of falling back to the locale
+    # default (``cp1252`` on Windows). Without this, a progress/warning
+    # path encoding a ``→`` (U+2192) from a docstring into ``cp1252``
+    # surfaces as a ``UnicodeEncodeError`` that gets wrapped as an opaque
+    # ``_DirectEpfdStageExecutionError: beam_finalize: 'charmap' codec
+    # can't encode character '→' ...`` — see ``scepter/__init__.py``
+    # and ``gui.py`` for the same rationale applied to the real stdio.
+    encoding = "utf-8"
+    errors = "backslashreplace"
+
     def __init__(self, callback: Callable[[str], None]) -> None:
         self._callback = callback
 
-    def write(self, text: str) -> int:
-        text_use = "" if text is None else str(text)
+    def write(self, text: Any) -> int:
+        if text is None:
+            return 0
+        if isinstance(text, (bytes, bytearray)):
+            text_use = bytes(text).decode("utf-8", errors="replace")
+        else:
+            text_use = str(text)
         if text_use:
             self._callback(text_use)
         return len(text_use)
+
+    def writelines(self, lines: Iterable[Any]) -> None:
+        for line in lines:
+            self.write(line)
 
     def flush(self) -> None:
         return None
 
     def isatty(self) -> bool:
+        return False
+
+    def writable(self) -> bool:
+        return True
+
+    def readable(self) -> bool:
+        return False
+
+    def seekable(self) -> bool:
+        return False
+
+    def fileno(self) -> int:
+        raise OSError("_ProgressStreamProxy has no file descriptor")
+
+    def close(self) -> None:
+        return None
+
+    @property
+    def closed(self) -> bool:
         return False
 
 

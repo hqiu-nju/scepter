@@ -11,16 +11,26 @@ __doc__ = "SCEPTer, Simulating Constellation Emission Patterns for Telescopes"
 __version__ = "0.25.3"
 __codename__ = "Patterns Strike Back"
 
-# On Windows, conda environments require Library/bin on PATH for DLL
-# loading (BLAS, CUDA, OpenSSL, etc.).  Fix this before any C-extension
-# imports so that ``import scepter`` works without ``conda activate``.
-#
-# Also override CUDA_PATH when the conda environment ships its own CUDA
-# headers, so CuPy's NVRTC compiler uses the conda headers instead of a
-# potentially incompatible system-installed CUDA toolkit.
+# On Windows without PYTHONUTF8=1, ``sys.stdout``/``sys.stderr`` default to
+# the ANSI code page (``cp1252`` on most English locales), which cannot
+# encode common Unicode glyphs (``→``, ``×``, ``≈``, ``≤``, ...).
+# These appear in source-line comments and in some warning/progress text,
+# so a stray ``warnings.warn`` / traceback print during a long run surfaces
+# as ``UnicodeEncodeError`` and gets wrapped as an opaque stage failure
+# (e.g. ``_DirectEpfdStageExecutionError: beam_finalize: 'charmap' codec
+# can't encode character '→' ...``). Reconfigure the streams to UTF-8
+# with a lossy fallback so reporting never crashes the run. Applied at
+# package import so every entry point (GUI, CLI, tests, notebooks)
+# benefits — ``gui.py`` does the same thing earlier for the case where
+# ``scepter`` hasn't been imported yet.
 import os as _os
 import sys as _sys
 if _sys.platform == "win32":
+    for _stream in (_sys.stdout, _sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="backslashreplace")
+        except Exception:
+            pass
     _lib_bin = _os.path.join(_sys.prefix, "Library", "bin")
     if _os.path.isdir(_lib_bin):
         _os.environ["PATH"] = _lib_bin + _os.pathsep + _os.environ.get("PATH", "")

@@ -259,6 +259,50 @@ except Exception:  # pragma: no cover - import availability is environment-depen
     cupy_special = None
 
 
+def _patch_cupy_nvrtc_tempfile_encoding() -> None:
+    """Force CuPy's NVRTC temp ``.cu`` write to UTF-8.
+
+    CuPy 13.x's ``cupy/cuda/compiler.py::_compile_using_nvrtc_no_warning``
+    does ``open(cu_path, 'w')`` with no explicit ``encoding=``. On Windows
+    that resolves to ``locale.getpreferredencoding()`` which is ``cp1252``
+    on English locales, and crashes when any character in the kernel
+    source is outside cp1252 (e.g. ``->`` was once ``→`` in a kernel
+    comment; ``α``/``β``/``Δ``/``×`` also appear in ElementwiseKernel
+    operation strings). The failure surfaces up the direct-EPFD pipeline
+    as an opaque ``_DirectEpfdStageExecutionError: beam_finalize:
+    'charmap' codec ...``. Fix it by shadowing the module-level ``open``
+    name inside ``cupy.cuda.compiler`` with a wrapper that forces
+    ``encoding='utf-8'`` when the caller doesn't specify one and opens
+    in text mode — Python's name lookup resolves ``open`` inside that
+    module via its globals dict, so an injected attribute wins over
+    ``builtins.open``.
+    """
+    if cp is None:
+        return
+    try:
+        from cupy.cuda import compiler as _cupy_compiler
+    except Exception:  # pragma: no cover - defensive
+        return
+    if getattr(_cupy_compiler, "_scepter_utf8_tempfile_patch", False):
+        return
+
+    import builtins as _builtins
+
+    _real_open = _builtins.open
+
+    def _utf8_default_open(file, mode="r", *args, **kwargs):
+        # Only inject ``encoding`` for text-mode opens that didn't set one.
+        if "b" not in mode and "encoding" not in kwargs:
+            kwargs["encoding"] = "utf-8"
+        return _real_open(file, mode, *args, **kwargs)
+
+    _cupy_compiler.open = _utf8_default_open
+    _cupy_compiler._scepter_utf8_tempfile_patch = True
+
+
+_patch_cupy_nvrtc_tempfile_encoding()
+
+
 MJD_TO_JD_OFFSET = 2400000.5
 EARTH_MODEL_WGS72 = "wgs72"
 EARTH_MODEL_WGS84 = "wgs84"
@@ -6271,7 +6315,7 @@ void compute_group_rank_and_select(
     bool* __restrict__ keep_out,              // (N,) output: true if rank < limit
     int* __restrict__ n_kept_out              // (1,) output: total kept count
 ) {
-    // Single-thread serial scan — appropriate for N ~ 5000
+    // Single-thread serial scan -- appropriate for N ~ 5000
     if (threadIdx.x != 0 || blockIdx.x != 0) return;
 
     int n_kept = 0;
@@ -6314,7 +6358,7 @@ void gather_realized_edges_3d(
     const float* __restrict__ beta_flat,          // (T*C*K,) beta angles
     int cell_count, int n_links, int exclude_cell,
     int N,
-    // Outputs — write at positions [0..N), some may be filtered out
+    // Outputs -- write at positions [0..N), some may be filtered out
     int* __restrict__ out_t,
     int* __restrict__ out_cell,
     int* __restrict__ out_link,
@@ -6371,14 +6415,14 @@ void scatter_selected_edges_3d(
     const long long* __restrict__ sel_pos,  // (N_selected,) indices into edge arrays
     const int* __restrict__ sel_slot,       // (N_selected,) beam slot assignment
     // Mapping
-    const int* __restrict__ sat_output_index, // (S_total,) sat → output index
+    const int* __restrict__ sat_output_index, // (S_total,) sat -> output index
     int n_links,
-    // Output arrays (3-D: T × S_out × K)
+    // Output arrays (3-D: T x S_out x K)
     int S_out, int K,
     int* __restrict__ beam_idx,
     float* __restrict__ beam_alpha,
     float* __restrict__ beam_beta,
-    // Optional: cell_slot_sat (T × C × n_links), may be NULL
+    // Optional: cell_slot_sat (T x C x n_links), may be NULL
     int* __restrict__ cell_slot_sat,
     int has_cell_slot,
     int C,
@@ -13647,7 +13691,7 @@ def _build_custom_2d_trig_to_gain_kernel(
 
     if mode == "az_el":
         coord_block = r"""
-        /* Body-frame components from raw beam trig — what
+        /* Body-frame components from raw beam trig -- what
          * _convert_surface_between_grids / _accumulate_*_cp used to
          * do in 2-3 separate CuPy launches.  x_body = beam_cosb * sin_da,
          * y_body = cosb0 * beam_sinb - sinb0 * beam_cosb * cos_da,
