@@ -1,17 +1,26 @@
-# SCEPTer
+# SCEPTER
 
-**S**imulating **C**onstellation **E**mission **P**atterns for **Te**lescopes (**r**adio)
+**S**imulating **C**onstellation **E**mission **P**atterns for **TE**lescopes in **R**adio
 
-SCEPTer is a modular Python toolkit for simulating satellite constellation
-emissions and evaluating their impact on radio astronomy observations.  It
-computes equivalent power flux density (EPFD) at Radio Astronomy Service (RAS)
+Scepter is a modular Python toolkit for simulating satellite constellation
+emissions and evaluating their impact on radio astronomy observations.  
+It calculates equivalent power flux density (EPFD) at Radio Astronomy Service (RAS)
 stations from large non-geostationary satellite constellations, following
 ITU-R methodologies.
 
-## Key capabilities
+Scepter is unique in that it simulates telescope array elements and observations in 
+a multi dimension sandbox. This allows assessment of impact to independent antennas 
+or interferometric baselines across the array. This also enables the simulation to highly
+customisable for different use cases in both ITU-R studies and Radio Astronomy instrumentation.
+
+
+
+## Simulation capabilities
 
 - **Synthetic constellation generation** from multi-belt orbital definitions
   (altitude, inclination, plane count, satellites per plane)
+- **Telescope Array Observations** Allows multiple stations/array elements 
+with dynamic pointing during simulation.
 - **Real-world TLE support** for propagating actual satellite catalogs
   (e.g. from [CelesTrack](https://celestrak.org/))
 - **GPU-accelerated direct-EPFD simulation** using CuPy/Numba CUDA kernels
@@ -39,8 +48,8 @@ SCEPTer uses Conda environments.  Three configurations are provided:
 **CPU-only** (no NVIDIA GPU or CUDA drivers required):
 
 ```bash
-conda env create -f environment-nogpu.yml
-conda activate scepter-nogpu
+conda env create -f environment-cpu.yml -n scepter
+conda activate scepter
 pip install -e .
 ```
 
@@ -51,7 +60,7 @@ workflows.  GPU-accelerated paths in `gpu_accel.py` are unavailable.
 
 ```bash
 conda env create -f environment.yml
-conda activate scepter-dev
+conda activate scepter
 pip install -e .
 ```
 
@@ -59,7 +68,7 @@ pip install -e .
 
 ```bash
 conda env create -f environment-full.yml
-conda activate scepter-dev-full
+conda activate scepter
 pip install -e .
 ```
 
@@ -71,7 +80,7 @@ viewers.  All packages are sourced from `conda-forge`.
 ### Running the desktop GUI
 
 ```bash
-conda activate scepter-dev
+conda activate scepter
 python gui.py
 ```
 

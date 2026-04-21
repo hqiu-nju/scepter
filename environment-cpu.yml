@@ -14,7 +14,7 @@
 #
 # All packages are sourced from conda-forge.
 
-name: scepter-nogpu
+name: scepter
 channels:
   - conda-forge
 dependencies:
