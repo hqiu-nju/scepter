@@ -17,6 +17,7 @@
 name: scepter-cpu
 channels:
   - conda-forge
+  - numba
 dependencies:
   - python=3.10
   - "setuptools<81"
@@ -43,6 +44,10 @@ dependencies:
   # --- Development & testing ---
   - pytest
   - pytest-timeout
+
+  # --- numba (no GPU/CUDA) ---
+  - numba
+  - llvmlite
 
   # --- Notebook support ---
   - ipykernel
