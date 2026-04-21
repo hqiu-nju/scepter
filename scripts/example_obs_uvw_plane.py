@@ -12,7 +12,7 @@ UVW baselines relative to the reference (first) antenna.
 
 Usage
 -----
-    conda activate scepter-dev
+    conda activate scepter
     python scripts/example_obs_uvw_plane.py
 
 Requirements
@@ -21,16 +21,19 @@ Requirements
 - astropy
 - cysgp4
 - pycraf
+- requests
 - matplotlib (for the optional UV-coverage plot)
 - scepter (scepter.obs, scepter.uvw, scepter.skynet)
 """
 
 from __future__ import annotations
 
+import cysgp4
+import requests
 import numpy as np
 import matplotlib.pyplot as plt
 from astropy import units as u
-from astropy.coordinates import ICRS, AltAz
+from astropy.coordinates import ICRS, AltAz, EarthLocation, SkyCoord
 from astropy.time import Time
 from cysgp4 import PyObserver
 
@@ -142,7 +145,7 @@ def obs_uvw_plane(
             dec_deg = float(icrs_pnt.dec.deg.flat[0])
 
     # 4. Compute UVW for all baselines
-    uvw_all, hour_angles = _uvw.compute_uvw_array(
+    uvw_all, hour_angles = _uvw.compute_uvw(
         antennas,
         ra_deg=ra_deg,
         dec_deg=dec_deg,
@@ -163,11 +166,15 @@ if __name__ == "__main__":
     # ------------------------------------------------------------------
     ant_coords = [
         (21.4430, -30.7130, 1086.0),   # reference
-        (21.4445, -30.7130, 1086.0),   # ~130 m East
-        (21.4430, -30.7115, 1086.0),   # ~170 m North
+        (21.4440, -30.7130, 1086.0),   #  East
+        (21.4430, -30.7120, 1086.0),   #  North
+        (21.4440, -30.7120, 1086.0),
+        (21.4440, -30.7122, 1086.0),
+        (21.4440, -30.7123, 1086.0),
+        (21.4440, -30.7124, 1086.0),
     ]
     pyobs_array = np.array(
-        [PyObserver(lon=lon, lat=lat, alt=alt) for lon, lat, alt in ant_coords]
+        [PyObserver(lon, lat, alt/1000) for lon, lat, alt in ant_coords]
     )
 
     # ------------------------------------------------------------------
@@ -182,12 +189,17 @@ if __name__ == "__main__":
     )
 
     # ------------------------------------------------------------------
-    # Time grid: 6 hours centred on 2024-01-01 02:00 UTC, 60-s cadence
+    # Time grid: 20 seconds starting from current UTC time, 1-s cadence
     # ------------------------------------------------------------------
-    t0 = Time("2024-01-01T02:00:00", scale="utc")
-    dt_s = 60.0          # seconds per sample
-    n_samples = 360       # 6 hours
-    mjds = (t0 + np.arange(n_samples) * dt_s * u.s).mjd
+    pydt = cysgp4.PyDateTime()   # current UTC date/time
+    mjds = skynet.plantime(
+        epochs=1,
+        cadence=24 * u.hour,
+        trange=3600 *1* u.s,
+        tint=1 * u.s,
+        startdate=pydt,
+    )
+    n_samples = mjds.size
 
     # ------------------------------------------------------------------
     # Minimal sky grid (1 pointing, 1 cell) — only mjds matters here
@@ -195,40 +207,202 @@ if __name__ == "__main__":
     skygrid = skynet.pointgen_S_1586_1(niters=1)
 
     # ------------------------------------------------------------------
-    # Build obs_sim and set phase centre: Crab Nebula (RA=83.633, Dec=22.014)
+    # Build obs_sim and set phase centre 
     # ------------------------------------------------------------------
     sim = obs.obs_sim(rx, skygrid, mjds)
-    sim.sky_track(ra=83.633, dec=22.014)   # ICRS degrees
+    ra=83.633 * u.deg
+    dec=50.014 * u.deg  
 
     # ------------------------------------------------------------------
-    # Compute UVW plane
+    # Download 1000 Starlink TLEs from Celestrak and populate obs_sim
     # ------------------------------------------------------------------
-    uvw_all, hour_angles = obs_uvw_plane(sim)
+    print("Downloading OneWeb TLEs from Celestrak...")
+    url = 'https://celestrak.org/NORAD/elements/gp.php?GROUP=oneweb&FORMAT=tle'
+    ctrak_starlink = requests.get(url).text
+    tle_list = cysgp4.tle_tuples_from_text(ctrak_starlink) 
+    tles = np.array([cysgp4.PyTle(*tle) for tle in tle_list])
+    print(f"Propagating {len(tles)} Starlink satellites over {n_samples} s...")
+    sim.populate(tles)
+    sim.reduce_sats(el_limit=-30)
+    
+    print(f"Satellites above 10° elevation: {sim.topo_pos_el.shape[-1]}")
 
-    print(f"uvw_all shape : {uvw_all.shape}")   # (3, 360, 3)
-    print(f"hour_angles shape: {hour_angles.shape}")  # (360,)
-    print(f"Reference baseline (ant 0): max |UVW| = {np.abs(uvw_all[0]).max():.3f} m")
-    print(f"Baseline 0→1  u range: {uvw_all[1, :, 0].min():.1f} … {uvw_all[1, :, 0].max():.1f} m")
-    print(f"Baseline 0→2  v range: {uvw_all[2, :, 1].min():.1f} … {uvw_all[2, :, 1].max():.1f} m")
+    # ------------------------------------------------------------------
+    # Compute UVW plane — phase centre
+    # ------------------------------------------------------------------
+    sim.sky_track(ra.value, dec.value)   # ICRS degrees
+    uvw_crab, ha_crab = obs_uvw_plane(sim)
 
     # ------------------------------------------------------------------
-    # UV-coverage plot
+    # Find the two satellites closest (in angle) to the pointing direction.
+    # Build UVW arrays for those two satellites, using each satellite's
+    # own ICRS RA/Dec as the phase centre.
     # ------------------------------------------------------------------
-    fig, ax = plt.subplots(figsize=(6, 6))
-    colors = ["C1", "C2"]
+    pnt_coord = SkyCoord(ra=ra, dec=dec, frame="icrs")
+    ref_ant = pyobs_array[0]
+    loc_ref = EarthLocation(
+        lon=ref_ant.loc.lon * u.deg,
+        lat=ref_ant.loc.lat * u.deg,
+        height=ref_ant.loc.alt * u.m,
+    )
+    obs_times_1d = Time(np.asarray(mjds).ravel(), format="mjd", scale="utc")
+
+    az_ts = sim.topo_pos_az[0, 0, 0, 0, :, :]   # (T, N_sat)
+    el_ts = sim.topo_pos_el[0, 0, 0, 0, :, :]   # (T, N_sat)
+    sat_altaz = SkyCoord(
+        az=az_ts * u.deg,
+        alt=el_ts * u.deg,
+        frame=AltAz(obstime=obs_times_1d[:, np.newaxis], location=loc_ref),
+    )
+    sat_icrs = sat_altaz.transform_to(ICRS())
+    pnt_altaz = pnt_coord.transform_to(AltAz(obstime=obs_times_1d, location=loc_ref))
+    print(sat_icrs.shape)  # (T, N_sat)
+    # Time-averaged angular separation to the pointing direction.
+    separations_deg = sat_altaz.separation(pnt_altaz[:, np.newaxis]).deg
+    mean_sep_deg = np.nanmean(separations_deg, axis=0)
+    closest_idx = np.argsort(mean_sep_deg)[:2]
+
+    print("Two satellites closest to pointing coordinate:")
+    for s in closest_idx:
+        print(f"  Sat {int(s)}: mean sep={mean_sep_deg[int(s)]:.3f}°")
+
+    sat1_ra_deg = sat_icrs.ra.deg[:, closest_idx[0]]
+    sat1_dec_deg = sat_icrs.dec.deg[:, closest_idx[0]]
+    sat2_ra_deg = sat_icrs.ra.deg[:, closest_idx[1]]
+    sat2_dec_deg = sat_icrs.dec.deg[:, closest_idx[1]]
+
+    print(
+        f"  Sat {int(closest_idx[0])} phase centre track: "
+        f"RA=[{sat1_ra_deg.min():.4f}, {sat1_ra_deg.max():.4f}]°, "
+        f"Dec=[{sat1_dec_deg.min():.4f}, {sat1_dec_deg.max():.4f}]°"
+    )
+    print(
+        f"  Sat {int(closest_idx[1])} phase centre track: "
+        f"RA=[{sat2_ra_deg.min():.4f}, {sat2_ra_deg.max():.4f}]°, "
+        f"Dec=[{sat2_dec_deg.min():.4f}, {sat2_dec_deg.max():.4f}]°"
+    )
+
+    antennas = list(pyobs_array)
+    uvw_sat1, ha_sat1 = _uvw.compute_uvw(
+        antennas,
+        ra_deg=sat1_ra_deg,
+        dec_deg=sat1_dec_deg,
+        obs_times=obs_times_1d,
+    )
+    uvw_sat2, ha_sat2 = _uvw.compute_uvw(
+        antennas,
+        ra_deg=sat2_ra_deg,
+        dec_deg=sat2_dec_deg,
+        obs_times=obs_times_1d,
+    )
+
+    print(f"uvw_crab shape : {uvw_crab.shape}")
+    print(f"uvw_sat1 shape : {uvw_sat1.shape}")
+    print(f"uvw_sat2 shape : {uvw_sat2.shape}")
+    print(f"Reference baseline (ant 0): max |UVW| = {np.abs(uvw_crab[0]).max():.3f} m")
+    print(f"Baseline 0→1  u range (Crab): {uvw_crab[1, :, 0].min():.1f} … {uvw_crab[1, :, 0].max():.1f} m")
+    print(f"Baseline 0→2  v range (Crab): {uvw_crab[2, :, 1].min():.1f} … {uvw_crab[2, :, 1].max():.1f} m")
+
+    # ------------------------------------------------------------------
+    # W-term comparison across sources
+    # ------------------------------------------------------------------
+    print("\nW-term comparison (meters):")
     for i in range(1, len(ant_coords)):
-        u_m = uvw_all[i, :, 0]
-        v_m = uvw_all[i, :, 1]
-        ax.plot(u_m, v_m, lw=0.8, color=colors[i - 1], label=f"Baseline 0→{i}")
-        # Hermitian conjugate (mirror)
-        ax.plot(-u_m, -v_m, lw=0.8, color=colors[i - 1], ls="--", alpha=0.5)
+        w_crab = uvw_crab[i, :, 2]
+        w_sat1 = uvw_sat1[i, :, 2]
+        w_sat2 = uvw_sat2[i, :, 2]
+        d_w_sat1 = w_sat1 - w_crab
+        d_w_sat2 = w_sat2 - w_crab
+        print(
+            f"  Baseline 0→{i}: "
+            f"Crab w=[{w_crab.min():.3f}, {w_crab.max():.3f}], "
+            f"sat1 Δw RMS={np.sqrt(np.mean(d_w_sat1**2)):.6f}, "
+            f"sat2 Δw RMS={np.sqrt(np.mean(d_w_sat2**2)):.6f}"
+        )
 
-    ax.set_xlabel("u  (m)")
-    ax.set_ylabel("v  (m)")
-    ax.set_title("UV coverage — Crab Nebula, 6 h track")
-    ax.set_aspect("equal")
-    ax.legend()
+    fig_w, axes_w = plt.subplots(len(ant_coords) - 1, 2, figsize=(10, 3.5 * (len(ant_coords) - 1)))
+    if len(ant_coords) - 1 == 1:
+        axes_w = np.array([axes_w])
+
+    t_sec = (np.asarray(mjds).ravel() - np.asarray(mjds).ravel()[0]) * 86400.0
+    for row, i in enumerate(range(1, len(ant_coords))):
+        w_crab = uvw_crab[i, :, 2]
+        w_sat1 = uvw_sat1[i, :, 2]
+        w_sat2 = uvw_sat2[i, :, 2]
+
+        ax_w = axes_w[row, 0]
+        ax_dw = axes_w[row, 1]
+
+        ax_w.plot(t_sec, w_crab, label="Crab", lw=1.5)
+        ax_w.plot(t_sec, w_sat1, label="Closest sat 1", lw=1.2, ls=":")
+        ax_w.plot(t_sec, w_sat2, label="Closest sat 2", lw=1.2, ls="-.")
+        ax_w.set_title(f"Baseline 0→{i}: w(t)")
+        ax_w.set_xlabel("Time from start (s)")
+        ax_w.set_ylabel("w (m)")
+        ax_w.legend()
+
+        ax_dw.plot(t_sec, w_sat1 - w_crab, label="sat1 - Crab", lw=1.2)
+        ax_dw.plot(t_sec, w_sat2 - w_crab, label="sat2 - Crab", lw=1.2)
+        ax_dw.axhline(0.0, color="k", lw=0.8, alpha=0.5)
+        ax_dw.set_title(f"Baseline 0→{i}: Δw(t)")
+        ax_dw.set_xlabel("Time from start (s)")
+        ax_dw.set_ylabel("Δw (m)")
+        ax_dw.legend()
+
     plt.tight_layout()
-    plt.savefig("uvw_coverage.png", dpi=150)
-    print("Saved UV coverage plot to uvw_coverage.png")
+    plt.savefig("w_term_comparison.png", dpi=150)
+    print("Saved W-term comparison plot to w_term_comparison.png")
+
+    # ------------------------------------------------------------------
+    # Array layout plot (local EN offsets from reference antenna)
+    # ------------------------------------------------------------------
+    lon0, lat0, _ = ant_coords[0]
+    lons = np.array([c[0] for c in ant_coords])
+    lats = np.array([c[1] for c in ant_coords])
+    east_m = (lons - lon0) * np.cos(np.deg2rad(lat0)) * 111320.0
+    north_m = (lats - lat0) * 110540.0
+
+    fig_layout, ax_layout = plt.subplots(figsize=(5.8, 5.4))
+    ax_layout.scatter(east_m, north_m, s=60, c="C0")
+    for i in range(len(ant_coords)):
+        ax_layout.text(east_m[i] + 1.0, north_m[i] + 1.0, f"ant{i}", fontsize=9)
+    ax_layout.set_xlabel("East offset (m)")
+    ax_layout.set_ylabel("North offset (m)")
+    ax_layout.set_title("Antenna Array Layout")
+    ax_layout.set_aspect("equal")
+    ax_layout.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.savefig("array_layout.png", dpi=150)
+    print("Saved array layout plot to array_layout.png")
+
+    # ------------------------------------------------------------------
+    # UV-coverage plots (three sources as subplots in one figure)
+    # ------------------------------------------------------------------
+    sources = [
+        (uvw_crab, "Crab phase centre"),
+        (uvw_sat1, "Closest satellite 1"),
+        (uvw_sat2, "Closest satellite 2"),
+    ]
+    fig_uv, axes_uv = plt.subplots(1, 3, figsize=(17, 5.5), sharex=True, sharey=True)
+
+    for ax, (uvw_arr, title) in zip(axes_uv, sources):
+        for i in range(1, len(ant_coords)):
+            u_m = uvw_arr[i, :, 0]
+            v_m = uvw_arr[i, :, 1]
+            ax.plot(u_m, v_m, lw=0.9, label=f"B0-{i}")
+            # Hermitian conjugate (mirror)
+            ax.plot(-u_m, -v_m, lw=0.9, ls="--", alpha=0.5)
+
+        ax.set_title(f"UV coverage - {title}")
+        ax.set_xlabel("u (m)")
+        ax.set_aspect("equal")
+        ax.grid(alpha=0.2)
+
+    axes_uv[0].set_ylabel("v (m)")
+    axes_uv[-1].legend(loc="best", fontsize=8)
+    plt.tight_layout()
+    plt.savefig("uvw_coverage_subplots.png", dpi=150)
+    print("Saved UV coverage subplots to uvw_coverage_subplots.png")
     plt.show()
+
+

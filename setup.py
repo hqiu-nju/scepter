@@ -47,6 +47,7 @@ setup(
         "h5py>=3.8",
         "pandas>=2.0",
         "shapely>=2.0",
+        "numba>=0.58",
         "psutil>=5.9",
         "PySide6>=6.5",
         "pyvista>=0.42",

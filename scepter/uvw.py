@@ -71,9 +71,8 @@ This module extends the interferometry capabilities in scepter.obs:
 - `scepter.uvw.itrf_to_enu()` → converts to local topocentric frame
 - `scepter.uvw.enu_to_uvw()` → transforms to interferometry UVW frame
 
-The high-level functions (`compute_uvw_from_observers`, `compute_uvw_astropy`, 
-`compute_uvw_array`) provide end-to-end pipelines that handle all coordinate 
-transformations automatically.
+The high-level function `compute_uvw` provides an end-to-end pipeline that
+handles all coordinate transformations automatically for any number of antennas.
 
 Dependencies
 ------------
@@ -116,8 +115,8 @@ Usage Examples
     >>> 
     >>> # Observe a source at RA=0°, Dec=-30°
     >>> times = Time(['2024-01-01T00:00:00', '2024-01-01T01:00:00'])
-    >>> uvw_coords, ha = uvw.compute_uvw_from_observers(
-    ...     ref, ant, ra_deg=0.0, dec_deg=-30.0, obs_times=times
+    >>> uvw_coords, ha = uvw.compute_uvw(
+    ...     [ref, ant], ra_deg=0.0, dec_deg=-30.0, obs_times=times
     ... )
 
 **Computing all baselines in an array**::
@@ -128,7 +127,7 @@ Usage Examples
     >>> antennas = [ant1, ant2, ant3]  # PyObserver objects
     >>> 
     >>> # Compute UVW for all baselines relative to first antenna
-    >>> uvw_all, ha = uvw.compute_uvw_array(
+    >>> uvw_all, ha = uvw.compute_uvw(
     ...     antennas, ra_deg=0.0, dec_deg=45.0, obs_times=times
     ... )
     >>> print(f"Shape: {uvw_all.shape}")  # (3, n_times, 3)
@@ -538,510 +537,220 @@ def enu_to_uvw(hour_angle, declination, baseline_enu):
     return baseline_uvw
 
 
-def compute_uvw_from_observers(ref_observer, ant_observer, ra_deg, dec_deg, obs_times):
+def compute_uvw(
+    antennas,
+    ra_deg: float,
+    dec_deg: float,
+    obs_times,
+    ref_index: int = 0,
+) -> tuple[np.ndarray, np.ndarray]:
     """
-    Compute UVW coordinates from PyObserver objects (cysgp4 integration).
-    
-    End-to-end pipeline for computing interferometric UVW coordinates from 
-    antenna locations defined as cysgp4.PyObserver objects. This integrates 
-    seamlessly with the scepter.obs module and handles all coordinate 
-    transformations automatically.
-    
-    Parameters
-    ----------
-    ref_observer : cysgp4.PyObserver
-        Reference antenna/observer location (baseline origin)
-        Must have .loc attributes: lon (degrees), lat (degrees), alt (meters)
-        Typically the first antenna in an array
-    ant_observer : cysgp4.PyObserver
-        Target antenna for baseline measurement
-        Same requirements as ref_observer
-    ra_deg : float
-        Right ascension of the observed source (degrees)
-        Range: [0, 360)
-    dec_deg : float
-        Declination of the observed source (degrees)
-        Range: [-90, 90]
-    obs_times : astropy.time.Time
-        Observation times
-        Can be scalar or array
-        Used to compute local sidereal time
-    
-    Returns
-    -------
-    uvw : numpy.ndarray, shape (N_times, 3) or (3,)
-        UVW coordinates at each observation time (meters)
-        Shape (3,) if obs_times is scalar, (N_times, 3) if array
-        Components: [u, v, w]
-    hour_angles : numpy.ndarray, shape (N_times,) or scalar
-        Hour angles at each observation time (radians)
-        Useful for diagnostics and UV track plotting
-    
-    Raises
-    ------
-    ImportError
-        If cysgp4 or pycraf is not available
-        Both are required for this function
-    
-    Notes
-    -----
-    **Processing pipeline:**
-    
-    1. Compute ITRF baseline from observer locations (uses pycraf)
-    2. Convert ITRF to ENU using reference observer's lat/lon
-    3. Calculate local sidereal time from obs_times (uses astropy)
-    4. Compute hour angle from LST and RA
-    5. Transform ENU to UVW using hour angle and declination
-    
-    **Integration with scepter.obs:**
-    
-    This function is designed to work with the same PyObserver objects used 
-    throughout the scepter package:
-    
-    - scepter.obs.obs_sim uses PyObserver for antenna locations
-    - scepter.obs.baseline_bearing works with PyObserver pairs
-    - This function extends that infrastructure for UVW calculations
-    
-    **Time handling:**
-    
-    Local sidereal time is computed from:
-    - Observer's longitude
-    - UTC time (from obs_times)
-    - Earth's rotation
-    
-    This accounts for:
-    - Longitude offset from Greenwich
-    - Precession and nutation (via astropy)
-    - Proper sidereal vs. solar time conversion
-    
-    Examples
-    --------
-    >>> from cysgp4 import PyObserver
-    >>> from astropy.time import Time
-    >>> from scepter import uvw
-    >>> 
-    >>> # Define two antennas (e.g., VLA-like in New Mexico)
-    >>> ref = PyObserver(-107.618, 34.079, 2.124)  # lon, lat (deg), alt (km)
-    >>> ant = PyObserver(-107.617, 34.079, 2.124)
-    >>> 
-    >>> # Observe Cygnus A (RA=19h59m, Dec=+40°44')
-    >>> ra = (19 + 59/60) * 15  # Convert hours to degrees
-    >>> dec = 40 + 44/60
-    >>> times = Time('2024-06-21T03:00:00')  # Single time
-    >>> 
-    >>> uvw_coords, ha = uvw.compute_uvw_from_observers(
-    ...     ref, ant, ra_deg=ra, dec_deg=dec, obs_times=times
-    ... )
-    >>> print(f"UVW: {uvw_coords}")
-    >>> print(f"Hour angle: {np.degrees(ha):.2f}°")
-    >>> 
-    >>> # Track source over 6 hours
-    >>> times = Time('2024-06-21T00:00:00') + np.linspace(0, 6, 25) * u.hour
-    >>> uvw_track, ha_track = uvw.compute_uvw_from_observers(
-    ...     ref, ant, ra_deg=ra, dec_deg=dec, obs_times=times
-    ... )
-    >>> print(f"UV track shape: {uvw_track.shape}")  # (25, 3)
-    >>> 
-    >>> # Plot UV coverage
-    >>> import matplotlib.pyplot as plt
-    >>> plt.plot(uvw_track[:, 0], uvw_track[:, 1], 'o-')
-    >>> plt.xlabel('u (m)'); plt.ylabel('v (m)')
-    >>> plt.title('UV track')
-    >>> plt.axis('equal')
-    
-    See Also
-    --------
-    compute_uvw_astropy : Alternative using EarthLocation instead of PyObserver
-    compute_uvw_array : Compute UVW for all baselines in an array
-    scepter.obs.baseline_bearing : Get ITRF baseline between observers
-    hour_angle : Compute hour angle from RA and LST
-    itrf_to_enu : ITRF to ENU transformation
-    enu_to_uvw : ENU to UVW transformation
-    
-    References
-    ----------
-    Thompson, Moran & Swenson (2017), "Interferometry and Synthesis in Radio 
-    Astronomy", 3rd ed., Chapter 4
-    """
-    if not CYSGP4_AVAILABLE:
-        raise ImportError(
-            "cysgp4 is required for compute_uvw_from_observers. "
-            "Install with: pip install cysgp4"
-        )
-    if not PYCRAF_AVAILABLE:
-        raise ImportError(
-            "pycraf is required for compute_uvw_from_observers. "
-            "Install with: pip install pycraf"
-        )
-    if not ASTROPY_AVAILABLE:
-        raise ImportError(
-            "astropy is required for compute_uvw_from_observers. "
-            "Install with: pip install astropy"
-        )
-    
-    # Step 1: Get ITRF baseline using pycraf
-    x1, y1, z1 = geospatial.wgs84_to_itrf2008(
-        ref_observer.loc.lon * u.deg,
-        ref_observer.loc.lat * u.deg,
-        ref_observer.loc.alt * u.m
-    )
-    x2, y2, z2 = geospatial.wgs84_to_itrf2008(
-        ant_observer.loc.lon * u.deg,
-        ant_observer.loc.lat * u.deg,
-        ant_observer.loc.alt * u.m
-    )
-    
-    baseline_itrf = np.array([
-        x2.value - x1.value,
-        y2.value - y1.value,
-        z2.value - z1.value
-    ])
-    
-    # Step 2: Convert ITRF to ENU
-    lon_rad = np.radians(ref_observer.loc.lon)
-    lat_rad = np.radians(ref_observer.loc.lat)
-    baseline_enu = itrf_to_enu(baseline_itrf, lon_rad, lat_rad)
-    
-    # Step 3: Calculate LST and hour angle
-    # Create EarthLocation for LST calculation
-    location = EarthLocation(
-        lon=ref_observer.loc.lon * u.deg,
-        lat=ref_observer.loc.lat * u.deg,
-        height=ref_observer.loc.alt * u.m
-    )
-    
-    # Compute LST
-    lst = obs_times.sidereal_time('apparent', longitude=location.lon)
-    lst_rad = lst.radian
-    
-    # Convert RA to radians and compute hour angle
-    ra_rad = np.radians(ra_deg)
-    ha = hour_angle(ra_rad, lst_rad)
-    
-    # Step 4: Convert ENU to UVW
-    dec_rad = np.radians(dec_deg)
-    uvw_coords = enu_to_uvw(ha, dec_rad, baseline_enu)
-    
-    return uvw_coords, ha
+    Compute UVW coordinates for one or more interferometric baselines.
 
+    Unified replacement for the former ``compute_uvw_from_observers``,
+    ``compute_uvw_astropy``, and ``compute_uvw_array`` helpers.  Accepts a
+    list of one or more antenna objects and computes all baselines relative
+    to ``antennas[ref_index]`` in a single vectorised pass, performing each
+    coordinate-frame rotation exactly once regardless of array size:
 
-def compute_uvw_astropy(ref_location, ant_location, ra_deg, dec_deg, obs_times):
-    """
-    Compute UVW coordinates from EarthLocation objects (pure astropy).
-    
-    End-to-end pipeline for computing interferometric UVW coordinates using 
-    astropy.coordinates.EarthLocation objects. This provides an alternative to 
-    compute_uvw_from_observers that doesn't require pycraf or cysgp4.
-    
-    Parameters
-    ----------
-    ref_location : astropy.coordinates.EarthLocation
-        Reference antenna/observer location (baseline origin)
-        Must have geodetic coordinates (lon, lat, height)
-    ant_location : astropy.coordinates.EarthLocation
-        Target antenna for baseline measurement
-        Same requirements as ref_location
-    ra_deg : float
-        Right ascension of the observed source (degrees)
-        Range: [0, 360)
-    dec_deg : float
-        Declination of the observed source (degrees)
-        Range: [-90, 90]
-    obs_times : astropy.time.Time
-        Observation times
-        Can be scalar or array
-        Used to compute local sidereal time
-    
-    Returns
-    -------
-    uvw : numpy.ndarray, shape (N_times, 3) or (3,)
-        UVW coordinates at each observation time (meters)
-        Shape (3,) if obs_times is scalar, (N_times, 3) if array
-        Components: [u, v, w]
-    hour_angles : numpy.ndarray, shape (N_times,) or scalar
-        Hour angles at each observation time (radians)
-        Useful for diagnostics and UV track plotting
-    
-    Raises
-    ------
-    ImportError
-        If astropy is not available
-    
-    Notes
-    -----
-    **Difference from compute_uvw_from_observers:**
-    
-    This function uses EarthLocation objects instead of PyObserver objects, 
-    making it suitable for pure astropy workflows without needing pycraf or 
-    cysgp4 dependencies.
-    
-    **Processing pipeline:**
-    
-    1. Extract ITRF (geocentric) coordinates from EarthLocation
-    2. Compute ITRF baseline vector
-    3. Convert to ENU using reference location's lat/lon
-    4. Calculate hour angle from LST and RA
-    5. Transform ENU to UVW
-    
-    **Coordinate systems:**
-    
-    EarthLocation stores coordinates in multiple representations:
-    - Geodetic: (longitude, latitude, height) - WGS84 ellipsoid
-    - Geocentric: (x, y, z) - ITRS Cartesian
-    
-    This function uses the geocentric (x, y, z) coordinates directly, which 
-    are equivalent to ITRF coordinates for our purposes.
-    
-    Examples
-    --------
-    >>> from astropy.coordinates import EarthLocation
-    >>> from astropy.time import Time
-    >>> from astropy import units as u
-    >>> from scepter import uvw
-    >>> 
-    >>> # Define two antennas using EarthLocation
-    >>> ref = EarthLocation(lon=-107.618*u.deg, lat=34.079*u.deg, height=2124*u.m)
-    >>> ant = EarthLocation(lon=-107.617*u.deg, lat=34.079*u.deg, height=2124*u.m)
-    >>> 
-    >>> # Observe a source
-    >>> times = Time('2024-01-01T00:00:00')
-    >>> uvw_coords, ha = uvw.compute_uvw_astropy(
-    ...     ref, ant, ra_deg=0.0, dec_deg=45.0, obs_times=times
-    ... )
-    >>> print(f"UVW: {uvw_coords}")
-    >>> 
-    >>> # Track over multiple times
-    >>> times = Time('2024-01-01T00:00:00') + np.linspace(0, 6, 25) * u.hour
-    >>> uvw_track, ha_track = uvw.compute_uvw_astropy(
-    ...     ref, ant, ra_deg=0.0, dec_deg=45.0, obs_times=times
-    ... )
-    >>> print(f"Shape: {uvw_track.shape}")  # (25, 3)
-    
-    See Also
-    --------
-    compute_uvw_from_observers : Alternative using PyObserver objects
-    compute_uvw_array : Compute UVW for all baselines in an array
-    hour_angle : Compute hour angle from RA and LST
-    itrf_to_enu : ITRF to ENU transformation
-    enu_to_uvw : ENU to UVW transformation
-    astropy.coordinates.EarthLocation : Astropy location objects
-    """
-    if not ASTROPY_AVAILABLE:
-        raise ImportError(
-            "astropy is required for compute_uvw_astropy. "
-            "Install with: pip install astropy"
-        )
-    
-    # Step 1: Get ITRF baseline from EarthLocation objects
-    # EarthLocation provides geocentric (x, y, z) directly
-    baseline_itrf = np.array([
-        (ant_location.x - ref_location.x).to(u.m).value,
-        (ant_location.y - ref_location.y).to(u.m).value,
-        (ant_location.z - ref_location.z).to(u.m).value
-    ])
-    
-    # Step 2: Convert ITRF to ENU
-    lon_rad = ref_location.lon.radian
-    lat_rad = ref_location.lat.radian
-    baseline_enu = itrf_to_enu(baseline_itrf, lon_rad, lat_rad)
-    
-    # Step 3: Calculate LST and hour angle
-    lst = obs_times.sidereal_time('apparent', longitude=ref_location.lon)
-    lst_rad = lst.radian
-    
-    # Convert RA to radians and compute hour angle
-    ra_rad = np.radians(ra_deg)
-    ha = hour_angle(ra_rad, lst_rad)
-    
-    # Step 4: Convert ENU to UVW
-    dec_rad = np.radians(dec_deg)
-    uvw_coords = enu_to_uvw(ha, dec_rad, baseline_enu)
-    
-    return uvw_coords, ha
+        ITRF positions (all antennas, batch)
+        → ITRF baselines (vectorised subtract)
+        → ENU baselines (one rotation matrix applied to all)
+        → UVW baselines (one rotation applied to all baselines × all times)
 
+    LST and the ITRF → ENU rotation are computed once for the reference
+    antenna and reused for every baseline.
 
-def compute_uvw_array(antennas, ra_deg, dec_deg, obs_times):
-    """
-    Compute UVW coordinates for all baselines in an antenna array.
-    
-    Computes interferometric UVW coordinates for all baselines in an array 
-    simultaneously, using the first antenna as the reference. This matches 
-    the convention used by scepter.obs.baseline_pairs and is efficient for 
-    processing entire arrays.
-    
     Parameters
     ----------
     antennas : list of cysgp4.PyObserver or astropy.coordinates.EarthLocation
-        List of antenna/observer objects
-        All must be the same type (either all PyObserver or all EarthLocation)
-        First antenna becomes the reference for all baselines
+        One or more antenna locations.  A two-element list ``[ref, ant]`` is
+        the minimal case (single baseline).  All elements must be the same
+        type.
+
+        *PyObserver* attributes used: ``loc.lon`` (deg), ``loc.lat`` (deg),
+        ``loc.alt`` (m).  Requires pycraf.
+
+        *EarthLocation* attributes used: ``.x``, ``.y``, ``.z`` (geocentric
+        Cartesian, converted to metres internally).
     ra_deg : float
-        Right ascension of the observed source (degrees)
-        Range: [0, 360)
+        Right ascension of the target source (degrees, range [0, 360)).
     dec_deg : float
-        Declination of the observed source (degrees)
-        Range: [-90, 90]
+        Declination of the target source (degrees, range [−90, 90]).
     obs_times : astropy.time.Time
-        Observation times
-        Can be scalar or array
-    
+        Observation times.  May be scalar or 1-D array.  Used to derive the
+        local sidereal time (LST) and hence the hour angle.
+    ref_index : int, optional
+        Index of the reference antenna within *antennas* (default 0).
+        ``uvw_all[ref_index]`` is always the zero vector.
+
     Returns
     -------
-    uvw_all : numpy.ndarray, shape (N_antennas, N_times, 3) or (N_antennas, 3)
-        UVW coordinates for all baselines
-        uvw_all[0] is always [0, 0, 0] (reference to itself)
-        uvw_all[i] is the UVW baseline from antenna 0 to antenna i
-        If obs_times is scalar, shape is (N_antennas, 3)
-        If obs_times is array, shape is (N_antennas, N_times, 3)
-    hour_angles : numpy.ndarray, shape (N_times,) or scalar
-        Hour angles at each observation time (radians)
-        Same for all baselines (depends only on time and source position)
-    
+    uvw_all : numpy.ndarray, shape (N, 3) or (N, T, 3)
+        UVW coordinates (metres) for all N antennas (baselines relative to
+        ``antennas[ref_index]``).  Shape is ``(N, 3)`` when *obs_times* is a
+        scalar ``Time`` and ``(N, T, 3)`` for a length-T time array.
+
+        - Axis 0 — antenna index; ``uvw_all[ref_index]`` is always zero.
+        - Axis 1 (array case) — time index.
+        - Last axis — UVW components ``[u, v, w]``.
+    hour_angles : float or numpy.ndarray, shape (T,)
+        Hour angle of the phase centre at each time (radians).  Scalar when
+        *obs_times* is scalar, shape ``(T,)`` otherwise.
+
     Raises
     ------
     ImportError
-        If required packages (cysgp4, pycraf, astropy) are not available
-        Required packages depend on antenna object type
+        If astropy is not installed (always required), or if pycraf is not
+        installed when PyObserver inputs are used.
     ValueError
-        If antennas list is empty or contains mixed types
-    
+        If *antennas* is empty, contains mixed types, or contains objects of
+        an unrecognised type.
+
     Notes
     -----
-    **Baseline convention:**
-    
-    This function uses the same convention as scepter.obs.baseline_pairs:
-    - Reference antenna: antennas[0]
-    - All baselines measured from reference to other antennas
-    - Baseline 0 (reference to itself) is always [0, 0, 0]
-    
-    **Array processing:**
-    
-    For N antennas and M time samples:
-    - Computes N baselines (including reference to itself)
-    - Each baseline tracked over M times
-    - Returns shape (N, M, 3) array of UVW coordinates
-    
-    **Automatic type detection:**
-    
-    The function detects whether inputs are PyObserver or EarthLocation objects 
-    and calls the appropriate backend (compute_uvw_from_observers or 
-    compute_uvw_astropy).
-    
-    **Memory efficiency:**
-    
-    For large arrays, this is more efficient than calling compute_uvw_from_observers 
-    repeatedly because:
-    - Baseline calculations are vectorized
-    - Hour angle computed once and reused
-    - LST calculation done once for all baselines
-    
+    **Coordinate-frame pipeline:**
+
+    1. Collect geocentric ITRF positions for all antennas in a single batch
+       call (``pycraf.geospatial.wgs84_to_itrf2008`` for PyObserver inputs;
+       ``.x/.y/.z`` extraction for EarthLocation inputs).
+    2. Subtract the reference position to obtain all ITRF baselines at once
+       (shape ``(N, 3)``; no Python loop).
+    3. Apply ``itrf_to_enu`` once to the entire ``(N, 3)`` baseline matrix
+       using the reference antenna's geodetic longitude and latitude.
+    4. Compute apparent LST and hour angle once for all times.
+    5. Apply ``enu_to_uvw`` once via broadcasting:
+
+       - Scalar time → input ``(N, 3)``, output ``(N, 3)``.
+       - Array time (T samples) → baselines expanded to ``(N, 1, 3)``,
+         hour angle to ``(1, T)``, output ``(N, T, 3)``.
+
     Examples
     --------
+    **Single baseline with PyObserver:**
+
     >>> from cysgp4 import PyObserver
     >>> from astropy.time import Time
     >>> from astropy import units as u
     >>> from scepter import uvw
-    >>> 
-    >>> # Create 3-antenna array
-    >>> ant1 = PyObserver(21.443, -30.713, 1.0)  # Reference (lon, lat deg, alt km)
-    >>> ant2 = PyObserver(21.444, -30.713, 1.0)  # ~100m E
-    >>> ant3 = PyObserver(21.443, -30.714, 1.0)  # ~100m N
-    >>> antennas = [ant1, ant2, ant3]
-    >>> 
-    >>> # Single observation time
-    >>> times = Time('2024-01-01T00:00:00')
-    >>> uvw_all, ha = uvw.compute_uvw_array(
-    ...     antennas, ra_deg=0.0, dec_deg=-30.0, obs_times=times
-    ... )
-    >>> print(f"Shape: {uvw_all.shape}")  # (3, 3)
-    >>> print(f"Baseline 0->0: {uvw_all[0]}")  # [0, 0, 0]
-    >>> print(f"Baseline 0->1: {uvw_all[1]}")  # Eastward baseline
-    >>> print(f"Baseline 0->2: {uvw_all[2]}")  # Northward baseline
-    >>> 
-    >>> # Track over time
+    >>>
+    >>> ref = PyObserver(-107.618, 34.079, 2.124)  # lon deg, lat deg, alt km
+    >>> ant = PyObserver(-107.617, 34.079, 2.124)
+    >>> ra = (19 + 59/60) * 15   # Cygnus A RA in degrees
+    >>> dec = 40 + 44/60
+    >>> times = Time('2024-06-21T03:00:00')
+    >>> uvw_coords, ha = uvw.compute_uvw([ref, ant], ra_deg=ra, dec_deg=dec,
+    ...                                   obs_times=times)
+    >>> print(uvw_coords.shape)   # (2, 3)
+
+    **Three-antenna array tracked over time:**
+
+    >>> ant1 = PyObserver(21.443, -30.713, 1.086)
+    >>> ant2 = PyObserver(21.445, -30.713, 1.086)
+    >>> ant3 = PyObserver(21.443, -30.712, 1.086)
     >>> times = Time('2024-01-01T00:00:00') + np.linspace(0, 6, 25) * u.hour
-    >>> uvw_all, ha = uvw.compute_uvw_array(
-    ...     antennas, ra_deg=0.0, dec_deg=-30.0, obs_times=times
-    ... )
-    >>> print(f"Shape: {uvw_all.shape}")  # (3, 25, 3)
-    >>> 
-    >>> # Plot UV coverage for all baselines
-    >>> import matplotlib.pyplot as plt
-    >>> for i in range(1, len(antennas)):  # Skip reference baseline
-    ...     u_coords = uvw_all[i, :, 0]
-    ...     v_coords = uvw_all[i, :, 1]
-    ...     plt.plot(u_coords, v_coords, 'o-', label=f'Baseline 0-{i}')
-    >>> plt.xlabel('u (m)'); plt.ylabel('v (m)')
-    >>> plt.legend(); plt.axis('equal')
-    
+    >>> uvw_all, ha = uvw.compute_uvw([ant1, ant2, ant3],
+    ...                                ra_deg=0.0, dec_deg=-30.0,
+    ...                                obs_times=times)
+    >>> print(uvw_all.shape)   # (3, 25, 3)
+
+    **EarthLocation inputs (no pycraf/cysgp4 needed):**
+
+    >>> from astropy.coordinates import EarthLocation
+    >>> ref = EarthLocation(lon=-107.618*u.deg, lat=34.079*u.deg, height=2124*u.m)
+    >>> ant = EarthLocation(lon=-107.617*u.deg, lat=34.079*u.deg, height=2124*u.m)
+    >>> uvw_coords, ha = uvw.compute_uvw([ref, ant], ra_deg=0.0, dec_deg=45.0,
+    ...                                   obs_times=Time('2024-01-01T00:00:00'))
+
     See Also
     --------
-    compute_uvw_from_observers : Compute single baseline with PyObserver
-    compute_uvw_astropy : Compute single baseline with EarthLocation
-    scepter.obs.baseline_pairs : Get ITRF baselines for antenna array
-    hour_angle : Compute hour angle from RA and LST
+    hour_angle : Compute hour angle from RA and LST.
+    itrf_to_enu : ITRF → ENU rotation.
+    enu_to_uvw : ENU → UVW rotation.
+    scepter.obs.baseline_bearing : ITRF baseline between two antennas.
+    scepter.obs.baseline_pairs : All ITRF baselines in an array.
+
+    References
+    ----------
+    Thompson, Moran & Swenson (2017), "Interferometry and Synthesis in Radio
+    Astronomy", 3rd ed., Chapter 4.
     """
     if not antennas:
         raise ValueError("antennas list cannot be empty")
-    
+
     if not ASTROPY_AVAILABLE:
         raise ImportError(
-            "astropy is required for compute_uvw_array. "
+            "astropy is required for compute_uvw. "
             "Install with: pip install astropy"
         )
-    
-    # Detect antenna type from first element
-    first_antenna = antennas[0]
-    
-    # Determine which backend to use
-    if CYSGP4_AVAILABLE and isinstance(first_antenna, cysgp4.PyObserver):
-        # Use PyObserver backend
+
+    first = antennas[0]
+    n = len(antennas)
+
+    # ------------------------------------------------------------------
+    # Step 1: collect geocentric ITRF positions for all antennas in batch
+    # ------------------------------------------------------------------
+    if CYSGP4_AVAILABLE and isinstance(first, cysgp4.PyObserver):
         if not PYCRAF_AVAILABLE:
             raise ImportError(
-                "pycraf is required for compute_uvw_array with PyObserver. "
+                "pycraf is required when using PyObserver antennas. "
                 "Install with: pip install pycraf"
             )
-        use_pyobserver = True
-    elif ASTROPY_AVAILABLE and isinstance(first_antenna, EarthLocation):
-        # Use EarthLocation backend
-        use_pyobserver = False
+        lons = np.array([a.loc.lon for a in antennas]) * u.deg
+        lats = np.array([a.loc.lat for a in antennas]) * u.deg
+        alts = np.array([a.loc.alt for a in antennas]) * u.m
+        xs, ys, zs = geospatial.wgs84_to_itrf2008(lons, lats, alts)
+        itrf = np.stack([xs.to(u.m).value,
+                         ys.to(u.m).value,
+                         zs.to(u.m).value], axis=-1)   # (N, 3)
+        ref_lon = np.radians(antennas[ref_index].loc.lon)
+        ref_lat = np.radians(antennas[ref_index].loc.lat)
+        ref_lon_qty = antennas[ref_index].loc.lon * u.deg
+    elif ASTROPY_AVAILABLE and isinstance(first, EarthLocation):
+        itrf = np.stack([
+            np.array([a.x.to(u.m).value for a in antennas]),
+            np.array([a.y.to(u.m).value for a in antennas]),
+            np.array([a.z.to(u.m).value for a in antennas]),
+        ], axis=-1)   # (N, 3)
+        ref_lon = antennas[ref_index].lon.radian
+        ref_lat = antennas[ref_index].lat.radian
+        ref_lon_qty = antennas[ref_index].lon
     else:
         raise ValueError(
             "antennas must be a list of cysgp4.PyObserver or "
             "astropy.coordinates.EarthLocation objects"
         )
-    
-    # Get number of antennas and determine output shape
-    n_antennas = len(antennas)
-    # Check if obs_times is scalar or array using astropy's isscalar
-    is_time_scalar = obs_times.isscalar
-    
-    if not is_time_scalar:
-        n_times = len(obs_times)
-        uvw_all = np.zeros((n_antennas, n_times, 3))
+
+    # ------------------------------------------------------------------
+    # Step 2: vectorised ITRF baseline subtraction  →  (N, 3)
+    # ------------------------------------------------------------------
+    baselines_itrf = itrf - itrf[ref_index]
+
+    # ------------------------------------------------------------------
+    # Step 3: one ITRF → ENU rotation applied to all baselines
+    # ------------------------------------------------------------------
+    baselines_enu = itrf_to_enu(baselines_itrf, ref_lon, ref_lat)   # (N, 3)
+
+    # ------------------------------------------------------------------
+    # Step 4: compute apparent LST and hour angle once for all times
+    # ------------------------------------------------------------------
+    lst = obs_times.sidereal_time('apparent', longitude=ref_lon_qty)
+    ha = hour_angle(np.radians(ra_deg), lst.radian)
+
+    # ------------------------------------------------------------------
+    # Step 5: one ENU → UVW rotation, broadcast over all baselines × times
+    # ------------------------------------------------------------------
+    dec_rad = np.radians(dec_deg)
+    if obs_times.isscalar:
+        # ha is scalar; baselines_enu is (N, 3) → output (N, 3)
+        uvw_all = enu_to_uvw(ha, dec_rad, baselines_enu)
     else:
-        uvw_all = np.zeros((n_antennas, 3))
-    
-    # Reference antenna
-    ref = antennas[0]
-    
-    # Compute UVW for each baseline
-    for i, ant in enumerate(antennas):
-        if i == 0:
-            # Reference to itself - already zeros
-            continue
-        
-        if use_pyobserver:
-            uvw_coords, ha = compute_uvw_from_observers(
-                ref, ant, ra_deg, dec_deg, obs_times
-            )
-        else:
-            uvw_coords, ha = compute_uvw_astropy(
-                ref, ant, ra_deg, dec_deg, obs_times
-            )
-        
-        uvw_all[i] = uvw_coords
-    
-    # Hour angle is the same for all baselines (computed in last iteration)
-    # For consistency, we could recompute it, but it's identical for all
+        # ha has shape (T,); expand dims for broadcasting
+        # baselines_enu: (N, 1, 3) × ha: (1, T) → output (N, T, 3)
+        uvw_all = enu_to_uvw(
+            ha[np.newaxis, :],
+            dec_rad,
+            baselines_enu[:, np.newaxis, :],
+        )
+
     return uvw_all, ha
