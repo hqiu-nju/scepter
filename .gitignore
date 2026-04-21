@@ -40,9 +40,10 @@ htmlcov/
 *.whl
 
 # Data files not tracked
-notebooks/starlink_100.npz
-notebooks/oneweb_1ms.npz
-
+notebooks/*.npz
+notebooks/*.png
+scripts/*.npz
+scripts/*.png
 # Simulation outputs
 *.h5
 !scepter/tests/*.h5
