@@ -1019,6 +1019,72 @@ def pfd_to_Jy(pfd):
     return F_Jy
 
 
+def tle_ascii_to_pytles(path: str) -> np.ndarray:
+    """
+    Read a plain-text TLE file and return an array of ``cysgp4.PyTle`` objects.
+
+    The file may use the traditional 2-line element set format (one optional
+    name line followed by lines 1 and 2) or contain any number of such blocks.
+    Parsing is delegated to ``cysgp4.tles_from_text``, which accepts both
+    2-line and 3-line (name + lines 1 & 2) TLE blocks.
+
+    Parameters
+    ----------
+    path : str
+        Absolute or relative path to the ASCII TLE file (e.g. ``starlink.tle``
+        or ``starlink.txt``).  The file must be readable as plain UTF-8 text.
+
+    Returns
+    -------
+    tles : numpy.ndarray of cysgp4.PyTle
+        1-D object array of ``PyTle`` instances, one per satellite found in the
+        file.  The array is suitable for passing directly to
+        ``cysgp4.propagate_many`` or ``obs_sim.populate``.
+
+    Raises
+    ------
+    FileNotFoundError
+        If *path* does not point to an existing file.
+    ValueError
+        If the file contains no valid TLE blocks (i.e. ``cysgp4.tles_from_text``
+        returns an empty sequence).
+
+    Notes
+    -----
+    - Blank lines and comment lines (lines not starting with ``1 `` or ``2 ``)
+      are ignored by the underlying ``cysgp4.tles_from_text`` parser.
+    - The function does **not** filter by satellite name, catalogue number, or
+      epoch; all TLE blocks present in the file are returned.
+    - For ``.npz`` archives produced by the SKAO TLE database workflow, use
+      ``tlefinder.readtlenpz`` instead.
+
+    Examples
+    --------
+    Load Starlink TLEs from a plain-text file and pass them to an
+    ``obs_sim`` instance::
+
+        >>> import numpy as np
+        >>> from scepter.obs import tle_ascii_to_pytles, obs_sim
+        >>> tles = tle_ascii_to_pytles('starlink.tle')
+        >>> print(tles.shape)           # e.g. (3000,)
+        >>> print(type(tles[0]))        # cysgp4.PyTle
+        >>> sim = obs_sim(receiver, skygrid, mjds)
+        >>> sim.populate(tles)
+    """
+    with open(path, 'r', encoding='utf-8') as fh:
+        tle_text = fh.read()
+
+    tles = np.array(cysgp4.tles_from_text(tle_text))
+
+    if tles.size == 0:
+        raise ValueError(
+            f"No valid TLE blocks found in '{path}'. "
+            "Ensure the file follows the 2-line or 3-line TLE format."
+        )
+
+    return tles
+
+
 class transmitter_info():
     """
     Information holder class for satellite transmitter characteristics.

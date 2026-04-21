@@ -34,7 +34,18 @@ ITU-R methodologies.
 
 ### Installation
 
-SCEPTer uses Conda environments.  Two configurations are provided:
+SCEPTer uses Conda environments.  Three configurations are provided:
+
+**CPU-only** (no NVIDIA GPU or CUDA drivers required):
+
+```bash
+conda env create -f environment-nogpu.yml
+conda activate scepter-nogpu
+pip install -e .
+```
+
+Includes the core simulation (CPU paths), desktop GUI, and postprocessing
+workflows.  GPU-accelerated paths in `gpu_accel.py` are unavailable.
 
 **Standard** (simulation + GPU + desktop GUI):
 
@@ -52,10 +63,10 @@ conda activate scepter-dev-full
 pip install -e .
 ```
 
-Both environments include GPU acceleration, the desktop GUI, and the
-postprocessing studio.  The full environment adds Cartopy for geographic
-map projections and Trame for notebook-embedded 3D viewers.
-All packages are sourced from `conda-forge`.
+The standard and full environments include GPU acceleration, the desktop GUI,
+and the postprocessing studio.  The full environment additionally provides
+Cartopy for geographic map projections and Trame for notebook-embedded 3D
+viewers.  All packages are sourced from `conda-forge`.
 
 ### Running the desktop GUI
 
@@ -239,8 +250,8 @@ For consistent high-quality changes, read the contributor guidance:
 - `AGENTS.md` — repository-wide code quality rules
 - `.github/copilot-instructions.md` — AI assistant generation rules
 
-When making dependency changes, keep `environment.yml`, `environment-full.yml`,
-`requirements.txt`, and `setup.py` aligned.
+When making dependency changes, keep `environment-nogpu.yml`, `environment.yml`,
+`environment-full.yml`, `requirements.txt`, and `setup.py` aligned.
 
 ## Development tooling
 
