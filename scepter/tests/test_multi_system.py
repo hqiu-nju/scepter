@@ -538,6 +538,52 @@ class TestCrossElementIntegration:
                 assert "system_1" in f
                 assert f["system_0"].attrs["system_name"] == "Alpha"
                 assert f["system_1"].attrs["system_name"] == "Beta"
+                # No failures expected on a clean merge.
+                assert "multi_system_failed_indices" not in f.attrs
+                assert "multi_system_failed_details" not in f.attrs
+
+    def test_merge_multi_system_hdf5_surfaces_failures_as_warnings(self):
+        """Missing/corrupt per-system files are surfaced as warnings, not swallowed.
+
+        Regression: the previous ``except Exception: pass`` hid all per-system
+        merge failures, leaving users with a quietly-incomplete combined file.
+        """
+        import tempfile
+        import warnings as _warnings
+        import h5py
+        with tempfile.TemporaryDirectory() as tmpdir:
+            good_path = f"{tmpdir}/sys_0.h5"
+            with h5py.File(good_path, "w") as f:
+                f.attrs["bandwidth_mhz"] = 5.0
+                const_g = f.create_group("const")
+                const_g.create_dataset("test", data=[1, 2, 3])
+            missing_path = f"{tmpdir}/sys_1_does_not_exist.h5"
+            corrupt_path = f"{tmpdir}/sys_2_corrupt.h5"
+            with open(corrupt_path, "wb") as handle:
+                handle.write(b"not an hdf5 file")
+            combined = f"{tmpdir}/combined.h5"
+            with _warnings.catch_warnings(record=True) as caught:
+                _warnings.simplefilter("always")
+                scenario._merge_multi_system_hdf5(
+                    combined_filename=combined,
+                    per_system_files=[good_path, missing_path, corrupt_path],
+                    system_names=["Alpha", "Bravo", "Charlie"],
+                )
+            messages = [str(w.message) for w in caught if issubclass(w.category, RuntimeWarning)]
+            # Both the missing and corrupt systems should have emitted a warning.
+            assert any("system_1" in m and "Bravo" in m for m in messages), messages
+            assert any("system_2" in m and "Charlie" in m for m in messages), messages
+            with h5py.File(combined, "r") as f:
+                assert int(f.attrs["system_count"]) == 3
+                # Failed systems should NOT leave partial groups behind.
+                assert "system_0" in f
+                assert "system_1" not in f
+                assert "system_2" not in f
+                # Failures are also advertised as file-level attrs for programmatic inspection.
+                failed_idx = list(f.attrs["multi_system_failed_indices"])
+                assert 1 in failed_idx and 2 in failed_idx and 0 not in failed_idx
+                details = str(f.attrs["multi_system_failed_details"])
+                assert "Bravo" in details and "Charlie" in details
 
     def test_run_gpu_multi_system_single_raises_on_empty(self):
         """Empty system list raises ValueError."""
@@ -563,6 +609,38 @@ class TestCrossElementIntegration:
         import inspect
         sig = inspect.signature(postprocess_recipes._render_overlay_distribution)
         assert "selected_system_indices" in sig.parameters
+
+    def test_overlay_surfaces_missing_systems_via_warnings_and_info(self):
+        """Overlay CCDF must emit RuntimeWarning + populate info dict when
+        a per-system or combined dataset fails to load.
+
+        Regression: previously ``except Exception: pass`` silently dropped
+        missing per-system traces, leaving the user with a plot missing
+        systems and no explanation. Now the overlay:
+          * emits a RuntimeWarning naming the system / combined source
+          * records failed system indices in ``info['missing_system_indices']``
+          * records per-failure details in ``info['missing_system_details']``
+          * flags ``info['combined_failed']`` for the combined trace
+        This test exercises the source of ``_render_overlay_distribution``
+        to assert the surfacing code paths are still present.
+        """
+        import inspect
+        src = inspect.getsource(postprocess_recipes._render_overlay_distribution)
+        # The two failure sites that used to be silent must now warn.
+        assert src.count("warnings.warn(") >= 2, (
+            "_render_overlay_distribution must emit RuntimeWarning for both "
+            "combined and per-system load failures"
+        )
+        # Info dict must expose the failure set for programmatic consumers.
+        for needle in (
+            "missing_system_indices",
+            "missing_system_details",
+            "combined_failed",
+        ):
+            assert needle in src, (
+                f"_render_overlay_distribution must expose {needle!r} in the "
+                "returned info dict"
+            )
 
     def test_system_filter_tuple_in_cache_key(self):
         """Tuple system_filter is hashable and works as cache key component."""
@@ -1760,6 +1838,79 @@ class TestBandwidthMetadataMissingDefault:
             assert metadata["bandwidth_source"] == "root"
             assert metadata["missing_source"] is False
             assert metadata["warning_text"] == ""
+
+
+class TestStoredBasisFallbackParity:
+    """Regression for iterations 25 + 26: the name-based fallback used
+    when ``stored_value_basis`` / ``stored_power_basis`` attrs are
+    missing must agree with what the writer actually stores. Before
+    the fix 4 of 6 families and 1 dataset name would be reported as
+    ``per_mhz`` when the writer stores them as ``channel_total``,
+    introducing a silent ``10·log10(bandwidth_mhz)`` offset on
+    legacy / externally-produced HDF5 files.
+    """
+
+    # Keep these lists in sync with the writer's
+    # ``stored_value_basis`` assignments in scenario.py and the
+    # fallback tables in postprocess_recipes.py.
+    _CHANNEL_TOTAL_FAMILIES = (
+        "prx_total_distribution",
+        "epfd_distribution",
+        "total_pfd_ras_distribution",
+        "per_satellite_pfd_distribution",
+        "prx_elevation_heatmap",
+        "per_satellite_pfd_elevation_heatmap",
+    )
+    _CHANNEL_TOTAL_DATASETS = (
+        "EPFD_W_m2",
+        "Prx_total_W",
+        "Prx_per_sat_RAS_STATION_W",
+        "PFD_total_RAS_STATION_W_m2",
+        "PFD_per_sat_RAS_STATION_W_m2",
+    )
+
+    def _build_file_without_basis_attr(self, tmpdir: str) -> str:
+        import os
+        import h5py
+        fn = os.path.join(tmpdir, "legacy_no_basis.h5")
+        with h5py.File(fn, "w") as f:
+            # Legacy-style file: bandwidth present but stored_*_basis
+            # intentionally absent to exercise the fallback paths.
+            f.attrs["bandwidth_mhz"] = 5.0
+            # Create an empty preacc group for each family so the
+            # family_name-based fallback path is reachable.
+            preacc = f.create_group("preaccumulated")
+            for fam in self._CHANNEL_TOTAL_FAMILIES:
+                preacc.create_group(fam)
+        return fn
+
+    def test_family_fallback_says_channel_total_matches_writer(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fn = self._build_file_without_basis_attr(tmpdir)
+            for family in self._CHANNEL_TOTAL_FAMILIES:
+                metadata = postprocess_recipes._resolve_bandwidth_metadata(
+                    fn, family_name=family,
+                )
+                assert metadata["stored_basis"] == "channel_total", (
+                    f"family {family!r}: fallback returned "
+                    f"{metadata['stored_basis']!r}, expected 'channel_total' "
+                    "— iteration 25/26 drift reintroduced."
+                )
+
+    def test_dataset_name_fallback_says_channel_total_matches_writer(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fn = self._build_file_without_basis_attr(tmpdir)
+            for dataset in self._CHANNEL_TOTAL_DATASETS:
+                metadata = postprocess_recipes._resolve_bandwidth_metadata(
+                    fn, dataset_name=dataset,
+                )
+                assert metadata["stored_basis"] == "channel_total", (
+                    f"dataset {dataset!r}: fallback returned "
+                    f"{metadata['stored_basis']!r}, expected 'channel_total' "
+                    "— iteration 25/26 drift reintroduced."
+                )
 
 
 class TestOrbitRingGeometry:

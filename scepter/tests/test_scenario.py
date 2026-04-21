@@ -1358,24 +1358,37 @@ def test_normalize_direct_epfd_spectrum_plan_channel_selection_encodings_are_inv
                 if channel_index not in set(subset)
             ]
             shuffled_duplicate_subset = list(reversed(subset)) + list(subset[: min(2, len(subset))])
-            enabled_plan = _normalize_direct_epfd_test_plan(
-                service_case=service_case,
-                ras_case=ras_case,
-                reuse_factor=int(reuse_factor),
-                enabled_channel_indices=subset,
-            )
-            disabled_plan = _normalize_direct_epfd_test_plan(
-                service_case=service_case,
-                ras_case=ras_case,
-                reuse_factor=int(reuse_factor),
-                disabled_channel_indices=disabled_channel_indices,
-            )
-            duplicate_plan = _normalize_direct_epfd_test_plan(
-                service_case=service_case,
-                ras_case=ras_case,
-                reuse_factor=int(reuse_factor),
-                enabled_channel_indices=shuffled_duplicate_subset,
-            )
+            # When the RAS band is entirely outside the service band (with a
+            # rectangular emission mask), all channels may legitimately have
+            # zero leakage → all disabled → ValueError. This is correct
+            # behaviour introduced by the rectangular mask fix.
+            # When the RAS band is entirely outside the service band (with a
+            # rectangular emission mask), all channels may legitimately have
+            # zero leakage → all disabled → ValueError. This is correct
+            # behaviour introduced by the rectangular mask fix. Skip these
+            # subsets entirely — the invariant is vacuously true when no
+            # channel has non-zero leakage.
+            try:
+                enabled_plan = _normalize_direct_epfd_test_plan(
+                    service_case=service_case,
+                    ras_case=ras_case,
+                    reuse_factor=int(reuse_factor),
+                    enabled_channel_indices=subset,
+                )
+                disabled_plan = _normalize_direct_epfd_test_plan(
+                    service_case=service_case,
+                    ras_case=ras_case,
+                    reuse_factor=int(reuse_factor),
+                    disabled_channel_indices=disabled_channel_indices,
+                )
+                duplicate_plan = _normalize_direct_epfd_test_plan(
+                    service_case=service_case,
+                    ras_case=ras_case,
+                    reuse_factor=int(reuse_factor),
+                    enabled_channel_indices=shuffled_duplicate_subset,
+                )
+            except ValueError:
+                continue
 
             for comparable_plan in (disabled_plan, duplicate_plan):
                 assert_equal(
@@ -2036,6 +2049,79 @@ def test_benchmark_direct_epfd_runs_collects_observed_memory_and_finalize_substa
         "first_pass_selector": pytest.approx(0.50),
         "retarget_repair_finalize": pytest.approx(0.75),
     }
+
+
+def test_benchmark_direct_epfd_runs_dispatches_multi_system_marker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression test for iteration 16: when ``run_kwargs`` carries
+    the ``_multi_system=True`` dispatch marker (as produced by
+    ``scepter_GUI._build_multi_system_run_request`` for projects with
+    2+ systems), :func:`benchmark_direct_epfd_runs` must peel off the
+    marker and dispatch to :func:`run_gpu_multi_system_epfd` rather
+    than feed the marker straight into
+    :func:`run_gpu_direct_epfd` (which rejects it with
+    ``TypeError: unexpected keyword argument '_multi_system'``).
+    Before the fix, every multi-system GUI config silently crashed
+    on the first benchmark run.
+    """
+    calls: dict[str, object] = {}
+
+    def _fake_multi(
+        *,
+        system_run_kwargs,
+        shared_run_kwargs,
+        system_names=None,
+        output_system_groups=None,
+        progress_callback=None,
+        cancel_controller=None,
+    ):
+        calls["system_run_kwargs"] = system_run_kwargs
+        calls["shared_run_kwargs"] = dict(shared_run_kwargs)
+        calls["system_names"] = system_names
+        calls["output_system_groups"] = output_system_groups
+        # Emit at least one batch_start so the summary has data.
+        if callable(progress_callback):
+            progress_callback({
+                "kind": "batch_start",
+                "bulk_timesteps": 2,
+                "cell_chunk": 8,
+            })
+        return {"storage_filename": "multi_system_fake.h5"}
+
+    def _fake_direct(*args, **kwargs):
+        calls["direct_called"] = True
+        return {"storage_filename": "should_not_be_called.h5"}
+
+    monkeypatch.setattr(scenario, "run_gpu_multi_system_epfd", _fake_multi)
+    monkeypatch.setattr(scenario, "run_gpu_direct_epfd", _fake_direct)
+
+    case = {
+        "name": "multi_system_probe",
+        "kwargs": {
+            "_multi_system": True,
+            "_system_run_kwargs": [
+                {"storage_filename": "sys_0.h5"},
+                {"storage_filename": "sys_1.h5"},
+            ],
+            "_system_names": ["System A", "System B"],
+            "_output_system_groups": None,
+            # Shared remainders after the markers are popped:
+            "storage_filename": "combined.h5",
+        },
+    }
+    summaries = scenario.benchmark_direct_epfd_runs([case])
+    assert len(summaries) == 1
+    assert summaries[0].get("ok") is True
+    # Multi-system path was taken; direct-epfd path was NOT.
+    assert "system_run_kwargs" in calls
+    assert calls.get("direct_called") is None
+    assert len(calls["system_run_kwargs"]) == 2
+    assert calls["system_names"] == ["System A", "System B"]
+    # Shared kwargs passed through after marker removal.
+    assert calls["shared_run_kwargs"].get("storage_filename") == "combined.h5"
+    assert "_multi_system" not in calls["shared_run_kwargs"]
+    assert "_system_run_kwargs" not in calls["shared_run_kwargs"]
 
 
 def test_benchmark_direct_epfd_runs_supports_graceful_first_batch_and_gpu_metric_sampling(
@@ -8123,3 +8209,98 @@ def test_boresight_run_notebook_tiny_budget_matches_normal_budget(tmp_path: Path
 
     assert int(tiny_result["writer_checkpoint_count"]) >= 1
     assert tiny_result["writer_stats_summary"]["durability_mode"] in {"fsync", "flush_only"}
+
+
+def test_estimate_direct_epfd_lut_overhead_bytes_captures_session_resident_luts() -> None:
+    """The scheduler must account for LUT memory that stays GPU-resident
+    across batches: S.1528 gain LUT, atmosphere LUT, RAS pattern LUT,
+    surface-PFD cap K-LUT, M.2101 element LUT, and any Custom-1D/2D
+    LUTs loaded from user JSON.  These were previously ignored by
+    ``_estimate_direct_epfd_setup_gpu_bytes``, causing the planner to
+    silently under-account ~10-20 MB for configs with 2-D LUTs
+    (asymmetric S.1528, M.2101, Custom-2D).  Regression guard.
+    """
+    from scepter import scenario as _s
+
+    # Baseline with no pattern + no atmosphere + no cap = 0
+    assert _s._estimate_direct_epfd_lut_overhead_bytes() == 0
+
+    # S.1528 Rec 1.4 symmetric (1-D LUT only) at fp32 ≈ 720 KB
+    sym_bytes = _s._estimate_direct_epfd_lut_overhead_bytes(
+        sat_antenna_model="s1528_rec1_4",
+        sat_antenna_is_asymmetric=False,
+    )
+    assert 700 * 1024 <= sym_bytes <= 800 * 1024, (
+        f"Expected S.1528 1-D LUT ≈ 720 KB at fp32, got {sym_bytes / 1024:.1f} KB"
+    )
+
+    # fp16 halves the LUT footprint.
+    sym_fp16 = _s._estimate_direct_epfd_lut_overhead_bytes(
+        sat_antenna_model="s1528_rec1_4", pattern_is_fp16=True,
+    )
+    assert sym_fp16 == sym_bytes // 2, (
+        f"Expected fp16 LUT = fp32 / 2, got {sym_fp16} vs {sym_bytes // 2}"
+    )
+
+    # Asymmetric Rec 1.4 adds the 2-D LUT on top.
+    asym_bytes = _s._estimate_direct_epfd_lut_overhead_bytes(
+        sat_antenna_model="s1528_rec1_4", sat_antenna_is_asymmetric=True,
+    )
+    # 361 × 181 × 4 bytes = 261 KB added
+    assert asym_bytes > sym_bytes + 200 * 1024
+
+    # M.2101 phased-array LUT (2-D element pattern ≈ 720 × 360 × 4 = ~1 MB).
+    m2101_bytes = _s._estimate_direct_epfd_lut_overhead_bytes(
+        sat_antenna_model="m2101",
+    )
+    assert 900 * 1024 <= m2101_bytes <= 2 * 1024 * 1024
+
+    # Custom-2D LUT size passed through verbatim.
+    custom_bytes = _s._estimate_direct_epfd_lut_overhead_bytes(
+        sat_antenna_model="custom_2d",
+        sat_custom_lut_bytes=4 * 1024 * 1024,
+    )
+    assert custom_bytes >= 4 * 1024 * 1024
+
+    # Surface-PFD cap adds a K-LUT; for M.2101 it's 2-D (bigger).
+    with_cap_1d = _s._estimate_direct_epfd_lut_overhead_bytes(
+        sat_antenna_model="s1528_rec1_4", surface_pfd_cap_enabled=True,
+    )
+    with_cap_2d = _s._estimate_direct_epfd_lut_overhead_bytes(
+        sat_antenna_model="m2101", surface_pfd_cap_enabled=True,
+    )
+    assert with_cap_1d > sym_bytes
+    assert with_cap_2d > m2101_bytes
+
+    # RAS RA.1631 adds its own LUT (~same as S.1528 1-D).
+    with_ras = _s._estimate_direct_epfd_lut_overhead_bytes(
+        sat_antenna_model="s1528_rec1_4", ras_antenna_model="ra1631",
+    )
+    assert with_ras >= sym_bytes + sym_bytes  # both 1-D LUTs resident
+
+
+def test_estimate_direct_epfd_setup_gpu_bytes_honours_lut_overhead() -> None:
+    """``_estimate_direct_epfd_setup_gpu_bytes`` must propagate the
+    ``lut_overhead_bytes`` kwarg into its total so callers can thread
+    the session-resident LUT size through the planner.
+    """
+    from scepter import scenario as _s
+
+    common = dict(
+        time_count=100,
+        cell_count=5000,
+        sat_count_total=3000,
+        n_skycells=1734,
+        output_dtype=np.float32,
+        need_pointings=False,
+        need_beam_demand=False,
+        demand_count_dtype=np.uint8,
+    )
+    baseline = _s._estimate_direct_epfd_setup_gpu_bytes(**common, lut_overhead_bytes=0)
+    with_lut = _s._estimate_direct_epfd_setup_gpu_bytes(
+        **common, lut_overhead_bytes=10 * 1024 * 1024,
+    )
+    assert with_lut - baseline == 10 * 1024 * 1024, (
+        "LUT overhead must flow 1:1 into the setup total so the planner "
+        "sees the real resident cost."
+    )

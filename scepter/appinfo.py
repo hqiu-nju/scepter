@@ -4,16 +4,22 @@ from __future__ import annotations
 
 APP_NAME = "SCEPTer"
 GUI_APP_NAME = "SCEPTer GUI"
-APP_VERSION = "0.25.2"
+APP_VERSION = "0.25.3"
 APP_VERSION_TAG = f"v{APP_VERSION}"
-GUI_WINDOW_TITLE_BASE = f"{GUI_APP_NAME} {APP_VERSION_TAG}"
+# Release codename for the Simulation Studio. Starting with v0.25.3,
+# each Simulation Studio release gets a short thematic codename that
+# appears in the window title bar and About box alongside the
+# numeric version.
+APP_CODENAME = "Patterns Strike Back"
+GUI_WINDOW_TITLE_BASE = f"{GUI_APP_NAME} {APP_VERSION_TAG} — “{APP_CODENAME}”"
 
 ABOUT_TITLE = f"About {APP_NAME}"
 ABOUT_TEXT = (
-    f"{GUI_APP_NAME} {APP_VERSION_TAG}\n\n"
+    f"{GUI_APP_NAME} {APP_VERSION_TAG} — “{APP_CODENAME}”\n\n"
     "SCEPTer — simulating satellite constellation emission patterns for radio telescopes.\n\n"
-    "This desktop GUI and the maintained workflow notebooks share the same "
-    "simulation and post-processing capabilities for the v0.25.2 release.\n\n"
+    f"This desktop GUI and the maintained workflow notebooks share the same "
+    f"simulation and post-processing capabilities for the v{APP_VERSION} "
+    f"(\u201C{APP_CODENAME}\u201D) release.\n\n"
     "Authors / contacts:\n"
     "  • Boris Sorokin <boris.sorokin@skao.int>  <mralin@protonmail.com>\n"
     "  • Hao (Harry) Qiu (GitHub: https://github.com/hqiu-nju)\n\n"
@@ -69,6 +75,7 @@ def format_gui_window_title(document_name: str | None = None, *, dirty: bool = F
 __all__ = [
     "ABOUT_TEXT",
     "ABOUT_TITLE",
+    "APP_CODENAME",
     "APP_NAME",
     "APP_VERSION",
     "APP_VERSION_TAG",

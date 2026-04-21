@@ -9,6 +9,20 @@ import sys
 import traceback
 import warnings
 
+# On Windows without PYTHONUTF8=1, sys.stdout/stderr default to the ANSI
+# code page (cp1252 on most English locales), which cannot encode common
+# Unicode glyphs (→, ×, ≈, ≤, ...). These appear in source-line comments
+# and in some warning/progress text, so a stray warnings.warn / traceback
+# print during a long run surfaces as UnicodeEncodeError and gets wrapped
+# as an opaque stage failure. Reconfigure the streams to UTF-8 with a
+# lossy fallback so reporting never crashes the run.
+if sys.platform == "win32":
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="backslashreplace")
+        except Exception:
+            pass
+
 # On Windows, conda environments require Library/bin on PATH for DLL
 # loading (BLAS, CUDA, OpenSSL, etc.).  When running outside a
 # ``conda activate`` shell (e.g. direct python.exe invocation) these
@@ -49,6 +63,11 @@ warnings.filterwarnings(
     "ignore",
     message=r"^pkg_resources is deprecated as an API",
     category=UserWarning,
+)
+warnings.filterwarnings(
+    "ignore",
+    category=RuntimeWarning,
+    module=r"shibokensupport\.signature\.parser",
 )
 
 from PySide6 import QtCore, QtWidgets
@@ -96,7 +115,7 @@ def _show_startup_error(
 
 def main() -> int:
     """Launch the desktop GUI and return the Qt exit code.
-
+Y
     The heavy import and window creation are scheduled as deferred event-loop
     callbacks so the splash screen animation stays fluid throughout.  Each
     heavy step is wrapped in a ``QTimer.singleShot(0, ...)`` call which

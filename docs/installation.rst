@@ -7,12 +7,14 @@ Python package plus a notebook-oriented workflow.
 Conda environments
 ------------------
 
-Two Conda environment files are maintained in the repository.
+Three Conda environment files are maintained in the repository. All
+packages come from the ``conda-forge`` channel.
 
-Lite environment
-^^^^^^^^^^^^^^^^
+Standard environment
+^^^^^^^^^^^^^^^^^^^^
 
-Use the lite environment for core simulation work and documentation builds:
+Use the standard environment for simulation, desktop GUI, and
+postprocessing on a machine with an NVIDIA GPU:
 
 .. code-block:: bash
 
@@ -22,13 +24,27 @@ Use the lite environment for core simulation work and documentation builds:
 Full environment
 ^^^^^^^^^^^^^^^^
 
-Use the full environment when you need optional GPU acceleration or the 3D
-visualisation stack:
+The full environment adds Cartopy (geographic map projections) and
+Trame (notebook-embedded 3D viewer) on top of the standard set:
 
 .. code-block:: bash
 
    conda env create -f environment-full.yml
    conda activate scepter-dev-full
+
+CPU-only environment
+^^^^^^^^^^^^^^^^^^^^
+
+Use the CPU-only environment on machines without an NVIDIA GPU
+(macOS, Linux-without-CUDA, Windows-without-CUDA). The desktop GUI
+still imports and supports config editing, HDF5 inspection, and
+postprocess recipes; the **Run Simulation** button is disabled because
+the engine requires CUDA.
+
+.. code-block:: bash
+
+   conda env create -f environment-cpu.yml
+   conda activate scepter-dev-cpu
 
 Core dependencies
 -----------------

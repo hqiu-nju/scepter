@@ -8,6 +8,7 @@ import h5py
 import math
 from pathlib import Path
 import re
+import warnings
 from typing import Any, Mapping, Sequence
 
 from matplotlib.figure import Figure
@@ -1335,13 +1336,41 @@ def _resolve_bandwidth_metadata(
         if root_basis is not None and str(root_basis).strip():
             stored_basis = str(root_basis).strip()
         elif family_name is not None:
-            if family_name in {"prx_total_distribution", "prx_elevation_heatmap"}:
+            # Keep this fallback list in sync with the writer's
+            # ``stored_value_basis`` assignments in scenario.py
+            # (~L13520 for distributions, ~L13780 for heatmaps).
+            # Mismatch means a missing attr on a legacy / externally-
+            # produced HDF5 is interpreted as per_mhz — introduces a
+            # 10·log10(bandwidth_mhz) error in every displayed value.
+            _FAMILY_CHANNEL_TOTAL = {
+                # distributions written as channel_total (or
+                # ras_receiver_band when a spectrum plan is active,
+                # which uses the same rescale path)
+                "prx_total_distribution",
+                "epfd_distribution",
+                "total_pfd_ras_distribution",
+                "per_satellite_pfd_distribution",
+                # heatmaps
+                "prx_elevation_heatmap",
+                "per_satellite_pfd_elevation_heatmap",
+            }
+            if family_name in _FAMILY_CHANNEL_TOTAL:
                 stored_basis = "channel_total"
             else:
                 stored_basis = "per_mhz"
         elif dataset_name is not None:
+            # Every primary power dataset ends up on the same
+            # ``stored_power_basis`` rail — "channel_total" when there
+            # is no spectrum plan (or "ras_receiver_band" with one,
+            # which uses the same rescale path via
+            # ``_resolve_bandwidth_view_context``). Keep this set in
+            # sync with the canonical name table at scenario.py:~L98.
             _CHANNEL_TOTAL_DATASETS = {
-                "Prx_total_W", "Prx_per_sat_RAS_STATION_W",
+                "EPFD_W_m2",
+                "Prx_total_W",
+                "Prx_per_sat_RAS_STATION_W",
+                "PFD_total_RAS_STATION_W_m2",
+                "PFD_per_sat_RAS_STATION_W_m2",
             }
             if _resolve_iter_dataset_name(scenario.describe_data(str(filename)), dataset_name) in _CHANNEL_TOTAL_DATASETS:
                 stored_basis = "channel_total"
@@ -3373,11 +3402,21 @@ def _render_distribution_recipe(
     if normalize_grx:
         attrs = meta.get("attrs") or meta  # describe_data nests under "attrs"
         grx_max_dbi = attrs.get("ras_max_gain_dbi")
-        # Fallback: compute from stored diameter and wavelength
+        # Fallback: compute from stored diameter and wavelength.
+        # Custom-RAS runs store ``ras_station_ant_diam_m = NaN`` as
+        # "not applicable" (see scenario.py), so require the diameter
+        # to be finite before invoking the RA.1631-style derivation —
+        # otherwise this silently produces a NaN plot title.
         if grx_max_dbi is None:
             _diam = attrs.get("ras_station_ant_diam_m")
             _wlen = attrs.get("wavelength_m")
-            if _diam is not None and _wlen is not None and float(_wlen) > 0:
+            if (
+                _diam is not None
+                and _wlen is not None
+                and np.isfinite(float(_diam))
+                and np.isfinite(float(_wlen))
+                and float(_wlen) > 0
+            ):
                 _d_wlen = float(_diam) / float(_wlen)
                 grx_max_dbi = 10.0 * np.log10((np.pi * _d_wlen) ** 2)
         if grx_max_dbi is not None and float(grx_max_dbi) != 0.0:
@@ -4125,11 +4164,17 @@ def _render_overlay_distribution(
     ax.set_yscale("log")
     ax.grid(True, color="#9ca3af", alpha=0.3, linestyle=":")
 
-    info: dict[str, Any] = {"overlay_systems": [], "selected_indices": plot_indices}
+    info: dict[str, Any] = {
+        "overlay_systems": [],
+        "selected_indices": plot_indices,
+        "missing_system_indices": [],
+        "missing_system_details": [],
+    }
     integration_window_s = float(params.get("integration_window_s", _DEFAULT_INTEGRATION_WINDOW_S))
     windowing = str(params.get("windowing", _DEFAULT_CCDF_WINDOWING))
 
     # If all systems selected, plot combined (root) data as thick white line
+    combined_failed = False
     if n_sel == n_tot:
         try:
             combined_params = dict(params)
@@ -4145,8 +4190,19 @@ def _render_overlay_distribution(
             ccdf = np.arange(len(sorted_vals), 0, -1, dtype=np.float64) / len(sorted_vals)
             ax.plot(sorted_vals, ccdf, color="#ffffff", linewidth=2.5, alpha=0.9,
                     label="Combined", zorder=10)
-        except Exception:
-            pass
+        except Exception as _exc_combined:
+            combined_failed = True
+            info["combined_load_error"] = (
+                f"{type(_exc_combined).__name__}: {_exc_combined}"
+            )
+            warnings.warn(
+                f"Overlay CCDF: combined (root) data for recipe {recipe_id!r} "
+                f"could not be loaded from {filename!r}: "
+                f"{type(_exc_combined).__name__}: {_exc_combined}. "
+                "The thick 'Combined' trace will be missing from the plot.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
     # Plot per-system data
     for sys_idx in plot_indices:
@@ -4173,8 +4229,20 @@ def _render_overlay_distribution(
             ccdf = np.arange(len(sorted_vals), 0, -1, dtype=np.float64) / len(sorted_vals)
             ax.plot(sorted_vals, ccdf, color=color, linewidth=1.5, alpha=0.85,
                     label=sys_name)
-        except Exception:
-            pass  # Per-system HDF5 group not present or dataset unreadable
+        except Exception as _exc_sys:
+            info["missing_system_indices"].append(int(sys_idx))
+            info["missing_system_details"].append(
+                f"{int(sys_idx)}:{sys_name}:{type(_exc_sys).__name__}:{_exc_sys}"
+            )
+            warnings.warn(
+                f"Overlay CCDF: per-system data for system_{sys_idx} "
+                f"({sys_name!r}) could not be loaded from {filename!r}: "
+                f"{type(_exc_sys).__name__}: {_exc_sys}. "
+                "This system will be missing from the overlay plot.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+    info["combined_failed"] = combined_failed
 
     if ax.get_legend_handles_labels()[1]:
         ax.legend(loc="upper right", fontsize=8)

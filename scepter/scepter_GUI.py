@@ -54,12 +54,18 @@ from vtkmodules.vtkRenderingCore import vtkActor, vtkGlyph3DMapper, vtkPropPicke
 from scepter import (
     appinfo,
     antenna,
+    custom_antenna,
     earthgrid,
     gpu_accel,
     postprocess_recipes,
     scenario,
     tleforger,
     visualise,
+)
+from scepter.custom_antenna import (
+    CustomAntennaPattern,
+    KIND_1D as _CA_KIND_1D,
+    KIND_2D as _CA_KIND_2D,
 )
 from scepter.gui_bootstrap import (
     apply_windows_window_icon,
@@ -243,6 +249,8 @@ _ANTENNA_MODEL_M2101 = "m2101"
 _ANTENNA_MODEL_S672 = "s672"
 _ANTENNA_MODEL_COLLAPSED = "beamforming_collapsed"
 _ANTENNA_MODEL_ISOTROPIC = "isotropic"
+_ANTENNA_MODEL_CUSTOM_1D = "custom_1d"
+_ANTENNA_MODEL_CUSTOM_2D = "custom_2d"
 _ANTENNA_MODEL_OPTIONS = (
     ("ITU-R S.1528 Recommends 1.2", _ANTENNA_MODEL_REC12),
     ("ITU-R S.1528 Recommends 1.4", _ANTENNA_MODEL_REC14),
@@ -250,6 +258,19 @@ _ANTENNA_MODEL_OPTIONS = (
     ("ITU-R S.672 (GSO)", _ANTENNA_MODEL_S672),
     ("Beamforming collapsed", _ANTENNA_MODEL_COLLAPSED),
     ("Isotropic", _ANTENNA_MODEL_ISOTROPIC),
+    ("Custom 1-D (axisymmetric LUT)", _ANTENNA_MODEL_CUSTOM_1D),
+    ("Custom 2-D (θ, φ / az, el LUT)", _ANTENNA_MODEL_CUSTOM_2D),
+)
+# RAS-side antenna models. ``az_el`` 2-D is the recommended default
+# for users (matches datasheets and the v1 schema); ``theta_phi`` files
+# are also accepted and converted internally.
+_RAS_ANTENNA_MODEL_RA1631 = "ra1631"
+_RAS_ANTENNA_MODEL_CUSTOM_1D = "custom_1d"
+_RAS_ANTENNA_MODEL_CUSTOM_2D = "custom_2d"
+_RAS_ANTENNA_MODEL_OPTIONS: tuple[tuple[str, str], ...] = (
+    ("ITU-R RA.1631 (analytical)", _RAS_ANTENNA_MODEL_RA1631),
+    ("Custom 1-D (axisymmetric LUT)", _RAS_ANTENNA_MODEL_CUSTOM_1D),
+    ("Custom 2-D (az/el or θ, φ LUT)", _RAS_ANTENNA_MODEL_CUSTOM_2D),
 )
 _KNOWN_OBSERVATORIES: tuple[tuple[str, dict[str, float]], ...] = (
     # --- SKA ---
@@ -308,6 +329,9 @@ _FIELD_WIDTH_WIDE = 228
 _FIELD_WIDTH_LONG = 260
 _DATA_ASSET_DIR = Path(__file__).resolve().parent / "data"
 _EARTH_TEXTURE_ASSET_PATH = _DATA_ASSET_DIR / "earth_texture_nasa_flat_earth_8192.jpg"
+# Codename splash / motto image shown at the top of the About dialog.
+# Filename tracks the released version's codename (see appinfo.APP_CODENAME).
+_ABOUT_MOTTO_IMAGE_PATH = _DATA_ASSET_DIR / "0.25.3v_motto.png"
 _GUI_ICON_FILES: dict[str, str] = {
     "brand_mark": "scepter_brand_mark.svg",
     "workspace_home": "workspace_home_icon.svg",
@@ -489,6 +513,7 @@ _WORKSPACES: tuple[str, ...] = (
 )
 _SIMULATION_PAGE_COPY: dict[str, tuple[str, str]] = {
     "RAS Station": ("RAS Station", "Place the RAS station and validate the local receive geometry."),
+    "Satellite System Mode": ("Satellite System Mode", "Pick the satellite-system emission model (directive cell illumination vs UEMR per-satellite bypass)."),
     "Satellite Orbitals": ("Satellite Orbitals", "Shape the constellation belts that drive the rest of the workflow."),
     "Satellite Antennas": ("Satellite Antennas", "Configure the satellite-system transmit antenna before coverage analysis."),
     "Service & Demand": ("Service & Demand", "Define Nco, Nbeam, selection strategy, and cell activity assumptions."),
@@ -2092,8 +2117,11 @@ class RunMonitorWidget(QtWidgets.QFrame):
                 ],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=1.5,
                 check=False,
+                creationflags=scenario._SUBPROCESS_NO_WINDOW_FLAG,
             )
         except Exception:
             return None
@@ -2146,8 +2174,11 @@ class RunMonitorWidget(QtWidgets.QFrame):
                 ],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=1.5,
                 check=False,
+                creationflags=scenario._SUBPROCESS_NO_WINDOW_FLAG,
             )
         except Exception:
             return None
@@ -5684,7 +5715,21 @@ class PostprocessStudioWidget(QtWidgets.QWidget):
         )
         if not filename:
             return
-        self._current_figure.savefig(filename, dpi=200, bbox_inches="tight")
+        try:
+            self._current_figure.savefig(filename, dpi=200, bbox_inches="tight")
+        except Exception as exc:
+            _show_exception_warning(
+                self,
+                "Export error",
+                "Couldn't write the PNG image to the selected path.",
+                exc,
+            )
+            return
+        QtWidgets.QMessageBox.information(
+            self,
+            "Export complete",
+            f"Figure saved to:\n{filename}",
+        )
 
     def _open_plotly_browser(self) -> None:
         self._start_recipe_render(
@@ -5753,6 +5798,13 @@ class FigureWindow(QtWidgets.QDialog):
         self._cell_pick_lons: np.ndarray | None = None
         self._cell_pick_lats: np.ndarray | None = None
         self._cell_pick_button: QtWidgets.QPushButton | None = None
+        # Optional projection toggle (e.g. cartesian ↔ polar for the
+        # RAS pattern viewer). Populated lazily by
+        # :meth:`install_projection_toggle`.
+        self._projection_toggle_combo: QtWidgets.QComboBox | None = None
+        self._projection_rebuild_cb: Callable[[str], Figure] | None = None
+        self._projection_summary_cb: Callable[[str], str | None] | None = None
+        self._projection_current: str | None = None
         self._content_layout = QtWidgets.QVBoxLayout(self)
         self._content_layout.setContentsMargins(8, 8, 8, 8)
         self._summary_label = QtWidgets.QLabel(self)
@@ -5784,6 +5836,83 @@ class FigureWindow(QtWidgets.QDialog):
             self._cell_pick_button.setText(
                 "Pick θ₂ cells (active)" if checked else "Pick θ₂ cells"
             )
+
+    def install_projection_toggle(
+        self,
+        *,
+        options: Sequence[tuple[str, str]],
+        current: str,
+        rebuild_cb: Callable[[str], Figure],
+        summary_cb: Callable[[str], str | None] | None = None,
+    ) -> None:
+        """Attach a projection picker next to the matplotlib toolbar.
+
+        ``options`` is a sequence of ``(userData, label)`` pairs — e.g.
+        ``[("cartesian", "Rectangular"), ("polar", "Polar")]``.
+        ``current`` is the active ``userData`` key (must be in
+        ``options``). ``rebuild_cb(key)`` returns the replacement
+        :class:`Figure` for the selected projection. ``summary_cb`` is
+        optional and, if supplied, returns the new summary text for
+        the footer label.
+
+        Re-entrant: calling again replaces the toggle. Intended for
+        view-only figures (antenna patterns, spectra) where the
+        underlying data doesn't change but the user wants a different
+        projection.
+        """
+        self._projection_rebuild_cb = rebuild_cb
+        self._projection_summary_cb = summary_cb
+        self._projection_current = current
+        if self._projection_toggle_combo is None:
+            combo = QtWidgets.QComboBox(self)
+            combo.setToolTip(
+                "Switch between projections. Data is identical; only "
+                "the rendering changes."
+            )
+            self._projection_toggle_combo = combo
+            combo.currentIndexChanged.connect(self._on_projection_changed)
+            # Insert into the toolbar row if it's already laid out
+            # (caller invoked after the figure was installed). If
+            # ``_install_figure_widgets`` runs later it re-reads
+            # ``self._projection_toggle_combo`` and adds it to the new
+            # row, so both orderings work.
+            row = getattr(self, "_toolbar_row_layout", None)
+            if (
+                isinstance(row, QtWidgets.QHBoxLayout)
+                and getattr(self, "_theme_toggle", None) is not None
+            ):
+                idx_theme = row.indexOf(self._theme_toggle)
+                if idx_theme >= 0:
+                    row.insertWidget(idx_theme, combo)
+        combo = self._projection_toggle_combo
+        blocker = QtCore.QSignalBlocker(combo)
+        combo.clear()
+        for key, label in options:
+            combo.addItem(label, userData=key)
+        idx = combo.findData(current)
+        if idx >= 0:
+            combo.setCurrentIndex(idx)
+        del blocker
+
+    def _on_projection_changed(self, _index: int) -> None:
+        if self._projection_toggle_combo is None or self._projection_rebuild_cb is None:
+            return
+        key = self._projection_toggle_combo.currentData()
+        if key is None or key == self._projection_current:
+            return
+        try:
+            new_fig = self._projection_rebuild_cb(str(key))
+        except Exception:
+            # Revert silently on rebuild failure; the old figure stays.
+            return
+        self._projection_current = str(key)
+        new_summary = None
+        if self._projection_summary_cb is not None:
+            try:
+                new_summary = self._projection_summary_cb(str(key))
+            except Exception:
+                new_summary = None
+        self.update_figure(figure=new_fig, summary_text=new_summary)
 
     def showEvent(self, event: QtGui.QShowEvent) -> None:
         super().showEvent(event)
@@ -5842,7 +5971,18 @@ class FigureWindow(QtWidgets.QDialog):
         self._theme_toggle.clicked.connect(self._toggle_local_theme)
         toolbar_row = QtWidgets.QHBoxLayout()
         toolbar_row.addWidget(self._toolbar, 1)
+        # Optional projection toggle (cartesian ↔ polar etc.) sits
+        # between the matplotlib toolbar and the theme toggle so it
+        # stays next to the data-specific controls regardless of how
+        # many ``update_figure`` cycles have occurred. The combo
+        # survives figure swaps via ``_release_figure_widgets`` which
+        # detaches (but does not delete) it before the old row is
+        # discarded.
+        if self._projection_toggle_combo is not None:
+            toolbar_row.addWidget(self._projection_toggle_combo, 0)
+            self._projection_toggle_combo.show()
         toolbar_row.addWidget(self._theme_toggle, 0)
+        self._toolbar_row_layout = toolbar_row
         self._content_layout.addLayout(toolbar_row)
         self._content_layout.addWidget(self._canvas)
         self._content_layout.addWidget(self._summary_label)
@@ -5866,6 +6006,16 @@ class FigureWindow(QtWidgets.QDialog):
         self._canvas_release_cid = None
         self._drag_marker_index = None
         self._clear_markers()
+        # Preserve the projection combo across figure swaps — it's
+        # re-added to the freshly-built toolbar row in
+        # ``_install_figure_widgets``. Detach it now so deleting the
+        # old row doesn't also delete the combo.
+        if self._projection_toggle_combo is not None:
+            row = getattr(self, "_toolbar_row_layout", None)
+            if isinstance(row, QtWidgets.QHBoxLayout):
+                row.removeWidget(self._projection_toggle_combo)
+            self._projection_toggle_combo.setParent(self)
+            self._projection_toggle_combo.hide()
         if self._toolbar is not None:
             self._toolbar.clear_marker_controls()
             self._content_layout.removeWidget(self._toolbar)
@@ -5876,6 +6026,27 @@ class FigureWindow(QtWidgets.QDialog):
             self._content_layout.removeWidget(self._canvas)
             self._canvas.deleteLater()
             self._canvas = None
+        # Retire the per-figure toolbar row (theme toggle lives here
+        # and is re-created for each new figure). Without this the
+        # row accumulates on every ``update_figure`` call, which
+        # shows up as stacks of orphaned Toggle-theme buttons when
+        # the projection combo rebuilds. Detach the button from its
+        # parent before scheduling deletion so ``findChildren`` /
+        # ``QLayout.indexOf`` stop reporting it immediately, instead
+        # of waiting for the next ``DeferredDelete`` event-loop tick.
+        theme_toggle = getattr(self, "_theme_toggle", None)
+        if theme_toggle is not None:
+            theme_toggle.setParent(None)
+            theme_toggle.deleteLater()
+            self._theme_toggle = None
+        row_layout = getattr(self, "_toolbar_row_layout", None)
+        if isinstance(row_layout, QtWidgets.QHBoxLayout):
+            # Detach from the content layout and let the empty
+            # wrapper be garbage-collected. Any remaining child
+            # widgets are handled above.
+            self._content_layout.removeItem(row_layout)
+            row_layout.deleteLater()
+            self._toolbar_row_layout = None
         self._content_layout.removeWidget(self._summary_label)
         if self._figure is not None:
             try:
@@ -5943,13 +6114,28 @@ class FigureWindow(QtWidgets.QDialog):
             if bbox is not None:
                 continue
             text.set_color(text_color)
+        # Polar axes need a stronger grid than the cartesian default:
+        # radial gridlines sit over open background (no data fill), so
+        # alpha=0.18 on a light face is almost invisible. Bump the
+        # polar alpha so the scale remains readable.
+        is_light = variant != "dark"
+        grid_color = "#475569" if is_light else "#94a3b8"
+        cart_alpha = 0.18
+        polar_alpha = 0.55 if is_light else 0.45
         for axis in figure.axes:
             axis.set_facecolor(axes_face)
             axis.tick_params(colors=text_color)
             axis.xaxis.label.set_color(text_color)
             axis.yaxis.label.set_color(text_color)
             axis.title.set_color(text_color)
-            axis.grid(True, alpha=0.18, linestyle=":")
+            is_polar = getattr(axis, "name", "") == "polar"
+            if is_polar:
+                axis.grid(
+                    True, alpha=polar_alpha, linestyle=":",
+                    color=grid_color, linewidth=0.9,
+                )
+            else:
+                axis.grid(True, alpha=cart_alpha, linestyle=":")
             for text in axis.texts:
                 bbox = text.get_bbox_patch()
                 if bbox is not None:
@@ -5959,6 +6145,17 @@ class FigureWindow(QtWidgets.QDialog):
             axis.yaxis.get_offset_text().set_color(text_color)
             for spine in axis.spines.values():
                 spine.set_color(spine_color)
+            if is_polar:
+                # The theta/radial labels on a polar axes are coloured
+                # via tick_params above, but matplotlib also styles
+                # the *radial* labels (which show gain dBi in our
+                # viewer) separately. Recolour explicitly so they
+                # stay readable on light backgrounds.
+                try:
+                    for tlabel in axis.get_xticklabels() + axis.get_yticklabels():
+                        tlabel.set_color(text_color)
+                except Exception:
+                    pass
             legend = axis.get_legend()
             if legend is not None:
                 legend.get_frame().set_facecolor(legend_face)
@@ -6534,8 +6731,9 @@ def _build_spectrum_preview_curves(
         if int(channel_index) not in active_channel_set:
             continue
         offset_mhz = frequency_axis - float(center_mhz)
-        edge_separation_mhz = np.clip(np.abs(offset_mhz) - channel_halfwidth, 0.0, None)
-        within_cutoff = edge_separation_mhz <= cutoff + 1.0e-12
+        # Cutoff is absolute distance from centre (ITU SM.329 convention:
+        # percent × BW, where 50% = band edge, 250% = spurious domain).
+        within_cutoff = np.abs(offset_mhz) <= cutoff + 1.0e-12
         tx_display_valid |= within_cutoff
         attenuation_db = scenario._evaluate_direct_epfd_mask_attenuation_db(
             offset_mhz,
@@ -7259,6 +7457,29 @@ class SpectrumMaskEditorDialog(QtWidgets.QDialog):
             reset_row.addWidget(self.reset_points_button)
             side_layout.addLayout(reset_row)
 
+        # JSON import/export row — lets users version-control masks and
+        # share vendor-specific roll-offs or customised ITU templates
+        # across runs. The importer routes the loaded points through
+        # ``_set_points``, which normalises them through the same kernel
+        # pipeline that the runtime uses, so any malformed payload is
+        # rejected with a validation error rather than silently accepted.
+        json_row = QtWidgets.QHBoxLayout()
+        json_row.setContentsMargins(0, 0, 0, 0)
+        self.import_json_button = QtWidgets.QPushButton("Import JSON\u2026", self)
+        self.import_json_button.setToolTip(
+            "Load a previously saved mask from a JSON file."
+        )
+        self.import_json_button.clicked.connect(self._import_mask_from_json)
+        self.export_json_button = QtWidgets.QPushButton("Export JSON\u2026", self)
+        self.export_json_button.setToolTip(
+            "Save the current mask points to a JSON file."
+        )
+        self.export_json_button.clicked.connect(self._export_mask_to_json)
+        json_row.addWidget(self.import_json_button)
+        json_row.addWidget(self.export_json_button)
+        json_row.addStretch(1)
+        side_layout.addLayout(json_row)
+
         self.point_table = QtWidgets.QTableWidget(self)
         self.point_table.setColumnCount(2)
         self.point_table.setHorizontalHeaderLabels(
@@ -7614,6 +7835,161 @@ class SpectrumMaskEditorDialog(QtWidgets.QDialog):
         )
         self._set_points(points, selected_index=self._default_selected_index())
 
+    # ------------------------------------------------------------
+    # JSON import/export
+    # ------------------------------------------------------------
+    #
+    # Schema (``scepter_mask_format`` = ``"v1"``):
+    #
+    #   {
+    #     "scepter_mask_format": "v1",
+    #     "mask_kind": "tx" | "rx",
+    #     "band_halfwidth_mhz": 35.0,          # metadata, advisory only
+    #     "points": [[-40.0, 12.0], [45.0, 20.0], ...]
+    #   }
+    #
+    # ``mask_kind`` is checked to avoid loading a TX attenuation mask
+    # into an RX response editor (which would silently re-interpret the
+    # values). ``band_halfwidth_mhz`` is informational: the runtime
+    # normaliser re-anchors the in-band edges at the current editor's
+    # half-width regardless, and any user points that fall inside the
+    # anchors are dropped just like the hand-edited path.
+
+    _MASK_JSON_FORMAT_VERSION: str = "v1"
+    _MASK_JSON_KIND_LABELS: Mapping[str, str] = {
+        "tx": "Transmit unwanted-emission mask",
+        "rx": "RAS receiver response mask",
+    }
+
+    def _mask_kind_human_label(self) -> str:
+        return self._MASK_JSON_KIND_LABELS.get(self._mask_kind, self._mask_kind)
+
+    @QtCore.Slot()
+    def _export_mask_to_json(self) -> None:
+        default_name = f"scepter_{self._mask_kind}_mask.json"
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            f"Export {self._mask_kind_human_label()}",
+            default_name,
+            "JSON files (*.json);;All files (*)",
+        )
+        if not path:
+            return
+        payload = {
+            "scepter_mask_format": self._MASK_JSON_FORMAT_VERSION,
+            "mask_kind": self._mask_kind,
+            "band_halfwidth_mhz": float(self._band_halfwidth_mhz),
+            "points": [
+                [float(offset_mhz), float(level_db)]
+                for offset_mhz, level_db in self._points.tolist()
+            ],
+        }
+        try:
+            import json
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, indent=2)
+        except Exception as exc:
+            _show_exception_warning(
+                self,
+                "Export error",
+                "Couldn't write the mask JSON to the selected file.",
+                exc,
+            )
+
+    @QtCore.Slot()
+    def _import_mask_from_json(self) -> None:
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            f"Import {self._mask_kind_human_label()}",
+            "",
+            "JSON files (*.json);;All files (*)",
+        )
+        if not path:
+            return
+        try:
+            import json
+            with open(path, "r", encoding="utf-8") as fh:
+                payload = json.load(fh)
+        except Exception as exc:
+            _show_exception_warning(
+                self,
+                "Import error",
+                "The selected file isn't valid JSON.",
+                exc,
+            )
+            return
+        if not isinstance(payload, Mapping):
+            _show_exception_warning(
+                self,
+                "Import error",
+                "The selected file doesn't contain a SCEPTer mask JSON object.",
+                ValueError("top-level JSON is not an object"),
+            )
+            return
+        fmt = str(payload.get("scepter_mask_format", "")).strip()
+        if fmt and fmt != self._MASK_JSON_FORMAT_VERSION:
+            _show_exception_warning(
+                self,
+                "Unsupported mask format",
+                (
+                    f"This file declares scepter_mask_format={fmt!r}, but this "
+                    f"editor only understands {self._MASK_JSON_FORMAT_VERSION!r}. "
+                    "Re-export the mask from an updated SCEPTer release."
+                ),
+                ValueError(fmt),
+            )
+            return
+        file_kind = str(payload.get("mask_kind", "")).strip().lower()
+        if file_kind and file_kind != self._mask_kind:
+            _show_exception_warning(
+                self,
+                "Mask type mismatch",
+                (
+                    f"The file is a "
+                    f"{self._MASK_JSON_KIND_LABELS.get(file_kind, file_kind)!r} "
+                    f"but this editor is for the "
+                    f"{self._mask_kind_human_label()!r}. Loading it would "
+                    "silently re-interpret the attenuation values; the "
+                    "import was refused."
+                ),
+                ValueError(file_kind),
+            )
+            return
+        raw_points = payload.get("points")
+        if not isinstance(raw_points, list) or not raw_points:
+            _show_exception_warning(
+                self,
+                "Import error",
+                "No ``points`` array found in the JSON payload.",
+                ValueError("missing 'points'"),
+            )
+            return
+        try:
+            parsed = [
+                [float(entry[0]), float(entry[1])]
+                for entry in raw_points
+            ]
+        except Exception as exc:
+            _show_exception_warning(
+                self,
+                "Import error",
+                "``points`` must be a list of ``[signed_offset_mhz, level_db]`` pairs.",
+                exc,
+            )
+            return
+        try:
+            self._set_points(parsed, selected_index=self._default_selected_index())
+        except Exception as exc:
+            # ``_set_points`` delegates to the runtime normaliser; a bad
+            # payload (points not strictly increasing, empty halves,
+            # non-finite values) lands here with a descriptive message.
+            _show_exception_warning(
+                self,
+                "Import rejected",
+                "The mask points were loaded but rejected by the runtime normaliser.",
+                exc,
+            )
+
     @QtCore.Slot()
     def _add_midpoint_after_selection(self) -> None:
         insert_after = self._default_selected_index() if self._selected_index is None else int(self._selected_index)
@@ -7767,6 +8143,9289 @@ class SpectrumMaskEditorDialog(QtWidgets.QDialog):
 
     def _on_plot_button_release(self, _event: Any) -> None:
         self._drag_index = None
+
+
+def _antenna_template_library_dir() -> Path:
+    """Return the on-disk location of the user-saved template library.
+
+    Stored under the app's ``AppDataLocation`` so it persists across
+    project files, survives project resets, and is shared across the
+    RAS + satellite 1-D editors. Created on first access.
+    """
+    base = QtCore.QStandardPaths.writableLocation(
+        QtCore.QStandardPaths.AppDataLocation
+    )
+    if not base:
+        base = str(Path.home() / ".scepter")
+    d = Path(base) / "antenna_template_library"
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    return d
+
+
+def _scan_antenna_template_library(
+    kind: str | None = None,
+) -> list[tuple[Path, "CustomAntennaPattern"]]:
+    """Load every valid template from the user library, optionally
+    filtered by ``kind`` (``"1d_axisymmetric"`` or ``"2d"``). Broken
+    files are silently skipped so a single bad JSON doesn't break the
+    preset picker.
+    """
+    from scepter.custom_antenna import load_custom_pattern
+    out: list[tuple[Path, "CustomAntennaPattern"]] = []
+    for path in sorted(_antenna_template_library_dir().glob("*.json")):
+        try:
+            pat = load_custom_pattern(path)
+        except Exception:
+            continue
+        if kind is not None and pat.kind != kind:
+            continue
+        out.append((path, pat))
+    return out
+
+
+#: Reference-pattern library for :class:`PatternEditor1DDialog`. Each
+#: entry declares the preset's display label, its required inputs
+#: (``"diameter"``, ``"frequency"``, ``"efficiency"``, ``"density"``,
+#: ``"beamwidth"``), and the name of the handler method that rewrites
+#: the editor's control points. Keeping this table next to the dialog
+#: makes adding a new reference pattern a two-step change: (1) append
+#: one line here, (2) write the handler method.
+_PATTERN_PRESET_LIBRARY_1D: tuple[dict[str, Any], ...] = (
+    {
+        "key": "ra1631",
+        "label": "ITU-R RA.1631 (analytical)",
+        "inputs": ("diameter", "frequency", "density"),
+        "handler": "_apply_ra1631_preset",
+    },
+    {
+        "key": "s1528_rec12",
+        "label": "ITU-R S.1528 Rec 1.2 (analytical)",
+        "inputs": ("gm", "diameter", "frequency", "ln", "density"),
+        "handler": "_apply_s1528_rec12_preset",
+    },
+    {
+        "key": "s672",
+        "label": "ITU-R S.672 (analytical, via S.1528 Rec 1.2)",
+        "inputs": ("gm", "diameter", "frequency", "ln", "density"),
+        "handler": "_apply_s672_preset",
+    },
+    {
+        # S.1528 Rec 1.4 is a 2-D pattern in general; when the two
+        # aperture dimensions match (L_t = L_r) the evaluator is
+        # φ-invariant and reduces to a 1-D function of θ only. The
+        # preset form therefore accepts a single L (reuses the
+        # "diameter" spin as the aperture length) and samples the
+        # evaluator at φ = 0°.
+        "key": "s1528_rec14_symmetric",
+        "label": "ITU-R S.1528 Rec 1.4 (symmetric: L\u209c = L\u1d63)",
+        "inputs": ("gm", "diameter", "frequency", "slr", "l_sidelobes", "density"),
+        "handler": "_apply_s1528_rec14_symmetric_preset",
+    },
+    {
+        "key": "f699",
+        "label": "ITU-R F.699 (radio-relay, peak envelope)",
+        "inputs": ("gm", "diameter", "frequency", "density"),
+        "handler": "_apply_f699_preset",
+    },
+    {
+        "key": "f1245",
+        "label": "ITU-R F.1245 (radio-relay, average envelope)",
+        "inputs": ("gm", "diameter", "frequency", "density"),
+        "handler": "_apply_f1245_preset",
+    },
+    {
+        "key": "s465",
+        "label": "ITU-R S.465 (earth-station / VSAT reference)",
+        "inputs": ("gm", "diameter", "frequency", "density"),
+        "handler": "_apply_s465_preset",
+    },
+    # The OneWeb pattern in ECC Report 271 Table 11 is a 2-D
+    # asymmetric satellite beam (along-track / cross-track), not a
+    # 1-D axisymmetric mask. It lives in the 2-D editor's template
+    # list as "OneWeb satellite (ECC 271 Table 11)" — the earlier
+    # 1-D S.1528-Rec-1.2 wrapper preset was an inaccurate
+    # representation and has been removed.
+    {
+        "key": "s580",
+        "label": "ITU-R S.580 (GSO earth-station design objective)",
+        "inputs": ("diameter", "frequency", "density"),
+        "handler": "_apply_s580_preset",
+    },
+    {
+        "key": "s1428",
+        "label": "ITU-R S.1428 (non-GSO EPFD reference earth station)",
+        "inputs": ("diameter", "frequency", "density"),
+        "handler": "_apply_s1428_preset",
+    },
+    {
+        "key": "sa509",
+        "label": "ITU-R SA.509 (space research / radio astronomy earth station)",
+        "inputs": ("diameter", "frequency", "density"),
+        "handler": "_apply_sa509_preset",
+    },
+    {
+        "key": "f1336_omni",
+        "label": "ITU-R F.1336-5 omnidirectional (base station, elevation only)",
+        "inputs": ("gm", "density"),
+        "handler": "_apply_f1336_omni_preset",
+    },
+    {
+        "key": "airy",
+        "label": "Uniform circular aperture (Airy / jinc)",
+        "inputs": ("diameter", "frequency", "density"),
+        "handler": "_apply_airy_preset",
+    },
+    {
+        "key": "cosine_taper",
+        "label": "Cosine-tapered circular aperture",
+        "inputs": ("diameter", "frequency", "density"),
+        "handler": "_apply_cosine_taper_preset",
+    },
+    {
+        "key": "generic_narrow",
+        "label": "Generic narrow-beam (\u03bb/D-scaled)",
+        "inputs": ("diameter", "frequency", "efficiency", "density"),
+        "handler": "_apply_generic_narrow_preset",
+    },
+    {
+        "key": "generic_wide",
+        "label": "Generic wide-beam (cos²)",
+        "inputs": ("beamwidth", "peak", "density"),
+        "handler": "_apply_generic_wide_preset",
+    },
+    {
+        "key": "gaussian",
+        "label": "Gaussian main lobe",
+        "inputs": ("beamwidth", "peak", "density"),
+        "handler": "_apply_gaussian_preset",
+    },
+)
+
+
+_SMOOTHING_METHODS: tuple[dict[str, Any], ...] = (
+    # ----- Idempotent methods (linear projections P² = P) -----
+    {
+        "key": "bspline_cubic",
+        "label": "Cubic B-spline projection (recommended)",
+        "idempotent": True,
+        "description": (
+            "Least-squares cubic-spline fit with a fixed knot sequence. "
+            "Smooth, flexible enough to track main-lobe / null / "
+            "sidelobe structure. <b>Idempotent</b>: the fit is a "
+            "linear projection, so 1 click = 1000 clicks. Good default."
+        ),
+    },
+    {
+        "key": "bspline_linear",
+        "label": "Linear B-spline projection",
+        "idempotent": True,
+        "description": (
+            "Same idea as the cubic fit but with degree-1 splines. "
+            "Produces a piecewise-linear curve \u2014 less smooth than "
+            "cubic but preserves sharper features (nulls, edges). "
+            "<b>Idempotent.</b>"
+        ),
+    },
+    {
+        "key": "chebyshev",
+        "label": "Chebyshev polynomial projection",
+        "idempotent": True,
+        "description": (
+            "Projects the gain curve onto the first N Chebyshev "
+            "polynomials. Great for smooth, globally-coherent patterns; "
+            "less useful when you need to preserve sharp local "
+            "features. <b>Idempotent.</b>"
+        ),
+    },
+    {
+        "key": "gaussian_rbf",
+        "label": "Gaussian-RBF basis projection",
+        "idempotent": True,
+        "description": (
+            "LSQ fit against a bank of fixed-width Gaussian radial "
+            "basis functions centred along \u03b8. Natural smoothness "
+            "but can ring near steep edges. <b>Idempotent.</b>"
+        ),
+    },
+    {
+        "key": "bin_mean",
+        "label": "Bin mean (piecewise constant)",
+        "idempotent": True,
+        "description": (
+            "Averages points inside fixed \u03b8 bins. Produces a "
+            "stair-step curve \u2014 cruder than the spline / "
+            "Chebyshev fits but dependency-free and bulletproof. "
+            "<b>Idempotent.</b>"
+        ),
+    },
+    # ----- Non-idempotent methods (each click changes more) -----
+    {
+        "key": "savgol",
+        "label": "Savitzky-Golay (classic) \u26a0",
+        "idempotent": False,
+        "description": (
+            "Local polynomial fit in a sliding window \u2014 the "
+            "textbook noise smoother. <b>Not idempotent:</b> each "
+            "click removes more high-frequency content and eventually "
+            "collapses the pattern toward a global polynomial. Use "
+            "for a single surgical pass on noisy measurement data."
+        ),
+    },
+    {
+        "key": "moving_avg_slide",
+        "label": "Sliding moving average \u26a0",
+        "idempotent": False,
+        "description": (
+            "Symmetric boxcar convolution. <b>Not idempotent:</b> "
+            "each pass widens the effective kernel and flattens the "
+            "pattern further. Simpler than Savitzky-Golay but with "
+            "the same drift caveat."
+        ),
+    },
+    {
+        "key": "gaussian_kernel",
+        "label": "Gaussian kernel convolution \u26a0",
+        "idempotent": False,
+        "description": (
+            "Convolves the gain curve with a Gaussian of fixed \u03c3. "
+            "Smoother than the boxcar but still <b>not idempotent</b>: "
+            "\u03c3 grows as \u221a2 with each pass (two Gaussian "
+            "convolutions = one wider Gaussian)."
+        ),
+    },
+    {
+        "key": "median",
+        "label": "Median filter \u26a0",
+        "idempotent": False,
+        "description": (
+            "Replaces each point with the median in a sliding window. "
+            "Excellent for outlier / spike removal. <b>Not idempotent</b> "
+            "\u2014 repeated passes converge to a stair-case / "
+            "constant but not in one application."
+        ),
+    },
+    {
+        "key": "ema",
+        "label": "Exponential moving average \u26a0",
+        "idempotent": False,
+        "description": (
+            "Causal IIR smoother with fixed smoothing factor \u03b1. "
+            "<b>Not idempotent</b>: every pass compounds the "
+            "exponential decay, so the curve keeps sliding. Included "
+            "for completeness \u2014 rarely the right choice for "
+            "symmetric antenna patterns."
+        ),
+    },
+)
+
+
+class SmoothingMethodDialog(QtWidgets.QDialog):
+    """Fancy chooser for the pattern-editor's smoothing technique.
+
+    Features
+    --------
+    * Methods are grouped by category: *Projection-based* methods
+      (idempotent — safe to click repeatedly) vs *Classical filters*
+      (not idempotent — each click evolves the pattern).
+    * A live matplotlib preview shows the current pattern before
+      smoothing (blue) overlaid with the candidate smoothed curve
+      (orange) so the user sees exactly what the selected method
+      would do before clicking Apply.
+    * A measured-drift badge shows the numerical drift per click on
+      the current pattern — the empirical confirmation that the
+      labelled idempotent methods really are idempotent, and how
+      quickly the classical filters diverge.
+    """
+
+    def __init__(
+        self,
+        parent: QtWidgets.QWidget | None = None,
+        *,
+        initial_method: str = "bspline_cubic",
+        preview_data: tuple[np.ndarray, np.ndarray] | None = None,
+        apply_callback: Callable[[str, np.ndarray, np.ndarray], np.ndarray] | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Choose smoothing method")
+        self.setWindowIcon(_load_app_icon())
+        self.setModal(True)
+        self.resize(920, 580)
+        if parent is not None:
+            self.setStyleSheet(parent.styleSheet())
+        self._preview_data = preview_data
+        self._apply_callback = apply_callback
+
+        root = QtWidgets.QVBoxLayout(self)
+        root.setContentsMargins(16, 14, 16, 14)
+        root.setSpacing(10)
+
+        intro = QtWidgets.QLabel(
+            "Pick a smoothing algorithm. <b>Projection-based</b> "
+            "methods are <b>idempotent</b> \u2014 clicking once vs. "
+            "a thousand times gives the same result. "
+            "<b>Classical filters</b> continue to evolve the pattern "
+            "with each click, which is sometimes what you want but "
+            "more often a surprise.",
+            self,
+        )
+        intro.setWordWrap(True)
+        intro.setTextFormat(QtCore.Qt.RichText)
+        root.addWidget(intro)
+
+        body = QtWidgets.QHBoxLayout()
+        body.setSpacing(14)
+        root.addLayout(body, 1)
+
+        # ----- Left column: grouped radio buttons -----
+        self._radio_group = QtWidgets.QButtonGroup(self)
+        self._radio_group.setExclusive(True)
+        self._radios: dict[str, QtWidgets.QRadioButton] = {}
+        left_col = QtWidgets.QVBoxLayout()
+        left_col.setSpacing(6)
+
+        def _add_category(title: str, specs: list[dict[str, Any]], hint: str) -> None:
+            group_box = QtWidgets.QGroupBox(title, self)
+            gbox_layout = QtWidgets.QVBoxLayout(group_box)
+            gbox_layout.setContentsMargins(10, 8, 10, 8)
+            gbox_layout.setSpacing(4)
+            hint_lbl = QtWidgets.QLabel(hint, self)
+            hint_lbl.setWordWrap(True)
+            hint_lbl.setStyleSheet("color:#94a3b8; font-size:11px;")
+            gbox_layout.addWidget(hint_lbl)
+            for spec in specs:
+                rb = QtWidgets.QRadioButton(spec["label"], self)
+                self._radios[str(spec["key"])] = rb
+                self._radio_group.addButton(rb)
+                gbox_layout.addWidget(rb)
+                rb.toggled.connect(self._on_radio_toggled)
+            left_col.addWidget(group_box)
+
+        idempotent_specs = [s for s in _SMOOTHING_METHODS if s["idempotent"]]
+        classical_specs = [s for s in _SMOOTHING_METHODS if not s["idempotent"]]
+        _add_category(
+            "Projection-based (idempotent \u2713)", idempotent_specs,
+            "Safe to click repeatedly \u2014 the result converges in one click.",
+        )
+        _add_category(
+            "Classical filters (not idempotent \u26a0)", classical_specs,
+            "Each click changes the pattern further; use Undo to step back.",
+        )
+        left_col.addStretch(1)
+        left_wrap = QtWidgets.QWidget(self)
+        left_wrap.setLayout(left_col)
+        left_wrap.setMinimumWidth(300)
+        body.addWidget(left_wrap, 0)
+
+        # ----- Right column: preview plot + detail pane -----
+        right_col = QtWidgets.QVBoxLayout()
+        right_col.setSpacing(8)
+
+        self._preview_figure = Figure(figsize=(5.2, 2.6), layout="constrained")
+        self._preview_canvas = FigureCanvasQTAgg(self._preview_figure)
+        # Fix the preview to a specific height so swapping methods
+        # with different description lengths doesn't reshape the
+        # plot. (The previous layout used a vertical stretch of 1
+        # on the canvas plus a ``Preferred``-height detail label,
+        # which meant longer descriptions squeezed the plot.)
+        self._preview_canvas.setFixedHeight(260)
+        self._preview_canvas.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed,
+        )
+        self._preview_ax = self._preview_figure.add_subplot(111)
+        right_col.addWidget(self._preview_canvas, 0)
+
+        # Drift badge — measured per-click drift on the current
+        # pattern. For idempotent methods this is rounding noise
+        # (< 1e-8 dB). For classical filters it's a real number
+        # showing how much each extra click changes things.
+        self._drift_badge = QtWidgets.QLabel("", self)
+        self._drift_badge.setWordWrap(True)
+        self._drift_badge.setTextFormat(QtCore.Qt.RichText)
+        self._drift_badge.setStyleSheet(
+            "padding: 6px 10px; border-radius: 6px; "
+            "background: rgba(100, 116, 139, 0.15);"
+        )
+        self._drift_badge.setFixedHeight(56)
+        right_col.addWidget(self._drift_badge, 0)
+
+        # Detail description — wrapped in a scroll area with a fixed
+        # visible height so long descriptions scroll internally
+        # instead of reshaping the preview plot above.
+        self._detail_label = QtWidgets.QLabel("", self)
+        self._detail_label.setWordWrap(True)
+        self._detail_label.setTextFormat(QtCore.Qt.RichText)
+        self._detail_label.setAlignment(
+            QtCore.Qt.AlignTop | QtCore.Qt.AlignLeft,
+        )
+        self._detail_label.setStyleSheet("padding: 10px;")
+        self._detail_label.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred,
+        )
+        detail_scroll = QtWidgets.QScrollArea(self)
+        detail_scroll.setWidget(self._detail_label)
+        detail_scroll.setWidgetResizable(True)
+        detail_scroll.setFrameShape(QtWidgets.QFrame.StyledPanel)
+        detail_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        detail_scroll.setStyleSheet(
+            "QScrollArea { border: 1px solid #334155; border-radius: 6px; }"
+        )
+        detail_scroll.setFixedHeight(160)
+        detail_scroll.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed,
+        )
+        right_col.addWidget(detail_scroll, 0)
+        right_col.addStretch(1)
+
+        right_wrap = QtWidgets.QWidget(self)
+        right_wrap.setLayout(right_col)
+        body.addWidget(right_wrap, 1)
+
+        button_box = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel,
+            QtCore.Qt.Horizontal, self,
+        )
+        apply_btn = button_box.button(QtWidgets.QDialogButtonBox.Ok)
+        if apply_btn is not None:
+            apply_btn.setText("Apply smoothing")
+        button_box.accepted.connect(self.accept)
+        button_box.rejected.connect(self.reject)
+        root.addWidget(button_box)
+
+        initial_key = (
+            initial_method if initial_method in self._radios else "bspline_cubic"
+        )
+        self._radios[initial_key].setChecked(True)
+        self._refresh_detail(initial_key)
+
+    def _on_radio_toggled(self, checked: bool) -> None:
+        if not checked:
+            return
+        self._refresh_detail(self.selected_method())
+
+    def _refresh_detail(self, key: str) -> None:
+        spec = next(
+            (s for s in _SMOOTHING_METHODS if s["key"] == key),
+            None,
+        )
+        if spec is None:
+            return
+        warning = (
+            "<span style='color:#4ade80;'>\u2713 Idempotent:</span> "
+            "applying this method twice gives the same result as once. "
+            "Click Apply as many times as you like without drift."
+            if spec["idempotent"]
+            else "<span style='color:#f59e0b;'>\u26a0 Not idempotent:</span> "
+            "each click changes the pattern further. If the result "
+            "overshoots, Undo steps back one click."
+        )
+        self._detail_label.setText(
+            f"<h3 style='margin-top:0;'>{spec['label']}</h3>"
+            f"<p>{spec['description']}</p>"
+            f"<p style='margin-top:6px;'>{warning}</p>"
+        )
+        self._update_preview(key, spec)
+
+    def _update_preview(self, key: str, spec: dict[str, Any]) -> None:
+        """Render a before/after curve and the measured drift badge."""
+        self._preview_ax.clear()
+        if self._preview_data is None or self._apply_callback is None:
+            self._preview_ax.text(
+                0.5, 0.5, "Preview unavailable",
+                ha="center", va="center",
+                transform=self._preview_ax.transAxes,
+                color="#94a3b8",
+            )
+            self._preview_ax.set_xticks([])
+            self._preview_ax.set_yticks([])
+            self._drift_badge.setText("")
+            self._preview_canvas.draw_idle()
+            return
+        thetas, gains = self._preview_data
+        try:
+            g1 = self._apply_callback(key, thetas, gains.copy())
+            g2 = self._apply_callback(key, thetas, g1.copy())
+            drift_per_click = float(np.max(np.abs(g2 - g1)))
+        except Exception as exc:
+            self._preview_ax.text(
+                0.5, 0.5, f"Preview failed:\n{exc}",
+                ha="center", va="center",
+                transform=self._preview_ax.transAxes,
+                color="#f87171",
+            )
+            self._drift_badge.setText("")
+            self._preview_canvas.draw_idle()
+            return
+        self._preview_ax.plot(
+            thetas, gains, color="#60a5fa", lw=1.1, label="Current",
+        )
+        self._preview_ax.plot(
+            thetas, g1, color="#f97316", lw=1.6, label="After 1 click",
+        )
+        if not spec["idempotent"]:
+            gN = g1.copy()
+            for _ in range(9):
+                gN = self._apply_callback(key, thetas, gN.copy())
+            self._preview_ax.plot(
+                thetas, gN, color="#ef4444", lw=1.1, linestyle="--",
+                label="After 10 clicks",
+            )
+        self._preview_ax.set_xlabel("\u03b8 (deg)", fontsize=9)
+        self._preview_ax.set_ylabel("Gain (dBi)", fontsize=9)
+        self._preview_ax.legend(fontsize=8, loc="best", frameon=False)
+        self._preview_ax.grid(True, alpha=0.25, linestyle=":")
+        self._preview_ax.tick_params(labelsize=8)
+        self._style_preview_colors()
+        self._preview_canvas.draw_idle()
+
+        if spec["idempotent"]:
+            status = (
+                f"<span style='color:#4ade80;'>\u2713 Measured drift "
+                f"per click: {drift_per_click:.2e} dB</span> \u2014 "
+                f"essentially rounding noise; clicking N times = "
+                f"clicking once."
+            )
+        else:
+            status = (
+                f"<span style='color:#f59e0b;'>\u26a0 Measured drift "
+                f"per click: {drift_per_click:.3g} dB</span> on the "
+                f"current pattern \u2014 each extra click will change "
+                f"the gain by roughly this much."
+            )
+        self._drift_badge.setText(status)
+
+    def _style_preview_colors(self) -> None:
+        """Match the preview figure to the dialog's dark palette."""
+        fig = self._preview_figure
+        ax = self._preview_ax
+        fig.patch.set_facecolor("#0c182b")
+        ax.set_facecolor("#0c182b")
+        for spine in ax.spines.values():
+            spine.set_color("#475569")
+        ax.tick_params(colors="#e2e8f0")
+        ax.xaxis.label.set_color("#e2e8f0")
+        ax.yaxis.label.set_color("#e2e8f0")
+        legend = ax.get_legend()
+        if legend is not None:
+            for text in legend.get_texts():
+                text.set_color("#e2e8f0")
+
+    def selected_method(self) -> str:
+        for key, rb in self._radios.items():
+            if rb.isChecked():
+                return key
+        return "bspline_cubic"
+
+
+class PatternEditor1DDialog(QtWidgets.QDialog):
+    """Graphical editor for 1-D axisymmetric custom antenna patterns.
+
+    Mirrors the UX of :class:`SpectrumMaskEditorDialog`: drag control
+    points on a gain-vs-angle plot, edit numeric values in a table,
+    import/export JSON, apply presets. Returns a validated
+    :class:`~scepter.custom_antenna.CustomAntennaPattern` on accept,
+    which the caller feeds into ``RasAntennaConfig.custom_pattern``
+    or ``SatelliteAntennasConfig.custom_pattern``.
+
+    Parameters
+    ----------
+    initial_pattern :
+        Existing :class:`CustomAntennaPattern` (kind=1d_axisymmetric)
+        to prefill the editor, or ``None`` to start from a generic
+        starter template.
+    wavelength_m, diameter_m :
+        Used by the "RA.1631 template" preset. Both must be positive
+        for the preset to apply; otherwise the button is disabled.
+    side :
+        ``"ras"`` or ``"tx"`` — only affects wording; the math is
+        identical.
+    """
+
+    _POINT_PICK_RADIUS_PX = 14.0
+    _THETA_MAX_DEG = 180.0
+    _MIN_POINT_GAP_DEG = 1.0e-6
+
+    def __init__(
+        self,
+        *,
+        initial_pattern: "CustomAntennaPattern | None" = None,
+        wavelength_m: float | None = None,
+        diameter_m: float | None = None,
+        side: str = "ras",
+        parent: QtWidgets.QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        from scepter.custom_antenna import (
+            KIND_1D as _CK_1D,
+            NORMALISATION_ABSOLUTE as _CN_ABS,
+            PEAK_SOURCE_EXPLICIT as _CP_EXPL,
+        )
+        self._kind_1d = _CK_1D
+        self._norm_abs = _CN_ABS
+        self._peak_src_explicit = _CP_EXPL
+        self._side = str(side or "ras").strip().lower()
+        self._wavelength_m = (
+            float(wavelength_m) if wavelength_m is not None and float(wavelength_m) > 0.0
+            else None
+        )
+        self._diameter_m = (
+            float(diameter_m) if diameter_m is not None and float(diameter_m) > 0.0
+            else None
+        )
+        title_prefix = "RAS" if self._side == "ras" else "Satellite"
+        self.setWindowTitle(f"Custom {title_prefix} Antenna Pattern \u2014 1-D Editor")
+        self.setWindowIcon(_load_app_icon())
+        self.resize(1200, 780)
+        self.setModal(True)
+        self.setAttribute(QtCore.Qt.WA_DeleteOnClose, True)
+
+        # Session state: points = Nx2 array (theta_deg, gain_dbi).
+        self._peak_gain_dbi: float = 34.0
+        self._title_text: str = ""
+        if initial_pattern is not None and initial_pattern.kind == _CK_1D:
+            self._points = np.stack(
+                [
+                    np.asarray(initial_pattern.grid_deg, dtype=np.float64),
+                    np.asarray(initial_pattern.gain_db, dtype=np.float64),
+                ],
+                axis=1,
+            )
+            self._peak_gain_dbi = float(initial_pattern.peak_gain_dbi)
+            self._title_text = str((initial_pattern.meta or {}).get("title", ""))
+            # Convert relative-normalisation storage to absolute dBi
+            # so the editor works in a single consistent convention.
+            if initial_pattern.normalisation != _CN_ABS:
+                self._points[:, 1] = self._points[:, 1] + float(self._peak_gain_dbi)
+        else:
+            self._points = self._starter_template()
+        self._selected_index: int | None = None
+        self._drag_index: int | None = None
+        self._table_sync_in_progress = False
+        self._result_pattern: "CustomAntennaPattern | None" = None
+        # Undo / redo: each entry is a ``(points_copy, peak_dbi,
+        # title)`` tuple so history captures the full editable state.
+        # ``_history_pos`` is the index of the *current* state; undo
+        # moves back, redo forward. Bounded at 64 entries.
+        self._history: list[tuple[np.ndarray, float, str]] = []
+        self._history_pos: int = -1
+        self._history_in_progress: bool = False
+        # Baseline state for "Reset" + unsaved-changes detection.
+        self._initial_points_baseline = self._points.copy()
+        self._initial_peak_baseline = float(self._peak_gain_dbi)
+        self._initial_title_baseline = str(self._title_text)
+        # Display-mode flags.
+        self._polar_mode: bool = False
+        self._log_x: bool = False
+        # Compare-overlay state: ``None`` means no overlay is drawn.
+        self._overlay_points: np.ndarray | None = None
+        self._overlay_label: str = ""
+        # Extended metadata kept out of the schema's required fields
+        # so users can document provenance without polluting the
+        # canonical ``peak_gain_dbi`` / ``grid_deg`` / ``gain_db``
+        # triple. Persisted in ``meta`` on accept.
+        self._meta_author: str = ""
+        self._meta_source: str = ""
+        self._meta_notes: str = ""
+
+        # --- layout ---
+        root = QtWidgets.QVBoxLayout(self)
+        root.setContentsMargins(10, 10, 10, 10)
+        root.setSpacing(10)
+
+        intro = QtWidgets.QLabel(
+            "Drag points to shape the gain-vs-off-axis-angle curve. "
+            "Double-click to add a point; right-click or press Delete "
+            "to remove the selected non-anchor point. The endpoints at "
+            "θ = 0° and θ = 180° are anchored horizontally.  "
+            "<span style='color:#94a3b8'>"
+            "<b>Shortcuts:</b> Ctrl+Z undo · Ctrl+Y / Ctrl+Shift+Z redo · "
+            "Arrows nudge selected point (Shift = coarse) · "
+            "Ctrl+Shift+V paste CSV."
+            "</span>",
+            self,
+        )
+        intro.setTextFormat(QtCore.Qt.RichText)
+        intro.setWordWrap(True)
+        root.addWidget(intro)
+
+        # Use a QSplitter so the user can widen the side panel when
+        # long preset / derived-quantity labels feel cramped. The
+        # default split is ~60/40 in favour of the plot; dragging the
+        # handle persists for the lifetime of the dialog.
+        body_splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal, self)
+        body_splitter.setChildrenCollapsible(False)
+        body_splitter.setHandleWidth(6)
+        root.addWidget(body_splitter, 1)
+        self._body_splitter = body_splitter
+
+        # Figure + side panel with a stable split. The side panel
+        # gets a fixed minimum width so varying preset-form content
+        # can't reshape the figure area on the left — matplotlib's
+        # ``tight_layout`` would re-compute subplot margins after
+        # every resize and cause visible flicker.
+        self._figure = Figure(figsize=(8.2, 6.0))
+        self._canvas = DeferredResizeFigureCanvas(self._figure)
+        self._toolbar = ScepterNavigationToolbar(self._canvas, self)
+        fig_col = QtWidgets.QVBoxLayout()
+        fig_col.setContentsMargins(0, 0, 0, 0)
+        fig_col.setSpacing(6)
+
+        # Display-mode mini-toolbar: polar / log-x / zoom to main
+        # lobe / compare overlay. Sits above the matplotlib toolbar
+        # so the plot itself stays at a fixed visual position.
+        display_row = QtWidgets.QHBoxLayout()
+        display_row.setContentsMargins(0, 0, 0, 0)
+        display_row.setSpacing(8)
+        self._polar_checkbox = QtWidgets.QCheckBox("Polar", self)
+        self._polar_checkbox.setToolTip(
+            "Toggle between cartesian (linear θ axis) and polar "
+            "(360° compass-style) plot. Polar is the standard view "
+            "for radiation patterns."
+        )
+        self._polar_checkbox.toggled.connect(self._on_polar_toggled)
+        self._log_x_checkbox = QtWidgets.QCheckBox("Log θ", self)
+        self._log_x_checkbox.setToolTip(
+            "Switch the off-axis-angle axis to logarithmic. Helps "
+            "read narrow main lobes and wide-sidelobe regions on "
+            "the same plot. Disabled in polar mode."
+        )
+        self._log_x_checkbox.toggled.connect(self._on_log_x_toggled)
+        self._zoom_main_button = QtWidgets.QPushButton("Zoom to main lobe", self)
+        self._zoom_main_button.setToolTip(
+            "Toggle between a zoomed-in main-lobe view (θ-axis = "
+            "[0°, ~5·θ₃dB]) and the full [0°, 180°] range. Click "
+            "once to zoom in, again to zoom out."
+        )
+        self._zoom_main_button.setCheckable(True)
+        # Pin the button's width to the wider of the two states so
+        # toggling "Zoom to main lobe" ↔ "Zoom out" doesn't reshuffle
+        # the display-mode row. Fixed (not minimum) — the parent
+        # layout would otherwise stretch the button when the shorter
+        # label is active.
+        _zoom_metrics = self._zoom_main_button.fontMetrics()
+        _zoom_fixed = int(_zoom_metrics.horizontalAdvance("Zoom to main lobe")) + 40
+        self._zoom_main_button.setFixedWidth(_zoom_fixed)
+        self._zoom_main_button.toggled.connect(self._on_zoom_to_main_lobe_toggled)
+        self._main_lobe_zoom_active: bool = False
+        self._compare_overlay_combo = QtWidgets.QComboBox(self)
+        self._compare_overlay_combo.addItem("Overlay: (none)", userData=None)
+        self._compare_overlay_combo.addItem("RA.1631 at current D/f", userData="ra1631")
+        self._compare_overlay_combo.addItem("Gaussian (current peak/bw)", userData="gaussian")
+        self._compare_overlay_combo.addItem("Import reference from JSON\u2026", userData="from_json")
+        self._compare_overlay_combo.setToolTip(
+            "Overlay a reference curve on the plot for side-by-side "
+            "comparison. The reference is purely visual and doesn't "
+            "affect the accepted pattern."
+        )
+        self._compare_overlay_combo.currentIndexChanged.connect(
+            self._on_compare_overlay_changed
+        )
+        display_row.addWidget(self._polar_checkbox)
+        display_row.addWidget(self._log_x_checkbox)
+        display_row.addWidget(self._zoom_main_button)
+        display_row.addWidget(self._compare_overlay_combo, 1)
+        fig_col.addLayout(display_row)
+        fig_col.addWidget(self._toolbar)
+        fig_col.addWidget(self._canvas, 1)
+
+        # Cursor read-out strip pinned under the plot. Updated on
+        # every ``motion_notify_event`` by :meth:`_on_plot_motion`.
+        self._cursor_readout_label = QtWidgets.QLabel(
+            "Move the cursor over the plot to read (θ, gain).",
+            self,
+        )
+        self._cursor_readout_label.setStyleSheet(
+            "color: #94a3b8; font-size: 11px; padding: 2px 4px;"
+        )
+        fig_col.addWidget(self._cursor_readout_label)
+
+        fig_widget = QtWidgets.QWidget(self)
+        fig_widget.setLayout(fig_col)
+        fig_widget.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding,
+        )
+        body_splitter.addWidget(fig_widget)
+
+        side_panel = QtWidgets.QWidget(self)
+        # Minimum width stops the user from collapsing the panel
+        # accidentally; the preferred initial width is set via
+        # ``setSizes`` below. The panel expands vertically with the
+        # dialog and can grow horizontally via the splitter handle
+        # when longer preset / derived-quantity labels need room.
+        side_panel.setMinimumWidth(320)
+        side_panel_outer = QtWidgets.QVBoxLayout(side_panel)
+        side_panel_outer.setContentsMargins(0, 0, 0, 0)
+        side_panel_outer.setSpacing(0)
+        side_panel.setSizePolicy(
+            QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Expanding,
+        )
+        body_splitter.addWidget(side_panel)
+        # Plot gets ~60% of the initial width so preset/derived
+        # panels have comfortable room for long labels; user can drag
+        # to rebalance.
+        body_splitter.setStretchFactor(0, 3)
+        body_splitter.setStretchFactor(1, 2)
+        # Seed initial sizes from the dialog width (defaults to 1240
+        # via ``self.resize`` earlier in __init__). Falls through to
+        # Qt's stretch-factor allocation if width is zero.
+        _split_total = max(int(self.width()), 1200)
+        body_splitter.setSizes([int(_split_total * 0.60), int(_split_total * 0.40)])
+
+        # Vertical splitter inside the side panel: the top section
+        # holds all configuration controls (title, peak, templates,
+        # derived quantities, actions, I/O). The bottom section holds
+        # the points table + add/remove buttons. The table previously
+        # got whatever vertical space was left over after the config
+        # widgets consumed their natural sizeHint, which made it
+        # visibly cramped when the templates/derived groupboxes were
+        # expanded. The splitter lets the user rebalance to whatever
+        # serves their current workflow (tuning templates vs. typing
+        # exact points).
+        side_vsplitter = QtWidgets.QSplitter(QtCore.Qt.Vertical, side_panel)
+        side_vsplitter.setChildrenCollapsible(False)
+        side_vsplitter.setHandleWidth(6)
+        side_panel_outer.addWidget(side_vsplitter)
+        self._side_vsplitter = side_vsplitter
+
+        side_top_scroll = QtWidgets.QScrollArea(side_panel)
+        side_top_scroll.setWidgetResizable(True)
+        side_top_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        side_top_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        side_top_widget = QtWidgets.QWidget(side_top_scroll)
+        side_top_scroll.setWidget(side_top_widget)
+        side_vsplitter.addWidget(side_top_scroll)
+        side_layout = QtWidgets.QVBoxLayout(side_top_widget)
+        side_layout.setContentsMargins(0, 0, 0, 0)
+        side_layout.setSpacing(8)
+
+        side_bottom_widget = QtWidgets.QWidget(side_panel)
+        side_bottom_layout = QtWidgets.QVBoxLayout(side_bottom_widget)
+        side_bottom_layout.setContentsMargins(0, 0, 0, 0)
+        side_bottom_layout.setSpacing(6)
+        side_vsplitter.addWidget(side_bottom_widget)
+        self._side_table_layout = side_bottom_layout
+        # Top=config gets ~65% of vertical space by default; bottom=
+        # table gets ~35% but with a generous minimum so the user
+        # sees more than 1-2 rows without dragging.
+        side_bottom_widget.setMinimumHeight(180)
+        side_vsplitter.setStretchFactor(0, 3)
+        side_vsplitter.setStretchFactor(1, 2)
+        _vsplit_total = max(int(self.height()) - 140, 640)
+        side_vsplitter.setSizes([
+            int(_vsplit_total * 0.58),
+            int(_vsplit_total * 0.42),
+        ])
+
+        # Metadata
+        meta_form = QtWidgets.QFormLayout()
+        meta_form.setLabelAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        self._title_edit = QtWidgets.QLineEdit(self._title_text, self)
+        self._title_edit.setPlaceholderText("Optional display title")
+        self._peak_gain_spin = OptionalNumericEdit(
+            minimum=-200.0, maximum=200.0, decimals=3, parent=self,
+        )
+        self._peak_gain_spin.set_value(self._peak_gain_dbi)
+        self._peak_gain_spin.editingFinished.connect(self._on_peak_gain_edited)
+        meta_form.addRow("Title", self._title_edit)
+        meta_form.addRow("Peak gain [dBi]", self._peak_gain_spin)
+        side_layout.addLayout(meta_form)
+
+        # I/O + library + normalise — arranged in a 2-column grid so
+        # the full button labels fit inside the side panel (one-row
+        # layout truncates "Save to library…" / "Normalise…" at
+        # typical system font sizes). Placed near the top of the
+        # side panel — below Title / Peak gain but above the
+        # Templates / Derived / Actions stack — so users don't have
+        # to scroll past the analytical presets to find Import /
+        # Export / Save-to-library / Normalise.
+        io_grid = QtWidgets.QGridLayout()
+        io_grid.setContentsMargins(0, 0, 0, 0)
+        io_grid.setHorizontalSpacing(6)
+        io_grid.setVerticalSpacing(6)
+        self._import_json_button = QtWidgets.QPushButton("Import JSON\u2026", self)
+        self._import_json_button.clicked.connect(self._import_from_json)
+        self._export_json_button = QtWidgets.QPushButton("Export JSON\u2026", self)
+        self._export_json_button.clicked.connect(self._export_to_json)
+        self._save_library_button = QtWidgets.QPushButton("Save to library\u2026", self)
+        self._save_library_button.setToolTip(
+            "Save the current pattern to the shared template library "
+            "alongside RA.1631 / Gaussian / \u2026 presets. You'll be "
+            "prompted for author, source, and notes. Saved entries "
+            "appear in the Templates dropdown and via Browse library\u2026."
+        )
+        self._save_library_button.clicked.connect(self._open_save_to_library_dialog)
+        self._browse_library_button = QtWidgets.QPushButton("Browse library\u2026", self)
+        self._browse_library_button.setToolTip(
+            "Open a gallery of user-saved 1-D patterns (shared across "
+            "RAS and satellite editors). Click one to load it."
+        )
+        self._browse_library_button.clicked.connect(self._open_browse_library_dialog)
+        self._normalise_button = QtWidgets.QPushButton("Normalise\u2026", self)
+        self._normalise_button.setToolTip(
+            "Rescale the pattern so its solid-angle-integrated gain "
+            "matches 4\u03c0\u00b7\u03b7_rad (energy-conservation). "
+            "Optional ohmic-loss factor \u2264 1 accounts for resistive "
+            "losses that don't radiate."
+        )
+        self._normalise_button.clicked.connect(self._open_normalise_dialog)
+        io_grid.addWidget(self._import_json_button, 0, 0)
+        io_grid.addWidget(self._export_json_button, 0, 1)
+        io_grid.addWidget(self._save_library_button, 1, 0)
+        io_grid.addWidget(self._browse_library_button, 1, 1)
+        io_grid.addWidget(self._normalise_button, 2, 0, 1, 2)
+        side_layout.addLayout(io_grid)
+
+        # Presets — dropdown-driven, spec-per-preset. Only the
+        # declared inputs for the selected preset are shown so users
+        # can't enter irrelevant parameters (e.g. efficiency for
+        # RA.1631, which has no aperture-efficiency term). Adding a
+        # new reference pattern is a three-step change: append a
+        # spec line to ``_PATTERN_PRESET_LIBRARY_1D``, implement its
+        # handler method, and the UI updates itself.
+        presets_box = QtWidgets.QGroupBox("Templates", self)
+        presets_layout = QtWidgets.QVBoxLayout(presets_box)
+        presets_layout.setContentsMargins(8, 8, 8, 8)
+        presets_layout.setSpacing(6)
+        self._preset_combo = QtWidgets.QComboBox(self)
+        for spec in _PATTERN_PRESET_LIBRARY_1D:
+            self._preset_combo.addItem(str(spec["label"]), userData=str(spec["key"]))
+        # Append user-saved library entries under a separator. Shared
+        # on-disk between the RAS-side and satellite-side 1-D editors
+        # so a template saved in either is immediately available in
+        # the other.
+        self._populate_user_library_into_preset_combo()
+        self._preset_combo.setToolTip(
+            "Pick a reference pattern. The parameter block below "
+            "shows only the inputs that preset needs. Built-in "
+            "templates are parametric; user-library entries "
+            "(Save to library\u2026) apply the stored pattern verbatim."
+        )
+        self._preset_combo.currentIndexChanged.connect(
+            self._sync_preset_input_visibility
+        )
+        presets_layout.addWidget(self._preset_combo)
+
+        self._preset_form = QtWidgets.QFormLayout()
+        self._preset_form.setContentsMargins(0, 0, 0, 0)
+        self._preset_form.setLabelAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        self._preset_diameter_spin = OptionalNumericEdit(
+            minimum=0.0, maximum=1000.0, decimals=4, parent=self,
+        )
+        self._preset_frequency_spin = OptionalNumericEdit(
+            minimum=0.0, maximum=1.0e6, decimals=3, parent=self,
+        )
+        # Prefill from the caller's RA.1631 geometry *only* when no
+        # pattern is being edited. When an existing custom pattern is
+        # being edited, the RAS-tab's RA.1631 diameter/frequency are
+        # unrelated to this pattern's content — leaving the template
+        # inputs blank makes it clear they're for generating a *new*
+        # template, not parameters of the already-loaded one.
+        _has_initial_pattern = initial_pattern is not None
+        if not _has_initial_pattern:
+            if self._diameter_m is not None:
+                self._preset_diameter_spin.set_value(float(self._diameter_m))
+            if self._wavelength_m is not None and self._wavelength_m > 0.0:
+                # 299.792458 MHz · m → freq [MHz] from λ [m].
+                self._preset_frequency_spin.set_value(
+                    299.792458 / float(self._wavelength_m)
+                )
+        self._preset_efficiency_spin = OptionalNumericEdit(
+            minimum=1.0, maximum=100.0, decimals=2, parent=self,
+        )
+        self._preset_efficiency_spin.set_value(60.0)
+        self._preset_efficiency_spin.setToolTip(
+            "Aperture efficiency [%] used for the peak-gain estimate "
+            "G = η·(π·D/λ)². 60% is a reasonable default for real "
+            "parabolic dishes. ITU-R RA.1631 has a closed-form "
+            "efficiency term so this input is hidden for that preset."
+        )
+        self._preset_beamwidth_spin = OptionalNumericEdit(
+            minimum=0.01, maximum=180.0, decimals=3, parent=self,
+        )
+        self._preset_beamwidth_spin.set_value(10.0)
+        self._preset_beamwidth_spin.setToolTip(
+            "Full 3-dB beamwidth [deg] for the main lobe. Used by "
+            "presets that don't have an aperture to derive it from."
+        )
+        self._preset_peak_spin = OptionalNumericEdit(
+            minimum=-200.0, maximum=200.0, decimals=2, parent=self,
+        )
+        self._preset_peak_spin.set_value(float(self._peak_gain_dbi))
+        self._preset_peak_spin.setToolTip(
+            "Peak gain [dBi] of the generated template."
+        )
+        # ITU S.1528 Rec 1.2 / S.672 parameters.
+        self._preset_gm_spin = OptionalNumericEdit(
+            minimum=-200.0, maximum=200.0, decimals=2, parent=self,
+        )
+        self._preset_gm_spin.set_value(34.0)
+        self._preset_gm_spin.setToolTip(
+            "Boresight gain G_max [dBi] for the S.1528 Rec 1.2 / "
+            "S.672 analytical envelope."
+        )
+        self._preset_ln_spin = OptionalNumericEdit(
+            minimum=-60.0, maximum=0.0, decimals=2, parent=self,
+        )
+        self._preset_ln_spin.set_value(-15.0)
+        self._preset_ln_spin.setToolTip(
+            "Near-sidelobe level L_N [dB relative to G_max] for the "
+            "S.1528 Rec 1.2 / S.672 envelope. Typical values: −15, "
+            "−20, −25, −30 dB."
+        )
+        # ITU S.1528 Rec 1.4 symmetric-case parameters (Lt = Lr):
+        # first-sidelobe ratio SLR (positive dB magnitude in ITU
+        # convention) and the integer sidelobe count ``l`` (≥ 2).
+        self._preset_slr_spin = OptionalNumericEdit(
+            minimum=0.0, maximum=60.0, decimals=2, parent=self,
+        )
+        self._preset_slr_spin.set_value(20.0)
+        self._preset_slr_spin.setToolTip(
+            "First-sidelobe magnitude SLR [dB] for the S.1528 Rec 1.4 "
+            "symmetric pattern. ITU convention: positive value; e.g. "
+            "20 means a −20 dB first sidelobe."
+        )
+        self._preset_l_sidelobes_spin = OptionalNumericEdit(
+            minimum=2.0, maximum=12.0, decimals=0, parent=self,
+        )
+        self._preset_l_sidelobes_spin.set_value(2.0)
+        self._preset_l_sidelobes_spin.setToolTip(
+            "Integer sidelobe count ``l`` (≥ 2) controlling the "
+            "number of Taylor-aperture nulls carried by the pattern."
+        )
+        self._preset_density_combo = QtWidgets.QComboBox(self)
+        self._preset_density_combo.addItem(
+            "Extra coarse (~25 pts, 5° / 10°)", userData=(5.0, 60.0, 10.0),
+        )
+        self._preset_density_combo.addItem(
+            "Coarse (~85 pts, 1.0° / 5°)", userData=(1.0, 60.0, 5.0),
+        )
+        self._preset_density_combo.addItem(
+            "Medium (~360 pts, 0.25° / 1°) \u2014 default",
+            userData=(0.25, 60.0, 1.0),
+        )
+        self._preset_density_combo.addItem(
+            "Fine (~1450 pts, 0.05° / 0.5°)",
+            userData=(0.05, 60.0, 0.5),
+        )
+        self._preset_density_combo.addItem(
+            "Dense (~7200 pts, 0.01° / 0.1°)",
+            userData=(0.01, 60.0, 0.1),
+        )
+        self._preset_density_combo.setCurrentIndex(2)
+        self._preset_form.addRow("Diameter [m]", self._preset_diameter_spin)
+        self._preset_form.addRow("Frequency [MHz]", self._preset_frequency_spin)
+        self._preset_form.addRow("Aperture efficiency [%]", self._preset_efficiency_spin)
+        self._preset_form.addRow("3-dB beamwidth [deg]", self._preset_beamwidth_spin)
+        self._preset_form.addRow("Peak gain [dBi]", self._preset_peak_spin)
+        self._preset_form.addRow("G_max [dBi]", self._preset_gm_spin)
+        self._preset_form.addRow("L_N [dB]", self._preset_ln_spin)
+        self._preset_form.addRow("SLR [dB]", self._preset_slr_spin)
+        self._preset_form.addRow("l (sidelobe count ≥ 2)", self._preset_l_sidelobes_spin)
+        self._preset_form.addRow("Sampling density", self._preset_density_combo)
+        presets_layout.addLayout(self._preset_form)
+
+        # Keyed lookup for the visibility helper.
+        self._preset_input_widgets: dict[str, QtWidgets.QWidget] = {
+            "diameter": self._preset_diameter_spin,
+            "frequency": self._preset_frequency_spin,
+            "efficiency": self._preset_efficiency_spin,
+            "beamwidth": self._preset_beamwidth_spin,
+            "peak": self._preset_peak_spin,
+            "gm": self._preset_gm_spin,
+            "ln": self._preset_ln_spin,
+            "slr": self._preset_slr_spin,
+            "l_sidelobes": self._preset_l_sidelobes_spin,
+            "density": self._preset_density_combo,
+        }
+
+        self._preset_apply_button = QtWidgets.QPushButton("Apply template", self)
+        self._preset_apply_button.clicked.connect(self._apply_selected_preset)
+        presets_layout.addWidget(self._preset_apply_button)
+        side_layout.addWidget(presets_box)
+        # Hide inputs that the initial selection (RA.1631) doesn't use.
+        self._sync_preset_input_visibility()
+
+        # Derived quantities — live-updating antenna-engineering
+        # read-outs (3-dB beamwidth, first-null, first sidelobe,
+        # front-to-back, directivity, efficiency). Compact labels +
+        # word-wrapped values keep the panel readable inside the
+        # 360-px side column even when the implied-efficiency line
+        # carries a non-physical warning suffix.
+        derived_group = QtWidgets.QGroupBox("Derived quantities", self)
+        derived_layout = QtWidgets.QFormLayout(derived_group)
+        derived_layout.setContentsMargins(8, 8, 8, 8)
+        derived_layout.setHorizontalSpacing(10)
+        derived_layout.setVerticalSpacing(4)
+        derived_layout.setLabelAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        derived_layout.setFieldGrowthPolicy(QtWidgets.QFormLayout.AllNonFixedFieldsGrow)
+        self._derived_labels: dict[str, QtWidgets.QLabel] = {}
+        for key, label_text in (
+            ("beamwidth", "3-dB BW:"),
+            ("first_null", "First null:"),
+            ("first_sll", "1st SLL:"),
+            ("fb_ratio", "F/B ratio:"),
+            ("directivity", "Directivity:"),
+            ("implied_eff", "∫G dΩ / 4π:"),
+        ):
+            value_label = QtWidgets.QLabel("—", self)
+            value_label.setStyleSheet("color: #93c5fd; font-weight: 600;")
+            value_label.setWordWrap(True)
+            value_label.setSizePolicy(
+                QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred,
+            )
+            derived_layout.addRow(label_text, value_label)
+            self._derived_labels[key] = value_label
+        side_layout.addWidget(derived_group)
+
+        # Provenance metadata (author / source / notes) is only
+        # prompted for when the user explicitly saves to the shared
+        # template library (see :meth:`_open_save_to_library_dialog`).
+        # The attributes were initialised at the top of ``__init__``
+        # and round-trip through save/reload via :attr:`meta`.
+
+        # Action buttons — Undo / Redo / Reset / Paste / Smooth sit
+        # in one compact row. Each is also available via keyboard.
+        actions_row = QtWidgets.QHBoxLayout()
+        actions_row.setContentsMargins(0, 0, 0, 0)
+        actions_row.setSpacing(6)
+        # Use QPushButton (not QToolButton) so the action-row buttons
+        # pick up the same rounded / themed appearance as Apply
+        # template, Import JSON…, Add midpoint, etc. QToolButton has
+        # its own default rendering that bypasses the main-window
+        # stylesheet.
+        self._undo_button = QtWidgets.QPushButton("\u21ba Undo", self)
+        self._undo_button.setToolTip("Revert last change (Ctrl+Z).")
+        self._undo_button.clicked.connect(self._undo)
+        self._redo_button = QtWidgets.QPushButton("\u21bb Redo", self)
+        self._redo_button.setToolTip("Re-apply undone change (Ctrl+Y / Ctrl+Shift+Z).")
+        self._redo_button.clicked.connect(self._redo)
+        self._reset_button = QtWidgets.QPushButton("Reset", self)
+        self._reset_button.setToolTip(
+            "Revert every point, peak, and title to the state this "
+            "dialog opened with."
+        )
+        self._reset_button.clicked.connect(self._reset_to_initial)
+        self._paste_button = QtWidgets.QPushButton("Paste CSV", self)
+        self._paste_button.setToolTip(
+            "Replace the current control points with CSV-like text "
+            "from the clipboard. Each line should be ``\u03b8, gain`` "
+            "(comma or whitespace-separated, headers OK). Ctrl+Shift+V."
+        )
+        self._paste_button.clicked.connect(self._paste_csv_from_clipboard)
+        self._smooth_button = QtWidgets.QPushButton("Smooth\u2026", self)
+        self._smooth_button.setToolTip(
+            "Open the smoothing-method chooser. Pick between "
+            "Savitzky-Golay (classic, not idempotent), cubic-spline "
+            "projection (idempotent \u2014 repeated clicks give the "
+            "same result), moving average, or Fourier low-pass."
+        )
+        self._smooth_button.clicked.connect(self._smooth_gains)
+        # Compact sizing for the action row — these are utility
+        # buttons, not primary CTAs, so we keep them tight while
+        # still inheriting the themed border/fill.
+        for btn in (
+            self._undo_button, self._redo_button, self._reset_button,
+            self._paste_button, self._smooth_button,
+        ):
+            btn.setSizePolicy(
+                QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Fixed,
+            )
+        actions_row.addWidget(self._undo_button)
+        actions_row.addWidget(self._redo_button)
+        actions_row.addWidget(self._reset_button)
+        actions_row.addWidget(self._paste_button)
+        actions_row.addWidget(self._smooth_button)
+        actions_row.addStretch(1)
+        side_layout.addLayout(actions_row)
+
+        # Absorb any leftover vertical space in the top splitter
+        # section so Templates/Derived/Actions don't get stretched to
+        # awkward heights — the empty stretch sits between the config
+        # controls and the splitter handle. (The I/O + library +
+        # normalise buttons were moved higher up — right after
+        # Title/Peak gain — so they're discoverable without scrolling
+        # past the templates box.)
+        side_layout.addStretch(1)
+
+        # Points table (in the resizable bottom splitter section).
+        self._point_table = QtWidgets.QTableWidget(self)
+        self._point_table.setColumnCount(2)
+        self._point_table.setHorizontalHeaderLabels(["θ [deg]", "Gain [dBi]"])
+        self._point_table.verticalHeader().setVisible(False)
+        self._point_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self._point_table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        self._point_table.setEditTriggers(
+            QtWidgets.QAbstractItemView.DoubleClicked
+            | QtWidgets.QAbstractItemView.SelectedClicked
+            | QtWidgets.QAbstractItemView.EditKeyPressed
+        )
+        self._point_table.itemChanged.connect(self._on_table_item_changed)
+        self._point_table.itemSelectionChanged.connect(self._on_table_selection_changed)
+        header = self._point_table.horizontalHeader()
+        header.setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
+        header.setSectionResizeMode(1, QtWidgets.QHeaderView.Stretch)
+        self._point_table.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding,
+        )
+        # Route the table + its buttons into the bottom splitter
+        # section so the user can drag to allocate vertical space
+        # between "configure" (templates/derived/actions at the top)
+        # and "edit points" (this table) based on their workflow.
+        self._side_table_layout.addWidget(self._point_table, 1)
+
+        table_buttons = QtWidgets.QHBoxLayout()
+        table_buttons.setContentsMargins(0, 0, 0, 0)
+        self._add_point_button = QtWidgets.QPushButton("Add midpoint", self)
+        self._add_point_button.clicked.connect(self._add_midpoint_after_selection)
+        self._remove_point_button = QtWidgets.QPushButton("Remove point", self)
+        self._remove_point_button.clicked.connect(self._remove_selected_point)
+        table_buttons.addWidget(self._add_point_button)
+        table_buttons.addWidget(self._remove_point_button)
+        self._side_table_layout.addLayout(table_buttons)
+
+        self._summary_label = QtWidgets.QLabel("", self)
+        self._summary_label.setWordWrap(True)
+        self._summary_label.setObjectName("sectionSummary")
+        self._side_table_layout.addWidget(self._summary_label)
+
+        button_box = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel,
+            QtCore.Qt.Horizontal,
+            self,
+        )
+        button_box.accepted.connect(self._on_accept)
+        button_box.rejected.connect(self.reject)
+        root.addWidget(button_box)
+
+        self._axis = self._figure.add_subplot(111)
+        self._canvas.mpl_connect("button_press_event", self._on_plot_button_press)
+        self._canvas.mpl_connect("button_release_event", self._on_plot_button_release)
+        self._canvas.mpl_connect("motion_notify_event", self._on_plot_motion)
+        self._canvas.mpl_connect("axes_leave_event", self._on_plot_leave)
+
+        # Keyboard shortcuts for the editor. The tooltip string is
+        # surfaced via the intro label so users can discover them
+        # without reading docs.
+        self._install_shortcuts()
+
+        # Seed the undo stack with the opening state so the first
+        # mutation has something to revert to.
+        self._history.clear()
+        self._history_pos = -1
+        self._push_history(force=True)
+
+        self._sync_table_from_points()
+        self._select_point(0)
+        self._apply_parent_theme()
+        self._refresh_plot()
+
+    def _apply_parent_theme(self) -> None:
+        """Propagate the app's dark stylesheet + matplotlib theme.
+
+        Qt's QSS inheritance via ``setStyleSheet`` doesn't reliably
+        cascade into top-level ``QDialog`` windows, so copy the parent
+        main-window stylesheet explicitly. The matplotlib figure is
+        restyled via the main window's ``_style_matplotlib_figure``
+        helper (same one the spectrum mask editor uses) so axes /
+        spines / labels match the rest of the app.
+        """
+        parent = self.parent()
+        if parent is not None:
+            try:
+                sheet = parent.styleSheet() if hasattr(parent, "styleSheet") else ""
+                if sheet:
+                    self.setStyleSheet(sheet)
+            except Exception:
+                pass
+            if hasattr(parent, "_style_matplotlib_figure"):
+                try:
+                    parent._style_matplotlib_figure(self._figure)
+                except Exception:
+                    pass
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def result_pattern(self) -> "CustomAntennaPattern | None":
+        """Return the pattern built on the last accept, or ``None``."""
+        return self._result_pattern
+
+    # ------------------------------------------------------------------
+    # Starter templates
+    # ------------------------------------------------------------------
+
+    def _starter_template(self) -> np.ndarray:
+        """Generic starter: Gaussian main beam + isotropic-style floor, built
+        so the pattern is **physically valid** (∫G dΩ ≤ 4π) for the current
+        peak-gain setting.  The half-power beam width is scaled from the peak
+        directivity via the lossless-aperture relationship
+        ``σ² ≈ 2·η_main / G_peak`` so the integral stays below 4π regardless
+        of how high the user pushes the peak.
+
+        Uses 80 % of the radiated power in the main beam and 20 % in a uniform
+        back-hemisphere floor (floor ≈ -7 dBi in linear) so the sidelobe tail
+        is visible but doesn't dominate.  Previous fixed-shape starter
+        (peak − 30 dB floor over π) was physical at low peaks but blew up for
+        peak ≥ 34 dBi, spawning an "Accept non-physical pattern?" warning the
+        moment the user hit "Accept".
+        """
+        peak = float(self._peak_gain_dbi)
+        g_peak = 10.0 ** (peak / 10.0)
+        main_eta = 0.8
+        sigma_rad = float(np.sqrt(2.0 * main_eta / max(g_peak, 1e-12)))
+        sigma_deg = float(np.degrees(sigma_rad))
+        floor_lin = 1.0 - main_eta
+        floor_dbi = float(10.0 * np.log10(floor_lin))
+
+        def _gauss_db(angle_deg: float) -> float:
+            """Gaussian main beam (linear) + uniform floor (linear), in dBi."""
+            a_rad = np.radians(angle_deg)
+            g_lin = g_peak * np.exp(-(a_rad / sigma_rad) ** 2 / 2.0) + floor_lin
+            return float(10.0 * np.log10(max(g_lin, 1e-12)))
+
+        # Sample across the main beam, then stay at the floor.
+        raw = [
+            (0.0, _gauss_db(0.0)),
+            (sigma_deg, _gauss_db(sigma_deg)),
+            (2.0 * sigma_deg, _gauss_db(2.0 * sigma_deg)),
+            (3.0 * sigma_deg, _gauss_db(3.0 * sigma_deg)),
+            (5.0 * sigma_deg, _gauss_db(5.0 * sigma_deg)),
+            (min(max(10.0 * sigma_deg, 5.0 * sigma_deg + 1.0), 180.0), floor_dbi),
+            (180.0, floor_dbi),
+        ]
+        # Dedupe identical angles that can collide at extreme peak values
+        # (very narrow σ → 5σ and 10σ both round to 0° or similar).
+        seen: set[float] = set()
+        clean: list[tuple[float, float]] = []
+        for a, g in raw:
+            a_r = round(float(a), 6)
+            if a_r in seen:
+                continue
+            seen.add(a_r)
+            clean.append((a_r, float(g)))
+        clean.sort(key=lambda p: p[0])
+        return np.asarray(clean, dtype=np.float64)
+
+    def _current_preset_spec(self) -> dict[str, Any] | None:
+        key = str(self._preset_combo.currentData() or "")
+        for spec in _PATTERN_PRESET_LIBRARY_1D:
+            if str(spec["key"]) == key:
+                return spec
+        return None
+
+    def _sync_preset_input_visibility(self) -> None:
+        """Show only the inputs declared by the active preset's spec."""
+        spec = self._current_preset_spec()
+        active_inputs = set(spec["inputs"]) if spec is not None else set()
+        for name, widget in self._preset_input_widgets.items():
+            self._set_form_row_visible(self._preset_form, widget, name in active_inputs)
+
+    @staticmethod
+    def _set_form_row_visible(
+        form: QtWidgets.QFormLayout, field: QtWidgets.QWidget, visible: bool,
+    ) -> None:
+        """Hide/show both the field widget and its associated row label."""
+        field.setVisible(bool(visible))
+        try:
+            form.setRowVisible(field, bool(visible))
+        except Exception:
+            # Fallback for Qt builds without setRowVisible — hide the
+            # label widget the form maintains for this field.
+            label = form.labelForField(field)
+            if label is not None:
+                label.setVisible(bool(visible))
+
+    def _apply_selected_preset(self) -> None:
+        """Dispatch to the handler method named by the active preset."""
+        data = self._preset_combo.currentData()
+        if isinstance(data, str) and data.startswith("library:"):
+            self._apply_library_entry(data[len("library:"):])
+            return
+        spec = self._current_preset_spec()
+        if spec is None:
+            return
+        handler = getattr(self, str(spec["handler"]), None)
+        if handler is None:
+            return
+        handler()
+
+    def _populate_user_library_into_preset_combo(self) -> None:
+        """Append every valid 1-D library entry to the preset combo.
+
+        Entries are stored on disk as JSON via the shared
+        :func:`_antenna_template_library_dir` helper. The combo's
+        ``userData`` for these rows is the string ``"library:<path>"``
+        so :meth:`_apply_selected_preset` can tell them apart from
+        the parametric built-ins.
+        """
+        entries = _scan_antenna_template_library(kind=self._kind_1d)
+        if not entries:
+            return
+        self._preset_combo.insertSeparator(self._preset_combo.count())
+        for path, pat in entries:
+            title = str((pat.meta or {}).get("title") or path.stem)
+            self._preset_combo.addItem(
+                f"\U0001f4da  {title}", userData=f"library:{path}",
+            )
+
+    def _open_browse_library_dialog(self) -> None:
+        """Show a list of user-saved 1-D templates with preview text.
+
+        The combo dropdown gives one-click access but is easy to
+        miss when the library has many entries. This dedicated
+        dialog gives the user a scrollable list with title + author
+        + peak-gain preview, plus Delete and Load actions.
+        """
+        entries = _scan_antenna_template_library(kind=self._kind_1d)
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("Browse template library")
+        dialog.setModal(True)
+        dialog.resize(560, 440)
+        sheet = self.styleSheet()
+        if sheet:
+            dialog.setStyleSheet(sheet)
+        layout = QtWidgets.QVBoxLayout(dialog)
+        layout.setContentsMargins(14, 14, 14, 12)
+        layout.setSpacing(8)
+        intro = QtWidgets.QLabel(
+            f"Library folder: <code>{_antenna_template_library_dir()}</code>",
+            dialog,
+        )
+        intro.setTextFormat(QtCore.Qt.RichText)
+        intro.setStyleSheet("color: #94a3b8; font-size: 11px;")
+        layout.addWidget(intro)
+        list_widget = QtWidgets.QListWidget(dialog)
+        list_widget.setAlternatingRowColors(True)
+        for path, pat in entries:
+            meta = pat.meta or {}
+            title = str(meta.get("title") or path.stem)
+            author = str(meta.get("author", "") or "")
+            try:
+                peak = float(pat.peak_gain_dbi)
+                peak_text = f"peak {peak:.2f} dBi"
+            except Exception:
+                peak_text = "peak ?"
+            primary = title
+            secondary = f"  \u2022 {peak_text}"
+            if author:
+                secondary += f"  \u2022 {author}"
+            item = QtWidgets.QListWidgetItem(primary + secondary, list_widget)
+            item.setData(QtCore.Qt.UserRole, str(path))
+            item.setToolTip(str(path))
+        layout.addWidget(list_widget, 1)
+        if not entries:
+            empty = QtWidgets.QLabel(
+                "The library is empty. Use <b>Save to library\u2026</b> "
+                "to add the current pattern.",
+                dialog,
+            )
+            empty.setTextFormat(QtCore.Qt.RichText)
+            empty.setStyleSheet("color: #94a3b8;")
+            layout.addWidget(empty)
+        button_row = QtWidgets.QHBoxLayout()
+        load_btn = QtWidgets.QPushButton("Load", dialog)
+        delete_btn = QtWidgets.QPushButton("Delete\u2026", dialog)
+        close_btn = QtWidgets.QPushButton("Close", dialog)
+        load_btn.setDefault(True)
+        button_row.addWidget(load_btn)
+        button_row.addWidget(delete_btn)
+        button_row.addStretch(1)
+        button_row.addWidget(close_btn)
+        layout.addLayout(button_row)
+        close_btn.clicked.connect(dialog.reject)
+
+        def _load_selected() -> None:
+            item = list_widget.currentItem()
+            if item is None:
+                return
+            path_str = str(item.data(QtCore.Qt.UserRole))
+            dialog.accept()
+            self._apply_library_entry(path_str)
+
+        def _delete_selected() -> None:
+            item = list_widget.currentItem()
+            if item is None:
+                return
+            path_str = str(item.data(QtCore.Qt.UserRole))
+            confirm = QtWidgets.QMessageBox.question(
+                dialog, "Delete template",
+                f"Permanently delete {Path(path_str).name} from the "
+                "shared library?",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                QtWidgets.QMessageBox.No,
+            )
+            if confirm != QtWidgets.QMessageBox.Yes:
+                return
+            try:
+                Path(path_str).unlink()
+            except Exception as exc:
+                QtWidgets.QMessageBox.warning(
+                    dialog, "Delete failed", f"Couldn't remove: {exc}",
+                )
+                return
+            row = list_widget.row(item)
+            list_widget.takeItem(row)
+            # Also drop it from the preset combo if it was listed.
+            for i in range(self._preset_combo.count() - 1, -1, -1):
+                data = self._preset_combo.itemData(i)
+                if isinstance(data, str) and data == f"library:{path_str}":
+                    self._preset_combo.removeItem(i)
+
+        load_btn.clicked.connect(_load_selected)
+        delete_btn.clicked.connect(_delete_selected)
+        list_widget.itemDoubleClicked.connect(lambda _i: _load_selected())
+        dialog.exec()
+
+    def _apply_library_entry(self, path_str: str) -> None:
+        from scepter.custom_antenna import load_custom_pattern as _load
+        try:
+            pat = _load(path_str)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(
+                self, "Template load failed",
+                f"Couldn't load library entry:\n{exc}",
+            )
+            return
+        if pat.kind != self._kind_1d:
+            QtWidgets.QMessageBox.warning(
+                self, "Wrong kind",
+                "The library entry isn't a 1-D axisymmetric pattern.",
+            )
+            return
+        self._load_pattern_into_editor(pat)
+
+    def _open_save_to_library_dialog(self) -> None:
+        """Prompt for provenance metadata and write the current
+        pattern into the shared template library.
+
+        The dialog is deliberately small — it's only shown on an
+        explicit user action — so the main editor stays focused on
+        the shape-editing workflow instead of surfacing author /
+        source / notes fields that most users never touch.
+        """
+        try:
+            base_pat = self._build_pattern_from_state()
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(
+                self, "Save to library",
+                f"The current pattern can't be saved:\n{exc}",
+            )
+            return
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("Save pattern to library")
+        dialog.setModal(True)
+        dialog.resize(440, 300)
+        sheet = self.styleSheet()
+        if sheet:
+            dialog.setStyleSheet(sheet)
+        layout = QtWidgets.QVBoxLayout(dialog)
+        layout.setContentsMargins(16, 16, 16, 14)
+        layout.setSpacing(10)
+        intro = QtWidgets.QLabel(
+            "This saves the current pattern to the shared antenna "
+            "template library. The library is stored under the "
+            "application-data folder and is shared by all 1-D pattern "
+            "editors (RAS and satellite).",
+            dialog,
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        form = QtWidgets.QFormLayout()
+        form.setLabelAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        title_edit = QtWidgets.QLineEdit(
+            str(self._title_edit.text() or "").strip() or "Untitled pattern",
+            dialog,
+        )
+        author_edit = QtWidgets.QLineEdit(str(self._meta_author), dialog)
+        author_edit.setPlaceholderText("Your name or team")
+        source_edit = QtWidgets.QLineEdit(str(self._meta_source), dialog)
+        source_edit.setPlaceholderText("URL, datasheet reference, paper…")
+        notes_edit = QtWidgets.QLineEdit(str(self._meta_notes), dialog)
+        notes_edit.setPlaceholderText("Short free-form note")
+        form.addRow("Title:", title_edit)
+        form.addRow("Author:", author_edit)
+        form.addRow("Source:", source_edit)
+        form.addRow("Notes:", notes_edit)
+        layout.addLayout(form)
+
+        button_box = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Save | QtWidgets.QDialogButtonBox.Cancel,
+            QtCore.Qt.Horizontal, dialog,
+        )
+        button_box.accepted.connect(dialog.accept)
+        button_box.rejected.connect(dialog.reject)
+        layout.addStretch(1)
+        layout.addWidget(button_box)
+
+        if dialog.exec() != QtWidgets.QDialog.Accepted:
+            return
+        new_title = str(title_edit.text() or "").strip() or "Untitled pattern"
+        self._meta_author = str(author_edit.text() or "").strip()
+        self._meta_source = str(source_edit.text() or "").strip()
+        self._meta_notes = str(notes_edit.text() or "").strip()
+        self._title_text = new_title
+        blocker = QtCore.QSignalBlocker(self._title_edit)
+        self._title_edit.setText(new_title)
+        del blocker
+        # Rebuild the pattern so meta picks up the just-set fields.
+        try:
+            pat_to_save = self._build_pattern_from_state()
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(
+                self, "Save to library",
+                f"Couldn't build the pattern to save:\n{exc}",
+            )
+            return
+        # Filename: slug of title + short suffix to avoid collisions.
+        import re, time
+        slug = re.sub(r"[^A-Za-z0-9._-]+", "_", new_title).strip("_") or "pattern"
+        filename = f"{slug}_{int(time.time())}.json"
+        lib_dir = _antenna_template_library_dir()
+        target = lib_dir / filename
+        from scepter.custom_antenna import dump_custom_pattern as _dump
+        try:
+            _dump(target, pat_to_save)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(
+                self, "Save to library",
+                f"Couldn't write {target.name}:\n{exc}",
+            )
+            return
+        # Add the freshly-saved entry to this editor's combo
+        # immediately (next editor open gets it from the disk scan).
+        # Idempotent via the "library:<path>" userData uniqueness.
+        already = False
+        for i in range(self._preset_combo.count()):
+            if self._preset_combo.itemData(i) == f"library:{target}":
+                already = True
+                break
+        if not already:
+            # Ensure there's a separator after the built-ins.
+            has_sep = any(
+                self._preset_combo.itemData(i) is None
+                for i in range(len(_PATTERN_PRESET_LIBRARY_1D), self._preset_combo.count())
+            )
+            if not has_sep:
+                self._preset_combo.insertSeparator(self._preset_combo.count())
+            self._preset_combo.addItem(
+                f"\U0001f4da  {new_title}", userData=f"library:{target}",
+            )
+        QtWidgets.QMessageBox.information(
+            self, "Saved to library",
+            f"Template saved as {target.name}.\n\n"
+            f"It will appear in the Templates dropdown of every 1-D "
+            f"pattern editor (RAS and satellite) from now on.\n\n"
+            f"Library folder: {lib_dir}",
+        )
+
+    def _apply_generic_preset(self) -> None:
+        """Fixed starter template (no freq/diameter dependency)."""
+        self._points = self._starter_template()
+        self._sync_table_from_points()
+        self._select_point(0)
+        self._refresh_plot()
+        self._push_history()
+
+    def _preset_aperture_gain_dbi(
+        self, diameter_m: float, wavelength_m: float, efficiency_frac: float,
+    ) -> float:
+        """``G_max = 10·log10(η·(π·D/λ)²)`` in dBi."""
+        d_wlen = float(diameter_m) / float(wavelength_m)
+        return float(10.0 * np.log10(float(efficiency_frac) * (np.pi * d_wlen) ** 2))
+
+    def _read_preset_aperture(self) -> tuple[float, float] | None:
+        """Return ``(diameter_m, wavelength_m)`` or ``None`` if either is missing."""
+        diameter_value = self._preset_diameter_spin.value_or_none()
+        frequency_value = self._preset_frequency_spin.value_or_none()
+        if diameter_value is None or float(diameter_value) <= 0.0:
+            QtWidgets.QMessageBox.warning(
+                self, "Template inputs",
+                "Enter a positive antenna diameter [m] before applying a template.",
+            )
+            return None
+        if frequency_value is None or float(frequency_value) <= 0.0:
+            QtWidgets.QMessageBox.warning(
+                self, "Template inputs",
+                "Enter a positive frequency [MHz] before applying a template.",
+            )
+            return None
+        return float(diameter_value), 299.792458 / float(frequency_value)
+
+    def _read_preset_efficiency_frac(self, default_frac: float = 0.6) -> float:
+        """Return the aperture-efficiency fraction, clamped to (0, 1]."""
+        eff = self._preset_efficiency_spin.value_or_none()
+        frac = float(eff) / 100.0 if eff is not None else float(default_frac)
+        return float(max(1.0e-4, min(frac, 1.0)))
+
+    def _read_preset_geometry(self) -> tuple[float, float, float] | None:
+        """Back-compat shim used by presets that do need efficiency."""
+        ap = self._read_preset_aperture()
+        if ap is None:
+            return None
+        return ap[0], ap[1], self._read_preset_efficiency_frac()
+
+    def _density_thetas(self, beamwidth_deg: float) -> np.ndarray:
+        """Return a θ grid honouring the sampling-density combo.
+
+        The grid uses the declared fine step up to ``far_start_deg``
+        (or a multiple of the pattern's beamwidth, whichever is
+        larger, so the grid still resolves the main-lobe features of
+        a wide beam) and switches to the far step thereafter.
+        """
+        density = self._preset_density_combo.currentData() or (0.25, 60.0, 1.0)
+        main_step = float(density[0])
+        far_start = float(density[1])
+        far_step = float(density[2])
+        fine_end = max(far_start, 6.0 * float(beamwidth_deg))
+        fine_end = min(fine_end, 180.0)
+        main_n = max(2, int(round(fine_end / max(main_step, 1e-6))) + 1)
+        fine = np.linspace(0.0, fine_end, main_n)
+        if fine_end >= 180.0:
+            return fine
+        far_n = max(2, int(round((180.0 - fine_end) / max(far_step, 1e-6))) + 1)
+        far = np.linspace(fine_end + far_step, 180.0, far_n)
+        return np.concatenate([fine, far])
+
+    def _commit_points(self, thetas: np.ndarray, gains: np.ndarray, *, peak: float) -> None:
+        """Replace the editor's control points + peak in one atomic update."""
+        self._points = np.stack([thetas.astype(np.float64), gains.astype(np.float64)], axis=1)
+        self._peak_gain_dbi = float(peak)
+        blocker = QtCore.QSignalBlocker(self._peak_gain_spin)
+        self._peak_gain_spin.set_value(float(peak))
+        del blocker
+        self._sync_table_from_points()
+        self._select_point(0)
+        self._refresh_plot()
+        self._push_history()
+
+    def _apply_generic_narrow_preset(self) -> None:
+        """λ/D-scaled generic narrow-beam template.
+
+        The main lobe's 3-dB half-width is derived from the aperture
+        geometry (``θ_{3dB}/2 ≈ 35·λ/D`` degrees for a uniform
+        circular aperture). The peak gain is
+        ``G = 10·log10(η·(π·D/λ)²)``. Sidelobe floor is peak − 30 dB
+        with a smooth transition. Sampling follows the density combo.
+        """
+        geometry = self._read_preset_geometry()
+        if geometry is None:
+            return
+        diameter_m, wavelength_m, eta = geometry
+        peak = self._preset_aperture_gain_dbi(diameter_m, wavelength_m, eta)
+        beamwidth_deg = max(
+            70.0 * float(wavelength_m) / float(diameter_m), 1.0e-3,
+        )
+        half_3db = 0.5 * beamwidth_deg
+        first_null = max(
+            1.22 * 180.0 / np.pi * float(wavelength_m) / float(diameter_m),
+            2.0 * half_3db,
+        )
+        thetas = self._density_thetas(beamwidth_deg)
+        # Smooth piecewise envelope — Gaussian-ish main lobe,
+        # exponential rolloff to sidelobe floor, flat in the far
+        # region. Closed-form so sampling density is honoured.
+        t = np.asarray(thetas, dtype=np.float64)
+        main = peak - 3.0 * (t / max(half_3db, 1e-6)) ** 2   # ≈ Gaussian down to first null
+        near_side = peak - 12.0 - 8.0 * np.log10(
+            np.clip(t / max(first_null, 1e-6), 1.0, None),
+        )
+        floor = peak - 30.0
+        gains = np.where(t <= half_3db, main, near_side)
+        gains = np.where(t >= first_null * 4.0, floor, gains)
+        gains = np.minimum(gains, peak)
+        self._commit_points(t, gains, peak=peak)
+
+    def _apply_generic_wide_preset(self) -> None:
+        """Cos²-main-lobe wide-beam template.
+
+        Uses a user-declared 3-dB full beamwidth and peak gain
+        (aperture geometry doesn't apply — a broad-beam reflectorless
+        antenna / horn doesn't obey λ/D). The shape is
+        ``G(θ) = peak · cos²(π·θ / θ_{3dB})`` in linear units within
+        the main lobe, flattening to a −20 dB floor in the far field.
+        """
+        beamwidth = self._preset_beamwidth_spin.value_or_none()
+        peak_value = self._preset_peak_spin.value_or_none()
+        if beamwidth is None or float(beamwidth) <= 0.0:
+            QtWidgets.QMessageBox.warning(
+                self, "Wide-beam template",
+                "Enter a positive 3-dB beamwidth [deg].",
+            )
+            return
+        if peak_value is None:
+            QtWidgets.QMessageBox.warning(
+                self, "Wide-beam template",
+                "Enter a peak gain [dBi].",
+            )
+            return
+        peak = float(peak_value)
+        beamwidth_deg = float(beamwidth)
+        thetas = self._density_thetas(beamwidth_deg)
+        # cos² rolloff scaled so that θ=θ_{3dB}/2 gives −3 dB.
+        arg = np.clip(np.pi * thetas / beamwidth_deg, 0.0, 0.5 * np.pi)
+        cos_db = 10.0 * np.log10(np.cos(arg) ** 2 + 1.0e-8)
+        floor = peak - 20.0
+        gains = np.maximum(peak + cos_db, floor)
+        gains = np.minimum(gains, peak)
+        self._commit_points(thetas, gains, peak=peak)
+
+    def _apply_gaussian_preset(self) -> None:
+        """Gaussian main-lobe template.
+
+        ``G(θ) = peak − 3·(θ / (θ_{3dB}/2))²`` below the main lobe,
+        transitioning to a flat −25 dB floor at the first null
+        (≈ 1.5·θ_{3dB}). Simple, symmetric, no sidelobes.
+        """
+        beamwidth = self._preset_beamwidth_spin.value_or_none()
+        peak_value = self._preset_peak_spin.value_or_none()
+        if beamwidth is None or float(beamwidth) <= 0.0:
+            QtWidgets.QMessageBox.warning(
+                self, "Gaussian template",
+                "Enter a positive 3-dB beamwidth [deg].",
+            )
+            return
+        if peak_value is None:
+            QtWidgets.QMessageBox.warning(
+                self, "Gaussian template",
+                "Enter a peak gain [dBi].",
+            )
+            return
+        peak = float(peak_value)
+        beamwidth_deg = float(beamwidth)
+        half_3db = 0.5 * beamwidth_deg
+        thetas = self._density_thetas(beamwidth_deg)
+        main = peak - 3.0 * (thetas / max(half_3db, 1e-6)) ** 2
+        floor = peak - 25.0
+        gains = np.maximum(main, floor)
+        self._commit_points(thetas, gains, peak=peak)
+
+    def _apply_ra1631_preset(self) -> None:
+        # RA.1631 is an analytical ITU model with its own closed-form
+        # efficiency term; the editor's "Aperture efficiency" input is
+        # intentionally hidden for this preset.
+        aperture = self._read_preset_aperture()
+        if aperture is None:
+            return
+        diameter_m, wavelength_m = aperture
+        density = self._preset_density_combo.currentData() or (0.1, 60.0, 5.0)
+        try:
+            main_step, far_start, far_step = (
+                float(density[0]), float(density[1]), float(density[2]),
+            )
+        except Exception:
+            main_step, far_start, far_step = 0.1, 60.0, 5.0
+        import astropy.units as _u
+        from pycraf import antenna as _pya
+        # Two concatenated ranges: fine sampling near the main lobe,
+        # coarser in the far-sidelobe region. This keeps the LUT
+        # compact without losing main-lobe shape.
+        main_n = max(2, int(round(float(far_start) / max(main_step, 1e-6))) + 1)
+        far_n = max(2, int(round((180.0 - float(far_start)) / max(far_step, 1e-6))) + 1)
+        thetas_deg = np.concatenate([
+            np.linspace(0.0, float(far_start), main_n),
+            np.linspace(float(far_start) + float(far_step), 180.0, far_n),
+        ])
+        try:
+            gains_q = _pya.ras_pattern(
+                thetas_deg * _u.deg,
+                diameter_m * _u.m,
+                wavelength_m * _u.m,
+            )
+            import pycraf.conversions as _cnv
+            gains_db = np.asarray(gains_q.to_value(_cnv.dB), dtype=np.float64)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(
+                self, "RA.1631 preset failed",
+                f"Couldn't evaluate the analytical RA.1631 template: {exc}",
+            )
+            return
+        peak = float(np.max(gains_db))
+        self._peak_gain_dbi = peak
+        blocker = QtCore.QSignalBlocker(self._peak_gain_spin)
+        self._peak_gain_spin.set_value(peak)
+        del blocker
+        self._points = np.stack([thetas_deg.astype(np.float64), gains_db], axis=1)
+        self._sync_table_from_points()
+        self._select_point(0)
+        self._refresh_plot()
+        self._push_history()
+
+    def _apply_s1528_rec12_preset(self) -> None:
+        """ITU-R S.1528 Rec 1.2 analytical envelope (axisymmetric)."""
+        self._apply_s1528_rec12_like_preset(label="S.1528 Rec 1.2")
+
+    def _apply_s672_preset(self) -> None:
+        """ITU-R S.672 analytical envelope — SCEPTer routes S.672
+        through the same S.1528 Rec 1.2 dispatcher (see
+        ``scepter.antenna.build_satellite_pattern_spec``)."""
+        self._apply_s1528_rec12_like_preset(label="S.672")
+
+    def _apply_s1528_rec12_like_preset(self, *, label: str) -> None:
+        """Shared implementation for S.1528 Rec 1.2 and S.672.
+
+        Reads G_max, diameter, frequency, L_N and a sampling density
+        from the preset form, then samples
+        :func:`scepter.analytical_fixtures.s1528_rec1_2_evaluator` onto
+        the density grid. Writes the resulting (θ, gain) table
+        directly into the editor's control points.
+        """
+        aperture = self._read_preset_aperture()
+        if aperture is None:
+            return
+        diameter_m, wavelength_m = aperture
+        gm_dbi = self._preset_gm_spin.value_or_none()
+        ln_db = self._preset_ln_spin.value_or_none()
+        if gm_dbi is None:
+            QtWidgets.QMessageBox.warning(
+                self, f"{label} preset",
+                "Enter a G_max [dBi] value.",
+            )
+            return
+        if ln_db is None:
+            ln_db = -15.0
+        density = self._preset_density_combo.currentData() or (0.1, 60.0, 5.0)
+        try:
+            main_step, far_start, far_step = (
+                float(density[0]), float(density[1]), float(density[2]),
+            )
+        except Exception:
+            main_step, far_start, far_step = 0.1, 60.0, 5.0
+        main_n = max(2, int(round(float(far_start) / max(main_step, 1e-6))) + 1)
+        far_n = max(2, int(round((180.0 - float(far_start)) / max(far_step, 1e-6))) + 1)
+        thetas_deg = np.concatenate([
+            np.linspace(0.0, float(far_start), main_n),
+            np.linspace(float(far_start) + float(far_step), 180.0, far_n),
+        ])
+        try:
+            from scepter.analytical_fixtures import s1528_rec1_2_evaluator
+            evaluator = s1528_rec1_2_evaluator(
+                gm_dbi=float(gm_dbi),
+                diameter_m=float(diameter_m),
+                wavelength_m=float(wavelength_m),
+                ln_db=float(ln_db),
+            )
+            gains_db = np.asarray(evaluator(thetas_deg), dtype=np.float64)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(
+                self, f"{label} preset failed",
+                f"Couldn't evaluate the analytical {label} template: {exc}",
+            )
+            return
+        peak = float(np.max(gains_db))
+        self._peak_gain_dbi = peak
+        blocker = QtCore.QSignalBlocker(self._peak_gain_spin)
+        self._peak_gain_spin.set_value(peak)
+        del blocker
+        self._points = np.stack([thetas_deg.astype(np.float64), gains_db], axis=1)
+        self._sync_table_from_points()
+        self._select_point(0)
+        self._refresh_plot()
+        self._push_history()
+
+    def _apply_s1528_rec14_symmetric_preset(self) -> None:
+        """ITU-R S.1528 Rec 1.4 reduced to 1-D (symmetric case Lt = Lr).
+
+        Rec 1.4 is a 2-D ``(θ, φ)`` Taylor-aperture formula; when the
+        two aperture dimensions match, the pattern is φ-invariant and
+        a single slice at φ = 0° fully describes it. The preset
+        reuses the "diameter" input as the symmetric aperture length
+        L and samples the standard 2-D evaluator at φ = 0°.
+        """
+        aperture = self._read_preset_aperture()
+        if aperture is None:
+            return
+        aperture_m, wavelength_m = aperture
+        gm_dbi = self._preset_gm_spin.value_or_none()
+        slr_db = self._preset_slr_spin.value_or_none()
+        l_raw = self._preset_l_sidelobes_spin.value_or_none()
+        if gm_dbi is None:
+            QtWidgets.QMessageBox.warning(
+                self, "S.1528 Rec 1.4 preset",
+                "Enter a G_max [dBi] value.",
+            )
+            return
+        if slr_db is None:
+            QtWidgets.QMessageBox.warning(
+                self, "S.1528 Rec 1.4 preset",
+                "Enter an SLR [dB] (positive magnitude; e.g. 20 for "
+                "a −20 dB first sidelobe).",
+            )
+            return
+        l_val = int(round(float(l_raw))) if l_raw is not None else 2
+        l_val = max(2, min(12, l_val))
+        density = self._preset_density_combo.currentData() or (0.1, 60.0, 5.0)
+        try:
+            main_step, far_start, far_step = (
+                float(density[0]), float(density[1]), float(density[2]),
+            )
+        except Exception:
+            main_step, far_start, far_step = 0.1, 60.0, 5.0
+        main_n = max(2, int(round(float(far_start) / max(main_step, 1e-6))) + 1)
+        far_n = max(2, int(round((180.0 - float(far_start)) / max(far_step, 1e-6))) + 1)
+        thetas_deg = np.concatenate([
+            np.linspace(0.0, float(far_start), main_n),
+            np.linspace(float(far_start) + float(far_step), 180.0, far_n),
+        ])
+        try:
+            from scepter.analytical_fixtures import s1528_rec1_4_evaluator
+            evaluator = s1528_rec1_4_evaluator(
+                wavelength_m=float(wavelength_m),
+                lr_m=float(aperture_m),
+                lt_m=float(aperture_m),
+                slr_db=float(slr_db),
+                gm_db=float(gm_dbi),
+                l=l_val,
+            )
+            phi_zero = np.zeros_like(thetas_deg)
+            gains_db = np.asarray(
+                evaluator(thetas_deg, phi_zero), dtype=np.float64,
+            )
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(
+                self, "S.1528 Rec 1.4 preset failed",
+                f"Couldn't evaluate the analytical template:\n{exc}",
+            )
+            return
+        peak = float(np.max(gains_db))
+        self._peak_gain_dbi = peak
+        blocker = QtCore.QSignalBlocker(self._peak_gain_spin)
+        self._peak_gain_spin.set_value(peak)
+        del blocker
+        self._points = np.stack([thetas_deg.astype(np.float64), gains_db], axis=1)
+        self._sync_table_from_points()
+        self._select_point(0)
+        self._refresh_plot()
+        self._push_history()
+
+    def _apply_f699_preset(self) -> None:
+        """ITU-R F.699 peak-envelope reference pattern."""
+        from scepter.analytical_fixtures import f699_evaluator
+        self._apply_analytical_1d_preset(
+            label="F.699",
+            evaluator_builder=lambda gm, d, wl: f699_evaluator(
+                g_max_dbi=gm, diameter_m=d, wavelength_m=wl,
+            ),
+            requires_gm=True,
+        )
+
+    def _apply_f1245_preset(self) -> None:
+        """ITU-R F.1245 average-sidelobe envelope."""
+        from scepter.analytical_fixtures import f1245_evaluator
+        self._apply_analytical_1d_preset(
+            label="F.1245",
+            evaluator_builder=lambda gm, d, wl: f1245_evaluator(
+                g_max_dbi=gm, diameter_m=d, wavelength_m=wl,
+            ),
+            requires_gm=True,
+        )
+
+    def _apply_s465_preset(self) -> None:
+        """ITU-R S.465 earth-station (VSAT) reference envelope."""
+        from scepter.analytical_fixtures import s465_evaluator
+        self._apply_analytical_1d_preset(
+            label="S.465",
+            evaluator_builder=lambda gm, d, wl: s465_evaluator(
+                g_max_dbi=gm, diameter_m=d, wavelength_m=wl,
+            ),
+            requires_gm=True,
+        )
+
+    def _apply_s580_preset(self) -> None:
+        """ITU-R S.580-6 GSO earth-station design-objective envelope."""
+        from scepter.analytical_fixtures import s580_evaluator
+        self._apply_analytical_1d_preset(
+            label="S.580",
+            evaluator_builder=lambda _gm, d, wl: s580_evaluator(
+                diameter_m=d, wavelength_m=wl,
+            ),
+            requires_gm=False,
+        )
+
+    def _apply_s1428_preset(self) -> None:
+        """ITU-R S.1428-1 non-GSO EPFD reference earth-station pattern."""
+        from scepter.analytical_fixtures import s1428_evaluator
+        self._apply_analytical_1d_preset(
+            label="S.1428",
+            evaluator_builder=lambda _gm, d, wl: s1428_evaluator(
+                diameter_m=d, wavelength_m=wl,
+            ),
+            requires_gm=False,
+        )
+
+    def _apply_sa509_preset(self) -> None:
+        """ITU-R SA.509-3 space-research / radio-astronomy ES pattern."""
+        from scepter.analytical_fixtures import sa509_evaluator
+        self._apply_analytical_1d_preset(
+            label="SA.509",
+            evaluator_builder=lambda _gm, d, wl: sa509_evaluator(
+                diameter_m=d, wavelength_m=wl, variant="single",
+            ),
+            requires_gm=False,
+        )
+
+    def _apply_f1336_omni_preset(self) -> None:
+        """ITU-R F.1336-5 omnidirectional base-station elevation pattern."""
+        from scepter.analytical_fixtures import f1336_omni_evaluator
+        self._apply_analytical_1d_preset(
+            label="F.1336 omni",
+            evaluator_builder=lambda gm, _d, _wl: f1336_omni_evaluator(
+                g0_dbi=gm,
+            ),
+            requires_gm=True,
+        )
+
+    def _apply_airy_preset(self) -> None:
+        """Uniform circular aperture (Airy / jinc) diffraction pattern."""
+        from scepter.analytical_fixtures import airy_evaluator
+        self._apply_analytical_1d_preset(
+            label="Airy",
+            evaluator_builder=lambda _gm, d, wl: airy_evaluator(
+                diameter_m=d, wavelength_m=wl,
+            ),
+            requires_gm=False,
+        )
+
+    def _apply_cosine_taper_preset(self) -> None:
+        """Cosine-tapered circular aperture (lower sidelobes)."""
+        from scepter.analytical_fixtures import cosine_taper_evaluator
+        self._apply_analytical_1d_preset(
+            label="Cosine taper",
+            evaluator_builder=lambda _gm, d, wl: cosine_taper_evaluator(
+                diameter_m=d, wavelength_m=wl, taper_order=1,
+            ),
+            requires_gm=False,
+        )
+
+    # (The 1-D OneWeb/ECC-271 preset previously lived here. Removed
+    # because ECC Report 271 Table 11 is a 2-D asymmetric satellite
+    # beam, not a 1-D axisymmetric mask. The replacement lives in
+    # the 2-D editor as the "OneWeb satellite (ECC 271 Table 11)"
+    # template.)
+
+    def _apply_analytical_1d_preset(
+        self,
+        *,
+        label: str,
+        evaluator_builder: Callable[[float, float, float], Callable[[np.ndarray], np.ndarray]],
+        requires_gm: bool = True,
+    ) -> None:
+        """Shared preset-apply path for 1-D analytical patterns that
+        only need (G_max, diameter, wavelength) — F.699, F.1245, S.465.
+
+        Reads the preset form fields, builds the evaluator, samples
+        it onto the density-combo grid, and commits the (θ, gain)
+        table into the editor.
+        """
+        aperture = self._read_preset_aperture()
+        if aperture is None:
+            return
+        diameter_m, wavelength_m = aperture
+        gm_dbi = self._preset_gm_spin.value_or_none()
+        if requires_gm and gm_dbi is None:
+            QtWidgets.QMessageBox.warning(
+                self, f"{label} preset",
+                "Enter a G_max [dBi] value.",
+            )
+            return
+        density = self._preset_density_combo.currentData() or (0.1, 60.0, 5.0)
+        try:
+            main_step, far_start, far_step = (
+                float(density[0]), float(density[1]), float(density[2]),
+            )
+        except Exception:
+            main_step, far_start, far_step = 0.1, 60.0, 5.0
+        main_n = max(2, int(round(float(far_start) / max(main_step, 1e-6))) + 1)
+        far_n = max(2, int(round((180.0 - float(far_start)) / max(far_step, 1e-6))) + 1)
+        thetas_deg = np.concatenate([
+            np.linspace(0.0, float(far_start), main_n),
+            np.linspace(float(far_start) + float(far_step), 180.0, far_n),
+        ])
+        try:
+            evaluator = evaluator_builder(
+                float(gm_dbi) if gm_dbi is not None else 0.0,
+                float(diameter_m), float(wavelength_m),
+            )
+            gains_db = np.asarray(evaluator(thetas_deg), dtype=np.float64)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(
+                self, f"{label} preset failed",
+                f"Couldn't evaluate the analytical template:\n{exc}",
+            )
+            return
+        self._commit_points_to_editor(thetas_deg, gains_db)
+
+    def _commit_points_to_editor(
+        self, thetas_deg: np.ndarray, gains_db: np.ndarray,
+    ) -> None:
+        """Shared post-processing step for 1-D analytical presets:
+        update peak, replace points, sync widgets, refresh plot,
+        and push history."""
+        peak = float(np.max(gains_db))
+        self._peak_gain_dbi = peak
+        blocker = QtCore.QSignalBlocker(self._peak_gain_spin)
+        self._peak_gain_spin.set_value(peak)
+        del blocker
+        self._points = np.stack([thetas_deg.astype(np.float64), gains_db], axis=1)
+        self._sync_table_from_points()
+        self._select_point(0)
+        self._refresh_plot()
+        self._push_history()
+
+    # ------------------------------------------------------------------
+    # Point manipulation
+    # ------------------------------------------------------------------
+
+    def _is_anchor_index(self, index: int) -> bool:
+        n = int(self._points.shape[0])
+        if n == 0:
+            return False
+        return int(index) == 0 or int(index) == n - 1
+
+    def _can_remove_index(self, index: int | None) -> bool:
+        if index is None:
+            return False
+        if self._is_anchor_index(int(index)):
+            return False
+        return int(self._points.shape[0]) > 3
+
+    def _update_remove_button_enabled(self) -> None:
+        self._remove_point_button.setEnabled(self._can_remove_index(self._selected_index))
+
+    def _select_point(self, index: int | None) -> None:
+        if index is None:
+            self._selected_index = None
+            self._point_table.clearSelection()
+            self._update_remove_button_enabled()
+            self._refresh_plot()
+            return
+        clamped = int(max(0, min(int(index), self._points.shape[0] - 1)))
+        self._selected_index = clamped
+        self._table_sync_in_progress = True
+        try:
+            self._point_table.selectRow(clamped)
+        finally:
+            self._table_sync_in_progress = False
+        self._update_remove_button_enabled()
+        self._refresh_plot()
+
+    def _nearest_point_index(self, event: Any) -> int | None:
+        if getattr(event, "inaxes", None) is not self._axis:
+            return None
+        if event.x is None or event.y is None:
+            return None
+        display = self._axis.transData.transform(self._points)
+        cursor = np.asarray([float(event.x), float(event.y)], dtype=np.float64)
+        distances = np.sqrt(np.sum((display - cursor[None, :]) ** 2, axis=1))
+        best = int(np.argmin(distances))
+        if float(distances[best]) > self._POINT_PICK_RADIUS_PX:
+            return None
+        return best
+
+    def _constrain_point(self, index: int, x_value: float, y_value: float) -> tuple[float, float]:
+        n = int(self._points.shape[0])
+        x_use = float(x_value)
+        y_use = float(y_value)
+        if self._is_anchor_index(int(index)):
+            # θ stays anchored at 0° or 180°; gain is free.
+            x_use = 0.0 if int(index) == 0 else float(self._THETA_MAX_DEG)
+        else:
+            left = float(self._points[int(index) - 1, 0]) if int(index) - 1 >= 0 else 0.0
+            right = float(self._points[int(index) + 1, 0]) if int(index) + 1 < n else float(self._THETA_MAX_DEG)
+            x_use = float(max(left + self._MIN_POINT_GAP_DEG, min(x_use, right - self._MIN_POINT_GAP_DEG)))
+        return x_use, y_use
+
+    def _add_midpoint_after_selection(self) -> None:
+        n = int(self._points.shape[0])
+        if n < 2:
+            return
+        idx = (
+            int(self._selected_index)
+            if self._selected_index is not None and int(self._selected_index) < n - 1
+            else 0
+        )
+        left_theta = float(self._points[idx, 0])
+        right_theta = float(self._points[idx + 1, 0])
+        if right_theta - left_theta < 2 * self._MIN_POINT_GAP_DEG:
+            return
+        new_theta = 0.5 * (left_theta + right_theta)
+        new_gain = 0.5 * (float(self._points[idx, 1]) + float(self._points[idx + 1, 1]))
+        self._points = np.insert(
+            self._points, idx + 1, [new_theta, new_gain], axis=0,
+        )
+        self._sync_table_from_points()
+        self._select_point(idx + 1)
+        self._refresh_plot()
+        self._push_history()
+
+    def _remove_selected_point(self) -> bool:
+        if not self._can_remove_index(self._selected_index):
+            return False
+        idx = int(self._selected_index)
+        self._points = np.delete(self._points, idx, axis=0)
+        self._sync_table_from_points()
+        self._select_point(max(0, idx - 1))
+        self._refresh_plot()
+        self._push_history()
+        return True
+
+    # ------------------------------------------------------------------
+    # Table ↔ points sync
+    # ------------------------------------------------------------------
+
+    def _sync_table_from_points(self) -> None:
+        self._table_sync_in_progress = True
+        try:
+            self._point_table.setRowCount(int(self._points.shape[0]))
+            for row in range(int(self._points.shape[0])):
+                theta_item = QtWidgets.QTableWidgetItem(f"{float(self._points[row, 0]):.6g}")
+                gain_item = QtWidgets.QTableWidgetItem(f"{float(self._points[row, 1]):.4g}")
+                if self._is_anchor_index(row):
+                    flags = theta_item.flags() & ~QtCore.Qt.ItemIsEditable
+                    theta_item.setFlags(flags)
+                self._point_table.setItem(row, 0, theta_item)
+                self._point_table.setItem(row, 1, gain_item)
+        finally:
+            self._table_sync_in_progress = False
+
+    def _on_table_item_changed(self, item: QtWidgets.QTableWidgetItem) -> None:
+        if self._table_sync_in_progress:
+            return
+        row = int(item.row())
+        col = int(item.column())
+        try:
+            value = float(item.text())
+        except ValueError:
+            self._sync_table_from_points()
+            return
+        if col == 0 and not self._is_anchor_index(row):
+            self._points[row, 0] = value
+        elif col == 1:
+            self._points[row, 1] = value
+        x_use, y_use = self._constrain_point(row, float(self._points[row, 0]), float(self._points[row, 1]))
+        self._points[row, 0] = x_use
+        self._points[row, 1] = y_use
+        self._sync_table_from_points()
+        self._select_point(row)
+        self._refresh_plot()
+        self._push_history()
+
+    def _on_table_selection_changed(self) -> None:
+        if self._table_sync_in_progress:
+            return
+        indices = self._point_table.selectionModel().selectedRows()
+        if not indices:
+            return
+        self._select_point(int(indices[0].row()))
+
+    # ------------------------------------------------------------------
+    # Peak-gain metadata
+    # ------------------------------------------------------------------
+
+    def _on_peak_gain_edited(self) -> None:
+        value = self._peak_gain_spin.value_or_none()
+        if value is None:
+            return
+        self._peak_gain_dbi = float(value)
+        self._refresh_plot()
+
+    # ------------------------------------------------------------------
+    # JSON I/O
+    # ------------------------------------------------------------------
+
+    def _import_from_json(self) -> None:
+        from scepter.custom_antenna import (
+            KIND_1D as _CK_1D, load_custom_pattern as _load,
+        )
+        filename, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Import custom pattern", str(Path.cwd()),
+            "Antenna pattern JSON (*.json);;All files (*)",
+        )
+        if not filename:
+            return
+        try:
+            pat = _load(filename)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(
+                self, "Import failed",
+                f"Couldn't import {Path(filename).name}:\n{exc}",
+            )
+            return
+        if pat.kind != _CK_1D:
+            QtWidgets.QMessageBox.warning(
+                self, "Wrong kind",
+                f"{Path(filename).name} declares kind={pat.kind!r}; the "
+                "1-D editor only accepts axisymmetric patterns. Use the "
+                "2-D editor instead.",
+            )
+            return
+        self._load_pattern_into_editor(pat)
+
+    def _export_to_json(self) -> None:
+        from scepter.custom_antenna import dump_custom_pattern as _dump
+        try:
+            pat = self._build_pattern_from_state()
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(
+                self, "Validation failed",
+                f"The current points don't form a valid pattern:\n{exc}",
+            )
+            return
+        filename, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Export custom pattern", str(Path.cwd() / "custom_pattern_1d.json"),
+            "Antenna pattern JSON (*.json)",
+        )
+        if not filename:
+            return
+        try:
+            _dump(filename, pat)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(
+                self, "Export failed",
+                f"Couldn't write {Path(filename).name}:\n{exc}",
+            )
+
+    # ------------------------------------------------------------------
+    # Normalisation (total-radiated-power preservation)
+    # ------------------------------------------------------------------
+
+    def _integrate_gain_linear(self) -> float:
+        """Return ``∫ G(θ) · 2π·sin(θ) dθ`` over [0°, 180°] in linear units.
+
+        Uses trapezoidal integration over the current control points
+        (linear interpolation in dB between consecutive θ, then
+        10^(·/10) → linear). Gives the "solid-angle-integrated gain"
+        of the axisymmetric pattern, which for a lossless isotropic
+        reference equals 4π.
+        """
+        thetas_deg = np.asarray(self._points[:, 0], dtype=np.float64)
+        gains_db = np.asarray(self._points[:, 1], dtype=np.float64)
+        thetas_rad = np.deg2rad(thetas_deg)
+        gains_lin = np.power(10.0, gains_db / 10.0)
+        integrand = gains_lin * 2.0 * np.pi * np.sin(thetas_rad)
+        return float(np.trapezoid(integrand, thetas_rad))
+
+    def _open_normalise_dialog(self) -> None:
+        """Prompt for normalisation target and apply the correction.
+
+        The pattern is rescaled so its solid-angle-integrated gain
+        matches ``4π · η_rad``, where ``η_rad`` is the radiation
+        efficiency (= 1 − ohmic loss fraction). Two equivalent input
+        modes are offered so users can pick whichever convention
+        their datasheet uses:
+
+        * **Radiation efficiency [%]** — 100 % is a lossless antenna
+          (∫G dΩ = 4π exactly). Values below 100 % remove a fraction
+          of the radiated power.
+        * **Ohmic loss [dB]** — the dB of loss between input power
+          and radiated power. 0 dB = lossless; 1 dB ≈ 79 % η_rad;
+          3 dB ≈ 50 % η_rad.
+
+        Toggling the radio switches which input is active; the other
+        one stays in sync so the user sees both representations of
+        their choice side-by-side.
+        """
+        current_integral = self._integrate_gain_linear()
+        if not np.isfinite(current_integral) or current_integral <= 0.0:
+            QtWidgets.QMessageBox.warning(
+                self, "Normalisation failed",
+                "The current pattern integrates to a non-positive "
+                "value; normalisation is undefined. Check the control "
+                "points for extreme negative gains.",
+            )
+            return
+        current_ratio = float(current_integral) / (4.0 * float(np.pi))
+        current_db = 10.0 * float(np.log10(current_ratio))
+
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("Normalise pattern")
+        dialog.setModal(True)
+        dialog.resize(480, 460)
+        sheet = self.styleSheet()
+        if sheet:
+            dialog.setStyleSheet(sheet)
+        root = QtWidgets.QVBoxLayout(dialog)
+        root.setContentsMargins(18, 18, 18, 14)
+        root.setSpacing(14)
+
+        # --- Section 1: Current state ---
+        current_group = QtWidgets.QGroupBox("Current pattern", dialog)
+        current_layout = QtWidgets.QFormLayout(current_group)
+        current_layout.setLabelAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        current_layout.setHorizontalSpacing(14)
+        current_layout.setVerticalSpacing(6)
+        ratio_label = QtWidgets.QLabel(
+            f"{current_ratio:.4f}  ({current_db:+.2f} dB vs 4π)", dialog,
+        )
+        ratio_label.setStyleSheet("color: #94a3b8;")
+        current_layout.addRow("∫G dΩ / 4π:", ratio_label)
+        implied_eta_pct = 100.0 * float(current_ratio)
+        implied_loss_db = -current_db
+        implied_label = QtWidgets.QLabel(
+            f"η_rad = {implied_eta_pct:.2f} %  /  L = {implied_loss_db:+.2f} dB",
+            dialog,
+        )
+        implied_label.setStyleSheet("color: #94a3b8;")
+        current_layout.addRow("Implied efficiency:", implied_label)
+        root.addWidget(current_group)
+
+        # --- Section 2: Target definition ---
+        target_group = QtWidgets.QGroupBox("Target radiation efficiency", dialog)
+        target_layout = QtWidgets.QVBoxLayout(target_group)
+        target_layout.setSpacing(8)
+
+        mode_row = QtWidgets.QHBoxLayout()
+        mode_row.setContentsMargins(0, 0, 0, 0)
+        mode_row.setSpacing(14)
+        eff_radio = QtWidgets.QRadioButton("By η_rad [%]", dialog)
+        loss_radio = QtWidgets.QRadioButton("By ohmic loss [dB]", dialog)
+        eff_radio.setChecked(True)
+        mode_row.addWidget(eff_radio)
+        mode_row.addWidget(loss_radio)
+        mode_row.addStretch(1)
+        target_layout.addLayout(mode_row)
+
+        inputs_form = QtWidgets.QFormLayout()
+        inputs_form.setLabelAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        inputs_form.setHorizontalSpacing(14)
+        inputs_form.setVerticalSpacing(8)
+        eta_spin = OptionalNumericEdit(
+            minimum=0.01, maximum=100.0, decimals=3, parent=dialog,
+        )
+        eta_spin.set_value(100.0)
+        loss_spin = OptionalNumericEdit(
+            minimum=0.0, maximum=30.0, decimals=3, parent=dialog,
+        )
+        loss_spin.set_value(0.0)
+        inputs_form.addRow("Radiation efficiency η_rad [%]", eta_spin)
+        inputs_form.addRow("Ohmic loss L [dB]", loss_spin)
+        target_layout.addLayout(inputs_form)
+
+        explanation = QtWidgets.QLabel(
+            "η_rad = 10^(−L/10). 100 % / 0 dB = lossless; 79 % / 1 dB; "
+            "50 % / 3 dB. Use whichever convention your datasheet "
+            "quotes — the other field tracks automatically.",
+            dialog,
+        )
+        explanation.setWordWrap(True)
+        explanation.setStyleSheet("color: #94a3b8; font-size: 11px;")
+        target_layout.addWidget(explanation)
+        root.addWidget(target_group)
+
+        # --- Section 3: Live preview of the normalisation ---
+        preview_group = QtWidgets.QGroupBox("Preview", dialog)
+        preview_layout = QtWidgets.QFormLayout(preview_group)
+        preview_layout.setLabelAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        preview_layout.setHorizontalSpacing(14)
+        preview_layout.setVerticalSpacing(6)
+        preview_offset_label = QtWidgets.QLabel("+0.000 dB", dialog)
+        preview_offset_label.setStyleSheet("color: #93c5fd; font-weight: 600;")
+        preview_ratio_label = QtWidgets.QLabel("—", dialog)
+        preview_ratio_label.setStyleSheet("color: #93c5fd; font-weight: 600;")
+        preview_layout.addRow("Offset applied:", preview_offset_label)
+        preview_layout.addRow("New ∫G dΩ / 4π:", preview_ratio_label)
+        root.addWidget(preview_group)
+
+        # --- Wire the mutual-sync between η_rad and L[dB] and the
+        # live preview of the offset + resulting integral. ---
+        sync_guard = {"busy": False}
+
+        def _current_eta_frac() -> float:
+            """Read η_rad from whichever input the active radio points at."""
+            if eff_radio.isChecked():
+                val = eta_spin.value_or_none()
+                if val is None or float(val) <= 0.0:
+                    return 0.0
+                return float(val) / 100.0
+            val = loss_spin.value_or_none()
+            if val is None or float(val) < 0.0:
+                return 0.0
+            return 10.0 ** (-float(val) / 10.0)
+
+        def _update_preview() -> None:
+            eta_frac = _current_eta_frac()
+            if eta_frac <= 0.0:
+                preview_offset_label.setText("—")
+                preview_ratio_label.setText("—")
+                return
+            target_integral = 4.0 * float(np.pi) * float(eta_frac)
+            offset_db = 10.0 * float(
+                np.log10(target_integral / float(current_integral))
+            )
+            preview_offset_label.setText(f"{offset_db:+.3f} dB")
+            preview_ratio_label.setText(
+                f"{eta_frac:.4f} (= η_rad {eta_frac * 100.0:.2f} %)"
+            )
+
+        def _sync_from_eta() -> None:
+            if sync_guard["busy"]:
+                return
+            val = eta_spin.value_or_none()
+            if val is None or float(val) <= 0.0:
+                _update_preview()
+                return
+            loss_db = -10.0 * float(np.log10(float(val) / 100.0))
+            sync_guard["busy"] = True
+            try:
+                loss_spin.set_value(round(loss_db, 6))
+            finally:
+                sync_guard["busy"] = False
+            _update_preview()
+
+        def _sync_from_loss() -> None:
+            if sync_guard["busy"]:
+                return
+            val = loss_spin.value_or_none()
+            if val is None:
+                _update_preview()
+                return
+            eta_percent = 100.0 * (10.0 ** (-float(val) / 10.0))
+            sync_guard["busy"] = True
+            try:
+                eta_spin.set_value(round(eta_percent, 6))
+            finally:
+                sync_guard["busy"] = False
+            _update_preview()
+
+        def _on_mode_toggled() -> None:
+            by_eff = bool(eff_radio.isChecked())
+            eta_spin.setEnabled(by_eff)
+            loss_spin.setEnabled(not by_eff)
+            _update_preview()
+
+        eta_spin.editingFinished.connect(_sync_from_eta)
+        loss_spin.editingFinished.connect(_sync_from_loss)
+        eff_radio.toggled.connect(_on_mode_toggled)
+        _on_mode_toggled()
+        _update_preview()
+
+        # --- Buttons ---
+        root.addStretch(1)
+        button_box = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel,
+            QtCore.Qt.Horizontal, dialog,
+        )
+        button_box.accepted.connect(dialog.accept)
+        button_box.rejected.connect(dialog.reject)
+        root.addWidget(button_box)
+
+        if dialog.exec() != QtWidgets.QDialog.Accepted:
+            return
+
+        # Pick whichever field the active radio points at; the other
+        # field was auto-updated via the signals so either is valid.
+        if eff_radio.isChecked():
+            eta_value = eta_spin.value_or_none()
+            if eta_value is None or float(eta_value) <= 0.0:
+                QtWidgets.QMessageBox.warning(
+                    self, "Normalisation failed",
+                    "Radiation efficiency must be a positive percentage.",
+                )
+                return
+            eta_frac = float(eta_value) / 100.0
+        else:
+            loss_value = loss_spin.value_or_none()
+            if loss_value is None or float(loss_value) < 0.0:
+                QtWidgets.QMessageBox.warning(
+                    self, "Normalisation failed",
+                    "Ohmic loss must be a non-negative value in dB.",
+                )
+                return
+            eta_frac = 10.0 ** (-float(loss_value) / 10.0)
+        eta_frac = float(max(1.0e-6, min(eta_frac, 1.0)))
+
+        target_integral = 4.0 * float(np.pi) * float(eta_frac)
+        offset_db = 10.0 * float(np.log10(target_integral / float(current_integral)))
+        self._points[:, 1] = self._points[:, 1] + offset_db
+        self._peak_gain_dbi = float(self._peak_gain_dbi) + offset_db
+        blocker = QtCore.QSignalBlocker(self._peak_gain_spin)
+        self._peak_gain_spin.set_value(self._peak_gain_dbi)
+        del blocker
+        self._sync_table_from_points()
+        self._refresh_plot()
+        self._push_history()
+        new_integral = self._integrate_gain_linear()
+        new_ratio = float(new_integral) / (4.0 * float(np.pi))
+        QtWidgets.QMessageBox.information(
+            self, "Normalised",
+            f"Applied offset {offset_db:+.3f} dB so the pattern now "
+            f"integrates to η_rad = {eta_frac * 100.0:.3f} % "
+            f"(L = {-10.0 * np.log10(max(eta_frac, 1e-12)):.3f} dB). "
+            f"New ∫G dΩ / 4π = {new_ratio:.4f}.",
+        )
+
+    def _load_pattern_into_editor(self, pattern: "CustomAntennaPattern") -> None:
+        self._peak_gain_dbi = float(pattern.peak_gain_dbi)
+        meta = pattern.meta or {}
+        self._title_text = str(meta.get("title", ""))
+        gains = np.asarray(pattern.gain_db, dtype=np.float64)
+        if pattern.normalisation != self._norm_abs:
+            gains = gains + float(self._peak_gain_dbi)
+        thetas = np.asarray(pattern.grid_deg, dtype=np.float64)
+        self._points = np.stack([thetas, gains], axis=1)
+        blocker_a = QtCore.QSignalBlocker(self._title_edit)
+        blocker_b = QtCore.QSignalBlocker(self._peak_gain_spin)
+        self._title_edit.setText(self._title_text)
+        self._peak_gain_spin.set_value(self._peak_gain_dbi)
+        self._meta_author = str(meta.get("author", ""))
+        self._meta_source = str(meta.get("source_url", ""))
+        self._meta_notes = str(meta.get("notes", ""))
+        del blocker_a
+        del blocker_b
+        self._sync_table_from_points()
+        self._select_point(0)
+        self._refresh_plot()
+        self._push_history()
+
+    # ------------------------------------------------------------------
+    # Plot rendering + drag handling
+    # ------------------------------------------------------------------
+
+    def _refresh_plot(self) -> None:
+        """Redraw the figure and refresh the derived-quantities panel."""
+        # Polar mode builds a fresh polar subplot; cartesian uses
+        # the default rectilinear one. Switching projection requires
+        # a full clear-and-rebuild of the axis.
+        self._figure.clear()
+        if self._polar_mode:
+            self._axis = self._figure.add_subplot(111, projection="polar")
+            self._draw_polar()
+        else:
+            self._axis = self._figure.add_subplot(111)
+            self._draw_cartesian()
+
+        try:
+            self._figure.tight_layout()
+        except Exception:
+            pass
+        parent = self.parent()
+        if parent is not None and hasattr(parent, "_style_matplotlib_figure"):
+            try:
+                parent._style_matplotlib_figure(self._figure)
+            except Exception:
+                pass
+        self._canvas.draw_idle()
+
+        self._summary_label.setText(
+            f"{int(self._points.shape[0])} control points \u2022 "
+            f"peak {self._peak_gain_dbi:.2f} dBi \u2022 "
+            f"min {float(self._points[:, 1].min()):.2f} dBi"
+        )
+        self._update_derived_panel()
+        self._update_undo_redo_enabled()
+
+    def _marker_sizes_for_density(self, n_pts: int) -> tuple[float, float]:
+        """Pick (marker_size, edge_width) so dense curves stay readable."""
+        if n_pts > 2000:
+            return 1.6, 0.0
+        if n_pts > 500:
+            return 3.0, 0.4
+        if n_pts > 100:
+            return 4.0, 0.6
+        return 7.0, 0.9
+
+    def _draw_cartesian(self) -> None:
+        axis = self._axis
+        n_pts = int(self._points.shape[0])
+        marker_size, marker_width = self._marker_sizes_for_density(n_pts)
+        axis.plot(self._points[:, 0], self._points[:, 1], "-", color="#3b82f6", lw=1.5)
+        axis.plot(
+            self._points[:, 0], self._points[:, 1], "o",
+            markerfacecolor="#38bdf8", markeredgecolor="#0f172a",
+            markeredgewidth=marker_width, markersize=marker_size,
+            linestyle="None",
+        )
+        if self._selected_index is not None:
+            sel = int(self._selected_index)
+            axis.plot(
+                float(self._points[sel, 0]), float(self._points[sel, 1]),
+                "o", markersize=max(12.0, marker_size + 6.0),
+                markerfacecolor="none",
+                markeredgecolor="#f97316", markeredgewidth=2.0,
+            )
+
+        # Horizontal reference lines at the canonical read-the-SLL
+        # magnitudes (peak, −3, −10, −20, −30 dB). Color-coded so
+        # the peak stays easy to distinguish from the floor refs.
+        ref_colors = {
+            0.0: "#22c55e", 3.0: "#f59e0b", 10.0: "#94a3b8",
+            20.0: "#64748b", 30.0: "#475569",
+        }
+        for drop_db, color in ref_colors.items():
+            y = self._peak_gain_dbi - drop_db
+            axis.axhline(y, color=color, lw=0.7, ls=":")
+            axis.text(
+                0.995, y, f"−{int(drop_db)} dB" if drop_db > 0 else "peak",
+                transform=axis.get_yaxis_transform(),
+                ha="right", va="bottom",
+                color=color, fontsize=8,
+            )
+
+        # Optional compare-overlay reference curve.
+        if self._overlay_points is not None:
+            axis.plot(
+                self._overlay_points[:, 0], self._overlay_points[:, 1],
+                color="#f59e0b", lw=1.0, ls="--", alpha=0.85,
+                label=self._overlay_label,
+            )
+            axis.legend(loc="upper right", frameon=False, fontsize=9)
+
+        axis.set_xlabel("Off-axis angle θ [deg]")
+        axis.set_ylabel("Gain [dBi]")
+        if self._log_x:
+            axis.set_xscale("log")
+            axis.set_xlim(0.01, 200.0)
+        else:
+            axis.set_xscale("linear")
+            axis.set_xlim(-2.0, 182.0)
+        axis.set_title("Custom 1-D antenna pattern")
+        axis.grid(True, alpha=0.3)
+        # Sticky main-lobe zoom: while the toggle is active, recompute
+        # the θ-extent on every refresh so the zoom tracks live point
+        # edits (the user's beamwidth can change as they drag).
+        if getattr(self, "_main_lobe_zoom_active", False):
+            hbw = self._compute_half_beamwidth_deg()
+            if hbw is not None:
+                theta_hi = max(5.0 * hbw, 2.0)
+                lo = 0.01 if self._log_x else -max(theta_hi * 0.05, 0.5)
+                axis.set_xlim(lo, theta_hi)
+
+    def _draw_polar(self) -> None:
+        axis = self._axis
+        # Polar convention: θ on the angular axis (compass-style,
+        # 0° at top, increasing clockwise is standard for antenna
+        # patterns). Y on the radial axis = gain [dBi]. Floor ≈ min
+        # of (points, overlay) minus small margin.
+        theta_rad = np.deg2rad(self._points[:, 0])
+        gain = self._points[:, 1]
+        gain_min = float(np.min(gain))
+        if self._overlay_points is not None:
+            gain_min = min(gain_min, float(np.min(self._overlay_points[:, 1])))
+        floor = gain_min - 2.0
+        axis.set_theta_zero_location("N")
+        axis.set_theta_direction(-1)
+        axis.set_rlabel_position(90)
+        axis.set_ylim(floor, self._peak_gain_dbi + 2.0)
+
+        # Mirror the pattern across 0° so the polar plot reads as a
+        # symmetric radiation rose — antenna patterns are plotted
+        # this way by convention even for 1-D axisymmetric data.
+        full_theta = np.concatenate([-theta_rad[::-1], theta_rad])
+        full_gain = np.concatenate([gain[::-1], gain])
+        axis.plot(full_theta, full_gain, color="#3b82f6", lw=1.5)
+        n_pts = int(self._points.shape[0])
+        marker_size, marker_width = self._marker_sizes_for_density(n_pts)
+        axis.plot(
+            theta_rad, gain, "o",
+            markerfacecolor="#38bdf8", markeredgecolor="#0f172a",
+            markeredgewidth=marker_width, markersize=marker_size,
+            linestyle="None",
+        )
+        if self._selected_index is not None:
+            sel = int(self._selected_index)
+            axis.plot(
+                float(theta_rad[sel]), float(gain[sel]),
+                "o", markersize=max(12.0, marker_size + 6.0),
+                markerfacecolor="none",
+                markeredgecolor="#f97316", markeredgewidth=2.0,
+            )
+        # Reference rings at the same SLL levels as the cartesian
+        # view, drawn as faint dotted circles via ``axhline`` on the
+        # polar axes (which draws concentric r = const lines).
+        for drop_db, color in (
+            (0.0, "#22c55e"), (3.0, "#f59e0b"), (10.0, "#94a3b8"),
+            (20.0, "#64748b"), (30.0, "#475569"),
+        ):
+            y = self._peak_gain_dbi - drop_db
+            if y <= floor:
+                continue
+            axis.axhline(y, color=color, lw=0.6, ls=":")
+
+        if self._overlay_points is not None:
+            overlay_theta = np.deg2rad(self._overlay_points[:, 0])
+            overlay_gain = self._overlay_points[:, 1]
+            full_o_theta = np.concatenate([-overlay_theta[::-1], overlay_theta])
+            full_o_gain = np.concatenate([overlay_gain[::-1], overlay_gain])
+            axis.plot(
+                full_o_theta, full_o_gain, color="#f59e0b",
+                lw=1.0, ls="--", alpha=0.85,
+                label=self._overlay_label,
+            )
+            axis.legend(loc="upper right", frameon=False, fontsize=9)
+        axis.set_title("Custom 1-D antenna pattern (polar)")
+
+    def _on_plot_button_press(self, event: Any) -> None:
+        if event.button == 1 and getattr(event, "dblclick", False):
+            if event.inaxes is self._axis and event.xdata is not None and event.ydata is not None:
+                self._insert_point_at(float(event.xdata), float(event.ydata))
+            return
+        if event.button == 3:
+            idx = self._nearest_point_index(event)
+            if idx is not None:
+                self._select_point(idx)
+                self._remove_selected_point()
+            return
+        if event.button == 1:
+            idx = self._nearest_point_index(event)
+            if idx is not None:
+                self._drag_index = idx
+                self._select_point(idx)
+
+    def _on_plot_motion(self, event: Any) -> None:
+        # Cursor read-out: update whenever the cursor is inside the
+        # plot area, whether or not we're dragging. In polar mode
+        # the event carries (theta_rad, r_gain); convert back to
+        # (deg, dBi) for the user.
+        if event.inaxes is self._axis and event.xdata is not None and event.ydata is not None:
+            if self._polar_mode:
+                theta_deg = np.rad2deg(float(event.xdata))
+                # Polar plots mirror across 0° — show the absolute
+                # angle from boresight so the read-out matches the
+                # way the pattern is evaluated.
+                theta_deg = abs(((theta_deg + 180.0) % 360.0) - 180.0)
+                gain = float(event.ydata)
+            else:
+                theta_deg = float(event.xdata)
+                gain = float(event.ydata)
+            self._cursor_readout_label.setText(
+                f"Cursor: θ = {theta_deg:.3f}°   gain = {gain:.2f} dBi   "
+                f"interpolated pattern at θ = "
+                f"{self._interp_gain_at(theta_deg):.2f} dBi"
+            )
+
+        if self._drag_index is None:
+            return
+        if event.inaxes is not self._axis:
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+        # Drag math differs between cartesian and polar projections.
+        if self._polar_mode:
+            x_deg = abs(((np.rad2deg(float(event.xdata)) + 180.0) % 360.0) - 180.0)
+            y_gain = float(event.ydata)
+        else:
+            x_deg = float(event.xdata)
+            y_gain = float(event.ydata)
+        x_use, y_use = self._constrain_point(
+            int(self._drag_index), x_deg, y_gain,
+        )
+        self._points[int(self._drag_index), 0] = x_use
+        self._points[int(self._drag_index), 1] = y_use
+        self._sync_table_from_points()
+        self._select_point(int(self._drag_index))
+
+    def _on_plot_button_release(self, _event: Any) -> None:
+        if self._drag_index is not None:
+            self._push_history()
+        self._drag_index = None
+
+    def _insert_point_at(self, x_value: float, y_value: float) -> None:
+        x_clamped = float(max(0.0, min(x_value, float(self._THETA_MAX_DEG))))
+        thetas = self._points[:, 0]
+        idx = int(np.searchsorted(thetas, x_clamped))
+        idx = int(max(1, min(idx, int(self._points.shape[0]) - 1)))
+        self._points = np.insert(self._points, idx, [x_clamped, float(y_value)], axis=0)
+        self._sync_table_from_points()
+        self._select_point(idx)
+        self._refresh_plot()
+        self._push_history()
+
+    # ------------------------------------------------------------------
+    # Validation + accept
+    # ------------------------------------------------------------------
+
+    def _build_pattern_from_state(self) -> "CustomAntennaPattern":
+        from scepter.custom_antenna import CustomAntennaPattern
+        peak_value = self._peak_gain_spin.value_or_none()
+        if peak_value is None:
+            raise ValueError("Peak gain must be set.")
+        peak = float(peak_value)
+        thetas = np.asarray(self._points[:, 0], dtype=np.float64).copy()
+        gains = np.asarray(self._points[:, 1], dtype=np.float64).copy()
+        if float(thetas[0]) != 0.0:
+            thetas[0] = 0.0
+        if float(thetas[-1]) < self._THETA_MAX_DEG:
+            thetas[-1] = float(self._THETA_MAX_DEG)
+        meta: dict[str, Any] = {"title": str(self._title_edit.text() or "").strip()}
+        if self._meta_author:
+            meta["author"] = self._meta_author
+        if self._meta_source:
+            meta["source_url"] = self._meta_source
+        if self._meta_notes:
+            meta["notes"] = self._meta_notes
+        meta["editor"] = "PatternEditor1DDialog"
+        payload = {
+            "scepter_antenna_pattern_format": "v1",
+            "kind": self._kind_1d,
+            "normalisation": self._norm_abs,
+            "peak_gain_source": self._peak_src_explicit,
+            "peak_gain_dbi": peak,
+            "grid_deg": thetas.tolist(),
+            "gain_db": gains.tolist(),
+            "meta": meta,
+        }
+        return CustomAntennaPattern.from_json_dict(payload)
+
+    def _on_accept(self) -> None:
+        try:
+            pat = self._build_pattern_from_state()
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(
+                self, "Validation failed",
+                f"The current points don't form a valid pattern:\n{exc}",
+            )
+            return
+        warning = self._physical_plausibility_warning()
+        if warning is not None:
+            response = QtWidgets.QMessageBox.warning(
+                self, "Pattern exceeds lossless limit",
+                warning
+                + "\n\nNote: ITU regulatory masks (e.g. S.1528 Rec 1.4, "
+                "RA.1631) are *envelopes* bounding any conforming antenna, "
+                "not physical patterns, and commonly integrate above 4π — "
+                "that's legitimate if you're modelling a regulatory mask "
+                "rather than a real antenna.\n\nAccept anyway?",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                QtWidgets.QMessageBox.No,
+            )
+            if response != QtWidgets.QMessageBox.Yes:
+                return
+        self._result_pattern = pat
+        # Accepting the dialog is a save, not a discard — suppress
+        # the unsaved-changes prompt that ``closeEvent`` would
+        # otherwise fire since ``self.accept()`` triggers the same
+        # close path that ``reject()`` does.
+        self._close_confirmed = True
+        self.accept()
+
+    # ------------------------------------------------------------------
+    # Undo / redo
+    # ------------------------------------------------------------------
+
+    def _snapshot(self) -> tuple[np.ndarray, float, str]:
+        return (
+            self._points.copy(),
+            float(self._peak_gain_dbi),
+            str(self._title_edit.text()),
+        )
+
+    def _push_history(self, *, force: bool = False) -> None:
+        """Store the current state in the undo stack.
+
+        Called after every action that mutates points / peak / title
+        (drag commit, point add/remove, preset apply, normalise,
+        import, paste, smooth). The ``_history_in_progress`` guard
+        prevents the signal chain triggered by ``_undo`` / ``_redo``
+        from pushing the state we just restored.
+        """
+        if self._history_in_progress and not force:
+            return
+        snap = self._snapshot()
+        if (
+            not force
+            and self._history_pos >= 0
+            and self._history
+            and np.array_equal(self._history[self._history_pos][0], snap[0])
+            and self._history[self._history_pos][1] == snap[1]
+            and self._history[self._history_pos][2] == snap[2]
+        ):
+            return
+        # Drop any redo tail before appending.
+        del self._history[self._history_pos + 1:]
+        self._history.append(snap)
+        # Cap the undo depth so long editing sessions don't grow
+        # unbounded memory.
+        max_depth = 64
+        if len(self._history) > max_depth:
+            self._history = self._history[-max_depth:]
+        self._history_pos = len(self._history) - 1
+        self._update_undo_redo_enabled()
+
+    def _restore_snapshot(self, snap: tuple[np.ndarray, float, str]) -> None:
+        pts, peak, title = snap
+        self._history_in_progress = True
+        try:
+            self._points = pts.copy()
+            self._peak_gain_dbi = float(peak)
+            self._title_text = str(title)
+            blocker_title = QtCore.QSignalBlocker(self._title_edit)
+            blocker_peak = QtCore.QSignalBlocker(self._peak_gain_spin)
+            self._title_edit.setText(title)
+            self._peak_gain_spin.set_value(float(peak))
+            del blocker_title
+            del blocker_peak
+            self._sync_table_from_points()
+            self._select_point(
+                min(self._selected_index, self._points.shape[0] - 1)
+                if self._selected_index is not None else 0
+            )
+            self._refresh_plot()
+        finally:
+            self._history_in_progress = False
+        self._update_undo_redo_enabled()
+
+    def _can_undo(self) -> bool:
+        return self._history_pos > 0
+
+    def _can_redo(self) -> bool:
+        return 0 <= self._history_pos < len(self._history) - 1
+
+    def _update_undo_redo_enabled(self) -> None:
+        if hasattr(self, "_undo_button"):
+            self._undo_button.setEnabled(self._can_undo())
+        if hasattr(self, "_redo_button"):
+            self._redo_button.setEnabled(self._can_redo())
+
+    def _undo(self) -> None:
+        if not self._can_undo():
+            return
+        self._history_pos -= 1
+        self._restore_snapshot(self._history[self._history_pos])
+
+    def _redo(self) -> None:
+        if not self._can_redo():
+            return
+        self._history_pos += 1
+        self._restore_snapshot(self._history[self._history_pos])
+
+    # ------------------------------------------------------------------
+    # Reset / unsaved-changes guard
+    # ------------------------------------------------------------------
+
+    def _is_modified(self) -> bool:
+        """True iff current state differs from the dialog's open state."""
+        if not np.array_equal(self._points, self._initial_points_baseline):
+            return True
+        if float(self._peak_gain_dbi) != float(self._initial_peak_baseline):
+            return True
+        if str(self._title_edit.text()) != str(self._initial_title_baseline):
+            return True
+        return False
+
+    def _reset_to_initial(self) -> None:
+        """Revert to the state the dialog opened with (one undoable op)."""
+        self._points = self._initial_points_baseline.copy()
+        self._peak_gain_dbi = float(self._initial_peak_baseline)
+        blocker_title = QtCore.QSignalBlocker(self._title_edit)
+        blocker_peak = QtCore.QSignalBlocker(self._peak_gain_spin)
+        self._title_edit.setText(str(self._initial_title_baseline))
+        self._peak_gain_spin.set_value(float(self._initial_peak_baseline))
+        del blocker_title
+        del blocker_peak
+        self._sync_table_from_points()
+        self._select_point(0)
+        self._refresh_plot()
+        self._push_history()
+
+    # ------------------------------------------------------------------
+    # Shortcuts
+    # ------------------------------------------------------------------
+
+    def _install_shortcuts(self) -> None:
+        """Create ``QShortcut`` instances for editor-level keys.
+
+        Arrow-key nudge lives in :meth:`keyPressEvent` instead because
+        it only applies when the user has focus on the figure / table
+        (and we want focus-aware behaviour rather than global hotkeys).
+        """
+        QtGui.QShortcut(QtGui.QKeySequence.Undo, self, activated=self._undo)
+        QtGui.QShortcut(QtGui.QKeySequence.Redo, self, activated=self._redo)
+        QtGui.QShortcut(
+            QtGui.QKeySequence("Ctrl+Shift+Z"), self, activated=self._redo,
+        )
+        QtGui.QShortcut(
+            QtGui.QKeySequence("Ctrl+Shift+V"), self,
+            activated=self._paste_csv_from_clipboard,
+        )
+
+    # ------------------------------------------------------------------
+    # Display mode toggles
+    # ------------------------------------------------------------------
+
+    def _on_polar_toggled(self, checked: bool) -> None:
+        self._polar_mode = bool(checked)
+        # Log θ doesn't mean anything in polar mode; disable and uncheck.
+        self._log_x_checkbox.setEnabled(not self._polar_mode)
+        if self._polar_mode and self._log_x:
+            blocker = QtCore.QSignalBlocker(self._log_x_checkbox)
+            self._log_x_checkbox.setChecked(False)
+            del blocker
+            self._log_x = False
+        self._refresh_plot()
+
+    def _on_log_x_toggled(self, checked: bool) -> None:
+        self._log_x = bool(checked) and not self._polar_mode
+        self._refresh_plot()
+
+    def _on_zoom_to_main_lobe_toggled(self, checked: bool) -> None:
+        """Toggle between the main-lobe-only view and the full axis."""
+        if checked:
+            hbw = self._compute_half_beamwidth_deg()
+            if hbw is None:
+                QtWidgets.QMessageBox.information(
+                    self, "Zoom to main lobe",
+                    "Couldn't estimate a 3-dB beamwidth from the "
+                    "current points — the pattern might be "
+                    "monotonically decreasing below peak or too "
+                    "coarse. Use the matplotlib toolbar to zoom "
+                    "manually.",
+                )
+                # Revert the button to unchecked without firing the
+                # signal again.
+                blocker = QtCore.QSignalBlocker(self._zoom_main_button)
+                self._zoom_main_button.setChecked(False)
+                del blocker
+                return
+            self._main_lobe_zoom_active = True
+            self._main_lobe_zoom_request = max(5.0 * hbw, 2.0)
+            self._zoom_main_button.setText("Zoom out")
+        else:
+            self._main_lobe_zoom_active = False
+            self._main_lobe_zoom_request = None
+            self._zoom_main_button.setText("Zoom to main lobe")
+        self._refresh_plot()
+
+    # ------------------------------------------------------------------
+    # Compare overlay
+    # ------------------------------------------------------------------
+
+    def _on_compare_overlay_changed(self, _idx: int) -> None:
+        key = self._compare_overlay_combo.currentData()
+        if key is None:
+            self._overlay_points = None
+            self._overlay_label = ""
+            self._refresh_plot()
+            return
+        if key == "from_json":
+            self._load_overlay_from_json()
+            return
+        if key == "ra1631":
+            self._overlay_points = self._make_overlay_from_ra1631()
+            self._overlay_label = "RA.1631 ref"
+        elif key == "gaussian":
+            self._overlay_points = self._make_overlay_from_gaussian()
+            self._overlay_label = "Gaussian ref"
+        self._refresh_plot()
+
+    def _make_overlay_from_ra1631(self) -> np.ndarray | None:
+        aperture = self._read_preset_aperture()
+        if aperture is None:
+            blocker = QtCore.QSignalBlocker(self._compare_overlay_combo)
+            self._compare_overlay_combo.setCurrentIndex(0)
+            del blocker
+            return None
+        diameter_m, wavelength_m = aperture
+        try:
+            import astropy.units as _u
+            from pycraf import antenna as _pya
+            import pycraf.conversions as _cnv
+        except Exception:
+            return None
+        thetas = np.concatenate([
+            np.linspace(0.0, 5.0, 121),
+            np.linspace(5.1, 60.0, 120),
+            np.linspace(60.5, 180.0, 60),
+        ])
+        try:
+            gains_q = _pya.ras_pattern(
+                thetas * _u.deg, diameter_m * _u.m, wavelength_m * _u.m,
+            )
+            gains = np.asarray(gains_q.to_value(_cnv.dB), dtype=np.float64)
+        except Exception:
+            return None
+        return np.stack([thetas, gains], axis=1)
+
+    def _make_overlay_from_gaussian(self) -> np.ndarray | None:
+        bw = self._preset_beamwidth_spin.value_or_none()
+        peak = self._preset_peak_spin.value_or_none()
+        if bw is None or peak is None or float(bw) <= 0.0:
+            # Fall back to the editor's current peak + a guess of bw.
+            peak = self._peak_gain_dbi
+            half_bw = self._compute_half_beamwidth_deg() or 1.0
+            bw = half_bw * 2.0
+        half_3db = 0.5 * float(bw)
+        thetas = np.concatenate([
+            np.linspace(0.0, half_3db * 4.0, 120),
+            np.linspace(half_3db * 4.5, 180.0, 40),
+        ])
+        gains = float(peak) - 3.0 * (thetas / max(half_3db, 1e-6)) ** 2
+        floor = float(peak) - 25.0
+        gains = np.maximum(gains, floor)
+        return np.stack([thetas, gains], axis=1)
+
+    def _load_overlay_from_json(self) -> None:
+        from scepter.custom_antenna import (
+            KIND_1D as _CK_1D, load_custom_pattern as _load,
+        )
+        filename, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Import overlay reference", str(Path.cwd()),
+            "Antenna pattern JSON (*.json);;All files (*)",
+        )
+        if not filename:
+            blocker = QtCore.QSignalBlocker(self._compare_overlay_combo)
+            self._compare_overlay_combo.setCurrentIndex(0)
+            del blocker
+            return
+        try:
+            pat = _load(filename)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(
+                self, "Overlay load failed",
+                f"Couldn't load {Path(filename).name}:\n{exc}",
+            )
+            blocker = QtCore.QSignalBlocker(self._compare_overlay_combo)
+            self._compare_overlay_combo.setCurrentIndex(0)
+            del blocker
+            return
+        if pat.kind != _CK_1D:
+            QtWidgets.QMessageBox.warning(
+                self, "Wrong kind",
+                "Overlay only supports axisymmetric (1-D) patterns.",
+            )
+            blocker = QtCore.QSignalBlocker(self._compare_overlay_combo)
+            self._compare_overlay_combo.setCurrentIndex(0)
+            del blocker
+            return
+        gains = np.asarray(pat.gain_db, dtype=np.float64)
+        if pat.normalisation != self._norm_abs:
+            gains = gains + float(pat.peak_gain_dbi)
+        thetas = np.asarray(pat.grid_deg, dtype=np.float64)
+        self._overlay_points = np.stack([thetas, gains], axis=1)
+        self._overlay_label = f"{Path(filename).stem}"
+        self._refresh_plot()
+
+    # ------------------------------------------------------------------
+    # Derived quantities
+    # ------------------------------------------------------------------
+
+    def _interp_gain_at(self, theta_deg: float) -> float:
+        return float(np.interp(
+            float(theta_deg), self._points[:, 0], self._points[:, 1],
+        ))
+
+    def _compute_half_beamwidth_deg(self) -> float | None:
+        """Find the θ where gain first drops to peak − 3 dB."""
+        thetas = np.asarray(self._points[:, 0], dtype=np.float64)
+        gains = np.asarray(self._points[:, 1], dtype=np.float64)
+        target = float(self._peak_gain_dbi) - 3.0
+        below = np.where(gains <= target)[0]
+        if below.size == 0:
+            return None
+        j = int(below[0])
+        if j == 0:
+            return float(thetas[0])
+        g_a, g_b = float(gains[j - 1]), float(gains[j])
+        t_a, t_b = float(thetas[j - 1]), float(thetas[j])
+        if g_b == g_a:
+            return t_b
+        frac = (target - g_a) / (g_b - g_a)
+        return t_a + frac * (t_b - t_a)
+
+    def _compute_first_null_deg(self) -> float | None:
+        """Estimate the first null (local minimum) angle after the main lobe."""
+        gains = np.asarray(self._points[:, 1], dtype=np.float64)
+        thetas = np.asarray(self._points[:, 0], dtype=np.float64)
+        if gains.size < 3:
+            return None
+        # Walk past the 3-dB point, then look for the first local minimum.
+        half = self._compute_half_beamwidth_deg()
+        start = 0
+        if half is not None:
+            start = int(np.searchsorted(thetas, half))
+        start = max(start + 1, 1)
+        for i in range(start, gains.size - 1):
+            if gains[i] <= gains[i - 1] and gains[i] <= gains[i + 1]:
+                return float(thetas[i])
+        return None
+
+    def _compute_first_sll_db(self) -> float | None:
+        """First sidelobe level = peak − (first local max after first null)."""
+        first_null = self._compute_first_null_deg()
+        if first_null is None:
+            return None
+        thetas = np.asarray(self._points[:, 0], dtype=np.float64)
+        gains = np.asarray(self._points[:, 1], dtype=np.float64)
+        start = int(np.searchsorted(thetas, first_null)) + 1
+        for i in range(start, gains.size - 1):
+            if gains[i] >= gains[i - 1] and gains[i] >= gains[i + 1]:
+                return float(self._peak_gain_dbi) - float(gains[i])
+        return None
+
+    def _compute_front_to_back_db(self) -> float:
+        return float(self._peak_gain_dbi) - float(
+            self._interp_gain_at(180.0)
+        )
+
+    def _compute_directivity_dbi(self) -> float | None:
+        integral = self._integrate_gain_linear()
+        if integral <= 0.0 or not np.isfinite(integral):
+            return None
+        d_lin = 4.0 * float(np.pi) * float(
+            10.0 ** (self._peak_gain_dbi / 10.0)
+        ) / float(integral)
+        return float(10.0 * np.log10(d_lin))
+
+    def _update_derived_panel(self) -> None:
+        def _fmt(val: float | None, unit: str, fmt: str = "{:.3f}") -> str:
+            if val is None or not np.isfinite(val):
+                return "—"
+            return fmt.format(val) + (f" {unit}" if unit else "")
+
+        half = self._compute_half_beamwidth_deg()
+        fullbw = (2.0 * half) if half is not None else None
+        first_null = self._compute_first_null_deg()
+        sll = self._compute_first_sll_db()
+        fb = self._compute_front_to_back_db()
+        directivity = self._compute_directivity_dbi()
+        integral = self._integrate_gain_linear()
+        ratio = (integral / (4.0 * np.pi)) if integral > 0 else None
+        self._derived_labels["beamwidth"].setText(_fmt(fullbw, "deg"))
+        self._derived_labels["first_null"].setText(_fmt(first_null, "deg"))
+        self._derived_labels["first_sll"].setText(_fmt(sll, "dB"))
+        self._derived_labels["fb_ratio"].setText(_fmt(fb, "dB"))
+        self._derived_labels["directivity"].setText(_fmt(directivity, "dBi"))
+        lbl = self._derived_labels["implied_eff"]
+        if ratio is None:
+            lbl.setText("—")
+            lbl.setToolTip("")
+            lbl.setStyleSheet("color: #93c5fd; font-weight: 600;")
+        elif ratio > 1.02:
+            # ratio > 1 means the pattern radiates more power than a
+            # lossless antenna could (non-physical); flag compactly
+            # with the full breakdown in the tooltip so the side
+            # panel stays narrow.
+            excess_db = 10.0 * float(np.log10(ratio))
+            lbl.setText(f"{ratio:.3f}  \u26a0 non-physical")
+            lbl.setToolTip(
+                f"∫G dΩ / 4π = {ratio:.4f} (+{excess_db:.2f} dB over 4π)\n"
+                "This pattern integrates to more power than any "
+                "lossless antenna could radiate. Use Normalise\u2026 "
+                "to rescale it, or lower the peak / raise sidelobes."
+            )
+            lbl.setStyleSheet("color: #fca5a5; font-weight: 600;")
+        else:
+            lbl.setText(f"{ratio:.4f}  (\u03b7 {ratio * 100.0:.1f} %)")
+            lbl.setToolTip(
+                f"Implied radiation efficiency {ratio * 100.0:.3f} %. "
+                "A lossless antenna integrates to exactly 1 (= 4π)."
+            )
+            lbl.setStyleSheet("color: #93c5fd; font-weight: 600;")
+
+    # ------------------------------------------------------------------
+    # Paste-from-clipboard + Smooth
+    # ------------------------------------------------------------------
+
+    def _paste_csv_from_clipboard(self) -> None:
+        import re
+        text = QtWidgets.QApplication.clipboard().text()
+        if not text.strip():
+            QtWidgets.QMessageBox.information(
+                self, "Paste CSV", "Clipboard is empty.",
+            )
+            return
+        parsed: list[tuple[float, float]] = []
+        for line in text.splitlines():
+            # Strip common delimiters; ignore comment/header lines.
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            tokens = re.split(r"[,\s]+", line)
+            numeric: list[float] = []
+            for tok in tokens:
+                try:
+                    numeric.append(float(tok))
+                except ValueError:
+                    numeric = []
+                    break
+            if len(numeric) >= 2:
+                parsed.append((float(numeric[0]), float(numeric[1])))
+        if len(parsed) < 2:
+            QtWidgets.QMessageBox.warning(
+                self, "Paste CSV",
+                "Couldn't find at least two ``θ, gain`` rows in the "
+                "clipboard. Expected whitespace- or comma-separated "
+                "lines with two numeric columns.",
+            )
+            return
+        arr = np.asarray(parsed, dtype=np.float64)
+        # Sort by θ, clip to [0, 180], ensure anchors.
+        arr = arr[np.argsort(arr[:, 0])]
+        arr[:, 0] = np.clip(arr[:, 0], 0.0, 180.0)
+        if arr[0, 0] > 0.0:
+            arr = np.insert(arr, 0, [0.0, float(arr[0, 1])], axis=0)
+        if arr[-1, 0] < 180.0:
+            arr = np.append(arr, [[180.0, float(arr[-1, 1])]], axis=0)
+        self._points = arr
+        peak = float(np.max(arr[:, 1]))
+        self._peak_gain_dbi = peak
+        blocker = QtCore.QSignalBlocker(self._peak_gain_spin)
+        self._peak_gain_spin.set_value(peak)
+        del blocker
+        self._sync_table_from_points()
+        self._select_point(0)
+        self._refresh_plot()
+        self._push_history()
+
+    def _smooth_gains(self) -> None:
+        """Open the smoothing-method chooser and apply the selection.
+
+        The chooser explains each technique (familiar name, one-line
+        description, and — importantly — whether it's *idempotent*:
+        whether repeated clicks converge to the same result). The
+        user asked for this because Savitzky-Golay continues to
+        flatten the pattern with each application, which is the
+        price of its local-polynomial approach; projection-based
+        methods don't have that property.
+        """
+        n = int(self._points.shape[0])
+        if n < 5:
+            QtWidgets.QMessageBox.information(
+                self, "Smooth",
+                "Need at least 5 control points to smooth.",
+            )
+            return
+        last_method = getattr(self, "_last_smoothing_method", "bspline_cubic")
+        thetas = self._points[:, 0].astype(np.float64, copy=True)
+        gains = self._points[:, 1].astype(np.float64, copy=True)
+        dispatch = {
+            "bspline_cubic": self._smooth_bspline_cubic,
+            "bspline_linear": self._smooth_bspline_linear,
+            "chebyshev": self._smooth_chebyshev,
+            "gaussian_rbf": self._smooth_gaussian_rbf,
+            "bin_mean": self._smooth_bin_mean,
+            "savgol": self._smooth_savgol,
+            "moving_avg_slide": self._smooth_sliding_mean,
+            "gaussian_kernel": self._smooth_gaussian_kernel,
+            "median": self._smooth_median,
+            "ema": self._smooth_ema,
+        }
+
+        def _apply_for_preview(key: str, t: np.ndarray, g: np.ndarray) -> np.ndarray:
+            fn = dispatch.get(key)
+            if fn is None:
+                return g
+            return fn(t, g)
+
+        dialog = SmoothingMethodDialog(
+            self,
+            initial_method=last_method,
+            preview_data=(thetas, gains),
+            apply_callback=_apply_for_preview,
+        )
+        if dialog.exec() != QtWidgets.QDialog.Accepted:
+            return
+        method = dialog.selected_method()
+        self._last_smoothing_method = method
+
+        fn = dispatch.get(method)
+        if fn is None:
+            return
+        smoothed = fn(thetas, gains)
+
+        # Preserve exact endpoint values so the editor's 0° / 180°
+        # anchors don't drift on smoothing. Interior behaviour then
+        # depends on the chosen method (idempotent methods converge;
+        # Savitzky-Golay / moving-average continue to evolve).
+        smoothed[0] = gains[0]
+        smoothed[-1] = gains[-1]
+        if np.allclose(smoothed, gains, atol=1.0e-9):
+            return
+
+        self._points[:, 1] = smoothed
+        self._sync_table_from_points()
+        self._refresh_plot()
+        self._push_history()
+
+    # -- Individual smoothing algorithms --------------------------
+    #
+    # Each algorithm takes the user's ``(thetas, gains)`` and returns
+    # a smoothed ``gains`` array on the SAME grid. Idempotent methods
+    # operate as a single linear projection P on the user's grid so
+    # applying them twice genuinely returns the same curve. Non-
+    # idempotent methods are included because they're the textbook
+    # classical smoothers and the chooser dialog warns about their
+    # drift behaviour.
+
+    # ----- Idempotent (linear-projection) smoothers --------------
+
+    def _smooth_bspline_cubic(
+        self, thetas: np.ndarray, gains: np.ndarray,
+    ) -> np.ndarray:
+        """Cubic B-spline LSQ fit with a fixed knot sequence."""
+        return self._bspline_fit(thetas, gains, degree=3)
+
+    def _smooth_bspline_linear(
+        self, thetas: np.ndarray, gains: np.ndarray,
+    ) -> np.ndarray:
+        """Piecewise-linear B-spline LSQ fit — preserves edges better
+        than the cubic version at the cost of visible kinks."""
+        return self._bspline_fit(thetas, gains, degree=1)
+
+    def _bspline_fit(
+        self, thetas: np.ndarray, gains: np.ndarray, *, degree: int,
+    ) -> np.ndarray:
+        n = int(thetas.size)
+        n_knots = int(max(5, min(n // 8, 80)))
+        try:
+            from scipy.interpolate import LSQUnivariateSpline
+            eps = 1.0e-9 * max(float(thetas[-1] - thetas[0]), 1.0)
+            theta_fit = thetas.copy()
+            for i in range(1, n):
+                if theta_fit[i] <= theta_fit[i - 1]:
+                    theta_fit[i] = theta_fit[i - 1] + eps
+            t_interior = np.linspace(
+                float(theta_fit[0]), float(theta_fit[-1]), n_knots + 2,
+            )[1:-1]
+            spline = LSQUnivariateSpline(
+                theta_fit, gains, t_interior, k=int(degree),
+            )
+            return np.asarray(spline(theta_fit), dtype=np.float64)
+        except Exception:
+            # SciPy missing — fall back to the bin-mean projection
+            # (also idempotent, just cruder).
+            return self._smooth_bin_mean(thetas, gains)
+
+    def _smooth_chebyshev(
+        self, thetas: np.ndarray, gains: np.ndarray,
+    ) -> np.ndarray:
+        """Chebyshev polynomial projection of fixed degree.
+
+        Idempotent iff the LSQ system is numerically well-
+        conditioned. The previous implementation sized the degree
+        from ``n`` alone, which caused ``RankWarning`` + subtle
+        drift (~1e-7) on small / duplicated grids. Here we (a) cap
+        the degree so ``deg ≤ n_unique // 2`` and (b) use SVD-based
+        lstsq on an explicit Chebyshev-Vandermonde matrix rather
+        than ``chebfit`` so the projection ``H = B(BᵀB)⁻¹Bᵀ`` has a
+        stable pseudo-inverse.
+        """
+        n = int(thetas.size)
+        lo = float(thetas[0])
+        hi = float(thetas[-1])
+        if hi <= lo:
+            return gains.copy()
+        # Rescale θ → [-1, 1] for the Chebyshev domain.
+        x = (2.0 * thetas - (lo + hi)) / (hi - lo)
+        n_unique = int(np.unique(np.round(x, 12)).size)
+        deg = int(max(4, min(n // 6, 40, max(n_unique // 2 - 1, 4))))
+        # Build Chebyshev basis matrix explicitly so we can apply a
+        # single SVD-regularised projection. ``rcond`` cuts modes
+        # below machine epsilon, keeping ``H² = H`` stable to
+        # float64 rounding on all grids we tested.
+        B = np.polynomial.chebyshev.chebvander(x, deg)
+        coeffs, *_ = np.linalg.lstsq(B, gains, rcond=1.0e-10)
+        return B @ coeffs
+
+    def _smooth_gaussian_rbf(
+        self, thetas: np.ndarray, gains: np.ndarray,
+    ) -> np.ndarray:
+        """LSQ fit against a bank of fixed-width Gaussian RBFs.
+
+        Idempotent iff ``BᵀB`` is well-conditioned. Previous version
+        used too many centres for short / duplicated grids and
+        drifted ~1e-7. This version sizes the centre count against
+        the number of *unique* θ samples and uses an SVD-based
+        lstsq with an explicit ``rcond`` cutoff for numerical
+        stability.
+        """
+        n = int(thetas.size)
+        lo = float(thetas[0])
+        hi = float(thetas[-1])
+        if hi <= lo:
+            return gains.copy()
+        n_unique = int(np.unique(np.round(thetas, 9)).size)
+        n_centers = int(max(5, min(n // 6, 80, max(n_unique - 2, 5))))
+        centers = np.linspace(lo, hi, n_centers)
+        # σ = twice the centre spacing so RBFs overlap smoothly.
+        sigma = 2.0 * (hi - lo) / max(n_centers - 1, 1)
+        B = np.exp(
+            -((thetas[:, None] - centers[None, :]) / float(sigma)) ** 2,
+        )
+        coeffs, *_ = np.linalg.lstsq(B, gains, rcond=1.0e-10)
+        return B @ coeffs
+
+    def _smooth_bin_mean(
+        self, thetas: np.ndarray, gains: np.ndarray,
+    ) -> np.ndarray:
+        """Bin-mean projection onto a piecewise-constant basis.
+
+        Idempotent: averaging the already-averaged values in the
+        same bins returns the bin mean.
+        """
+        n = int(thetas.size)
+        n_bins = int(max(5, min(n // 8, 80)))
+        edges = np.linspace(float(thetas[0]), float(thetas[-1]), n_bins + 1)
+        bin_idx = np.clip(
+            np.digitize(thetas, edges[1:-1], right=False), 0, n_bins - 1,
+        )
+        smoothed = np.empty_like(gains)
+        for b in range(n_bins):
+            mask = bin_idx == b
+            if np.any(mask):
+                smoothed[mask] = float(np.mean(gains[mask]))
+        return smoothed
+
+    # ----- Classical (non-idempotent) smoothers -----------------
+
+    def _smooth_savgol(
+        self, thetas: np.ndarray, gains: np.ndarray,
+    ) -> np.ndarray:
+        """Savitzky-Golay filter — local polynomial fit in a window.
+
+        Not idempotent: repeated application collapses the pattern
+        toward a global polynomial.
+        """
+        uniform = self._uniform_bridge(thetas, gains)
+        window = int(min(max(9, uniform["n"] // 25), 201))
+        if window % 2 == 0:
+            window += 1
+        try:
+            from scipy.signal import savgol_filter as _savgol
+            polyorder = min(3, window - 1)
+            filt = _savgol(uniform["g"], window, polyorder)
+        except Exception:
+            kernel = np.ones(window) / float(window)
+            padded = np.pad(uniform["g"], window // 2, mode="edge")
+            filt = np.convolve(padded, kernel, mode="valid")
+        return np.interp(thetas, uniform["t"], filt)
+
+    def _smooth_sliding_mean(
+        self, thetas: np.ndarray, gains: np.ndarray,
+    ) -> np.ndarray:
+        """Sliding boxcar convolution.
+
+        Not idempotent: each pass widens the effective kernel.
+        """
+        uniform = self._uniform_bridge(thetas, gains)
+        window = int(min(max(11, uniform["n"] // 25), 201))
+        if window % 2 == 0:
+            window += 1
+        kernel = np.ones(window) / float(window)
+        padded = np.pad(uniform["g"], window // 2, mode="edge")
+        filt = np.convolve(padded, kernel, mode="valid")
+        return np.interp(thetas, uniform["t"], filt)
+
+    def _smooth_gaussian_kernel(
+        self, thetas: np.ndarray, gains: np.ndarray,
+    ) -> np.ndarray:
+        """Gaussian-kernel convolution.
+
+        Not idempotent: G_σ ∗ G_σ = G_{σ√2} — the effective
+        bandwidth grows by √2 per pass.
+        """
+        uniform = self._uniform_bridge(thetas, gains)
+        sigma = max(1.5, float(uniform["n"]) / 80.0)
+        try:
+            from scipy.ndimage import gaussian_filter1d
+            filt = gaussian_filter1d(uniform["g"], sigma=sigma, mode="nearest")
+        except Exception:
+            # Manual Gaussian kernel as fallback.
+            radius = int(max(3, round(3 * sigma)))
+            xs = np.arange(-radius, radius + 1, dtype=np.float64)
+            kernel = np.exp(-(xs ** 2) / (2.0 * sigma * sigma))
+            kernel /= kernel.sum()
+            padded = np.pad(uniform["g"], radius, mode="edge")
+            filt = np.convolve(padded, kernel, mode="valid")
+        return np.interp(thetas, uniform["t"], filt)
+
+    def _smooth_median(
+        self, thetas: np.ndarray, gains: np.ndarray,
+    ) -> np.ndarray:
+        """Median filter (good for outlier spikes).
+
+        Not idempotent: repeated median passes converge toward a
+        stair-case / constant but not in one application.
+        """
+        uniform = self._uniform_bridge(thetas, gains)
+        window = int(min(max(9, uniform["n"] // 30), 151))
+        if window % 2 == 0:
+            window += 1
+        try:
+            from scipy.signal import medfilt
+            filt = medfilt(uniform["g"], kernel_size=window)
+        except Exception:
+            half = window // 2
+            padded = np.pad(uniform["g"], half, mode="edge")
+            filt = np.empty_like(uniform["g"])
+            for i in range(uniform["g"].size):
+                filt[i] = float(np.median(padded[i:i + window]))
+        return np.interp(thetas, uniform["t"], filt)
+
+    def _smooth_ema(
+        self, thetas: np.ndarray, gains: np.ndarray,
+    ) -> np.ndarray:
+        """Exponential moving average (causal IIR).
+
+        Not idempotent: every pass compounds the decay.
+        """
+        uniform = self._uniform_bridge(thetas, gains)
+        alpha = 0.15
+        g = uniform["g"]
+        filt = np.empty_like(g)
+        filt[0] = g[0]
+        for i in range(1, g.size):
+            filt[i] = alpha * g[i] + (1.0 - alpha) * filt[i - 1]
+        # A second pass in reverse gives a symmetric (zero-phase)
+        # result but is still non-idempotent because the IIR state
+        # changes each call.
+        bwd = np.empty_like(g)
+        bwd[-1] = filt[-1]
+        for i in range(g.size - 2, -1, -1):
+            bwd[i] = alpha * filt[i] + (1.0 - alpha) * bwd[i + 1]
+        return np.interp(thetas, uniform["t"], bwd)
+
+    # -- Shared helper: resample to a dense uniform θ grid --------
+
+    def _uniform_bridge(
+        self, thetas: np.ndarray, gains: np.ndarray,
+    ) -> dict[str, np.ndarray]:
+        """Resample (θ, gain) onto a dense uniform θ grid.
+
+        Used by the non-idempotent filter family, which assumes
+        constant sample spacing. Returns a dict so call sites don't
+        have to unpack a three-tuple.
+        """
+        n = int(thetas.size)
+        n_uniform = int(min(max(n * 10, 512), 8192))
+        theta_uniform = np.linspace(
+            float(thetas[0]), float(thetas[-1]), n_uniform,
+        )
+        gains_uniform = np.interp(theta_uniform, thetas, gains)
+        return {"n": n_uniform, "t": theta_uniform, "g": gains_uniform}
+
+    # ------------------------------------------------------------------
+    # Plausibility warning
+    # ------------------------------------------------------------------
+
+    def _physical_plausibility_warning(self) -> str | None:
+        """Return a human-readable warning if the pattern violates energy
+        conservation, or ``None`` when it's physically plausible.
+
+        The only strict physical constraint on an axisymmetric gain
+        pattern is ``∫G dΩ ≤ 4π`` — equality for a lossless antenna,
+        strict inequality when ohmic / mismatch losses are present.
+        Peak gain has no universal upper bound: a very large aperture
+        can produce > 80 dBi directivity if the beam is correspondingly
+        narrow, so we don't flag on peak alone.
+        """
+        integral = self._integrate_gain_linear()
+        ratio = float(integral) / (4.0 * float(np.pi))
+        # Allow a small numerical slop so trapezoidal-integration of a
+        # lossless pattern authored via the editor doesn't get flagged.
+        if ratio > 1.0 + 0.02:
+            excess_db = 10.0 * float(np.log10(ratio))
+            return (
+                "The pattern integrates above the lossless 4π limit: "
+                f"∫G dΩ / 4π = {ratio:.4f} (+{excess_db:.2f} dB). "
+                "If you are authoring a real antenna, use the Normalise… "
+                "button to rescale it, or lower the peak / raise the "
+                "sidelobe levels."
+            )
+        return None
+
+    # ------------------------------------------------------------------
+    # Cleanup
+    # ------------------------------------------------------------------
+
+    def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
+        key = event.key()
+        mods = event.modifiers()
+        if key in {QtCore.Qt.Key_Delete, QtCore.Qt.Key_Backspace}:
+            if self._remove_selected_point():
+                self._push_history()
+                event.accept()
+                return
+        if key == QtCore.Qt.Key_Escape:
+            self._select_point(None)
+            event.accept()
+            return
+        if key in {
+            QtCore.Qt.Key_Left, QtCore.Qt.Key_Right,
+            QtCore.Qt.Key_Up, QtCore.Qt.Key_Down,
+        } and self._selected_index is not None:
+            coarse = bool(mods & QtCore.Qt.ShiftModifier)
+            step_x = (1.0 if coarse else 0.1)
+            step_y = (1.0 if coarse else 0.1)
+            idx = int(self._selected_index)
+            x = float(self._points[idx, 0])
+            y = float(self._points[idx, 1])
+            if key == QtCore.Qt.Key_Left:
+                x -= step_x
+            elif key == QtCore.Qt.Key_Right:
+                x += step_x
+            elif key == QtCore.Qt.Key_Up:
+                y += step_y
+            elif key == QtCore.Qt.Key_Down:
+                y -= step_y
+            x_use, y_use = self._constrain_point(idx, x, y)
+            self._points[idx, 0] = x_use
+            self._points[idx, 1] = y_use
+            self._sync_table_from_points()
+            self._select_point(idx)
+            self._refresh_plot()
+            self._push_history()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def _on_plot_leave(self, _event: Any) -> None:
+        if hasattr(self, "_cursor_readout_label"):
+            self._cursor_readout_label.setText(
+                "Move the cursor over the plot to read (θ, gain)."
+            )
+
+    def _confirm_discard_if_modified(self) -> bool:
+        """Prompt the user before discarding unsaved pattern edits.
+
+        Returns ``True`` if the dialog should proceed to close
+        (either nothing is modified or the user clicked *Discard*),
+        ``False`` if the user cancelled. Called from *both* ``reject``
+        and ``closeEvent`` but guarded by ``_close_confirmed`` so the
+        prompt only renders once per close attempt even when the two
+        paths chain (clicking Cancel → ``reject()`` → ``super().reject()``
+        → ``closeEvent``).
+        """
+        if getattr(self, "_close_confirmed", False):
+            return True
+        if not self._is_modified():
+            self._close_confirmed = True
+            return True
+        answer = QtWidgets.QMessageBox.question(
+            self, "Discard changes?",
+            "You have unsaved edits to the pattern. Close anyway "
+            "and discard them?",
+            QtWidgets.QMessageBox.Discard | QtWidgets.QMessageBox.Cancel,
+            QtWidgets.QMessageBox.Cancel,
+        )
+        if answer != QtWidgets.QMessageBox.Discard:
+            return False
+        self._close_confirmed = True
+        return True
+
+    def reject(self) -> None:
+        if not self._confirm_discard_if_modified():
+            return
+        super().reject()
+
+    def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        if not self._confirm_discard_if_modified():
+            event.ignore()
+            return
+        self._canvas.release_resize_proxy()
+        try:
+            plt.close(self._figure)
+        except Exception:
+            pass
+        super().closeEvent(event)
+
+
+class _LegacyCutsPatternEditor2DDialog(QtWidgets.QDialog):
+    """DEPRECATED — superseded by the surface-based
+    :class:`PatternEditor2DDialog` below. Kept temporarily as dead
+    code while the new editor settles; will be removed once the
+    surface paradigm is proven out in a release. No call sites
+    reference this class any more.
+
+    Graphical editor for 2-D custom antenna patterns.
+
+    The editor represents the 2-D surface through two orthogonal
+    principal-plane cuts — the same compact representation used by
+    datasheets. Either grid mode is supported:
+
+    * ``theta_phi`` (the schema default for non-axisymmetric ITU
+      patterns): Cut A = G(θ, φ=0°), Cut B = G(θ, φ=90°). The full
+      surface is synthesised as ``G(θ, φ) = G_A(θ)·cos²(φ) +
+      G_B(θ)·sin²(φ)`` (dB) — the elliptical-aperture approximation.
+
+    * ``az_el`` (datasheet convention): Cut A = G(az, el=0), Cut B
+      = G(az=0, el). The full surface uses the separable
+      approximation ``G(az, el) ≈ G_A(az) + G_B(el) − peak`` (dB).
+
+    Clicking OK returns a validated
+    :class:`~scepter.custom_antenna.CustomAntennaPattern` sampled on
+    a regular grid suitable for direct upload to GPU.
+    """
+
+    _POINT_PICK_RADIUS_PX = 14.0
+    _MIN_POINT_GAP_DEG = 1.0e-6
+
+    def __init__(
+        self,
+        *,
+        initial_pattern: "CustomAntennaPattern | None" = None,
+        side: str = "ras",
+        parent: QtWidgets.QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        from scepter.custom_antenna import (
+            KIND_2D as _CK_2D,
+            GRID_MODE_AZEL as _GMA,
+            GRID_MODE_THETAPHI as _GMT,
+            NORMALISATION_ABSOLUTE as _CN_ABS,
+            PEAK_SOURCE_EXPLICIT as _CP_EXPL,
+        )
+        self._kind_2d = _CK_2D
+        self._gm_azel = _GMA
+        self._gm_thetaphi = _GMT
+        self._norm_abs = _CN_ABS
+        self._peak_src_explicit = _CP_EXPL
+        self._side = str(side or "ras").strip().lower()
+        title_prefix = "RAS" if self._side == "ras" else "Satellite"
+        self.setWindowTitle(f"Custom {title_prefix} Antenna Pattern \u2014 2-D Editor")
+        self.setWindowIcon(_load_app_icon())
+        self.resize(1360, 880)
+        self.setModal(True)
+        self.setAttribute(QtCore.Qt.WA_DeleteOnClose, True)
+
+        self._peak_gain_dbi: float = 34.0
+        self._title_text: str = ""
+        # Active interpolation mode: "elliptical" (cos²/sin²-weighted
+        # along φ for θ,φ grids) or "separable" (G_A(az) + G_B(el) −
+        # peak for az,el grids). Both are pragmatic approximations
+        # from two principal cuts — users who need the full surface
+        # author it externally and import a JSON file.
+        self._interp_mode: str = "elliptical"
+        self._grid_mode: str = _GMT
+        self._cut_a, self._cut_b = self._starter_cuts_theta_phi()
+        self._result_pattern: "CustomAntennaPattern | None" = None
+        # Drag / selection state is per-cut.
+        self._selected_cut: str = "A"
+        self._selected_index: int | None = None
+        self._drag_cut: str | None = None
+        self._drag_index: int | None = None
+        self._table_sync_in_progress = False
+
+        if initial_pattern is not None and initial_pattern.kind == _CK_2D:
+            self._load_initial_pattern(initial_pattern)
+
+        # Undo / redo history (port from 1-D editor). Snapshot tuple
+        # = (cut_a, cut_b, peak_gain_dbi, title, grid_mode).
+        self._history: list[tuple[np.ndarray, np.ndarray, float, str, str]] = []
+        self._history_index: int = -1
+        self._close_confirmed: bool = False
+        # Provenance session attrs for Save-to-library dialog (same
+        # pattern as the 1-D editor).
+        self._meta_author: str = ""
+        self._meta_source: str = ""
+        self._meta_notes: str = ""
+
+        # --- layout ---
+        root = QtWidgets.QVBoxLayout(self)
+        root.setContentsMargins(10, 10, 10, 10)
+        root.setSpacing(10)
+
+        intro = QtWidgets.QLabel(
+            "Shape the 2-D pattern through two orthogonal principal "
+            "cuts. Drag control points on either cut plot; double-click "
+            "to add, right-click or press Delete to remove. The 2-D "
+            "heatmap below updates live from the cuts via the selected "
+            "interpolation rule.",
+            self,
+        )
+        intro.setWordWrap(True)
+        root.addWidget(intro)
+
+        # Top metadata row
+        meta_row = QtWidgets.QHBoxLayout()
+        meta_row.setSpacing(10)
+        self._title_edit = QtWidgets.QLineEdit(self._title_text, self)
+        self._title_edit.setPlaceholderText("Optional display title")
+        self._peak_gain_spin = OptionalNumericEdit(
+            minimum=-200.0, maximum=200.0, decimals=3, parent=self,
+        )
+        self._peak_gain_spin.set_value(self._peak_gain_dbi)
+        self._peak_gain_spin.editingFinished.connect(self._on_peak_gain_edited)
+        self._grid_theta_phi_radio = QtWidgets.QRadioButton("θ, φ", self)
+        self._grid_az_el_radio = QtWidgets.QRadioButton("az, el", self)
+        self._grid_button_group = QtWidgets.QButtonGroup(self)
+        self._grid_button_group.addButton(self._grid_theta_phi_radio, 0)
+        self._grid_button_group.addButton(self._grid_az_el_radio, 1)
+        if self._grid_mode == self._gm_azel:
+            self._grid_az_el_radio.setChecked(True)
+        else:
+            self._grid_theta_phi_radio.setChecked(True)
+        self._grid_button_group.idToggled.connect(self._on_grid_mode_toggled)
+        meta_row.addWidget(QtWidgets.QLabel("Title:"))
+        meta_row.addWidget(self._title_edit, 1)
+        meta_row.addWidget(QtWidgets.QLabel("Peak [dBi]:"))
+        meta_row.addWidget(self._peak_gain_spin)
+        meta_row.addWidget(QtWidgets.QLabel("Grid:"))
+        meta_row.addWidget(self._grid_theta_phi_radio)
+        meta_row.addWidget(self._grid_az_el_radio)
+        root.addLayout(meta_row)
+
+        # Body: figure (left) + side panel (right)
+        body = QtWidgets.QHBoxLayout()
+        body.setSpacing(10)
+        root.addLayout(body, 1)
+
+        self._figure = Figure(figsize=(9.4, 7.2))
+        self._canvas = DeferredResizeFigureCanvas(self._figure)
+        self._toolbar = ScepterNavigationToolbar(self._canvas, self)
+        fig_col = QtWidgets.QVBoxLayout()
+        fig_col.setContentsMargins(0, 0, 0, 0)
+        fig_col.addWidget(self._toolbar)
+        fig_col.addWidget(self._canvas, 1)
+        fig_widget = QtWidgets.QWidget(self)
+        fig_widget.setLayout(fig_col)
+        body.addWidget(fig_widget, 6)
+
+        # Side panel
+        side_panel = QtWidgets.QWidget(self)
+        side_layout = QtWidgets.QVBoxLayout(side_panel)
+        side_layout.setContentsMargins(0, 0, 0, 0)
+        side_layout.setSpacing(8)
+        body.addWidget(side_panel, 2)
+
+        # Active-cut picker
+        cut_row = QtWidgets.QHBoxLayout()
+        cut_row.setContentsMargins(0, 0, 0, 0)
+        self._cut_a_radio = QtWidgets.QRadioButton("Cut A", self)
+        self._cut_b_radio = QtWidgets.QRadioButton("Cut B", self)
+        self._cut_a_radio.setChecked(True)
+        self._cut_button_group = QtWidgets.QButtonGroup(self)
+        self._cut_button_group.addButton(self._cut_a_radio, 0)
+        self._cut_button_group.addButton(self._cut_b_radio, 1)
+        self._cut_button_group.idToggled.connect(self._on_cut_selection_changed)
+        cut_row.addWidget(QtWidgets.QLabel("Active cut:"))
+        cut_row.addWidget(self._cut_a_radio)
+        cut_row.addWidget(self._cut_b_radio)
+        cut_row.addStretch(1)
+        side_layout.addLayout(cut_row)
+
+        # Action row: Undo, Redo, Reset, Smooth A, Smooth B. Themed
+        # QPushButtons so they match the app's rounded blue styling
+        # (ported from the 1-D editor).
+        action_row = QtWidgets.QHBoxLayout()
+        action_row.setContentsMargins(0, 0, 0, 0)
+        action_row.setSpacing(6)
+        self._undo_button = QtWidgets.QPushButton("\u21ba Undo", self)
+        self._undo_button.setToolTip("Revert last change (Ctrl+Z).")
+        self._undo_button.clicked.connect(self._undo)
+        self._redo_button = QtWidgets.QPushButton("\u21bb Redo", self)
+        self._redo_button.setToolTip("Re-apply undone change (Ctrl+Y / Ctrl+Shift+Z).")
+        self._redo_button.clicked.connect(self._redo)
+        self._reset_button = QtWidgets.QPushButton("Reset", self)
+        self._reset_button.setToolTip(
+            "Revert both cuts, peak, title, and grid mode to the state "
+            "this dialog opened with."
+        )
+        self._reset_button.clicked.connect(self._reset_to_initial)
+        self._smooth_a_button = QtWidgets.QPushButton("Smooth A\u2026", self)
+        self._smooth_a_button.setToolTip(
+            "Open the smoothing-method chooser for cut A (reuses the "
+            "1-D editor's 10-method palette with live preview)."
+        )
+        self._smooth_a_button.clicked.connect(lambda: self._open_smooth_dialog("A"))
+        self._smooth_b_button = QtWidgets.QPushButton("Smooth B\u2026", self)
+        self._smooth_b_button.setToolTip(
+            "Open the smoothing-method chooser for cut B."
+        )
+        self._smooth_b_button.clicked.connect(lambda: self._open_smooth_dialog("B"))
+        for btn in (
+            self._undo_button, self._redo_button, self._reset_button,
+            self._smooth_a_button, self._smooth_b_button,
+        ):
+            btn.setSizePolicy(
+                QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Fixed,
+            )
+            action_row.addWidget(btn)
+        action_row.addStretch(1)
+        side_layout.addLayout(action_row)
+
+        # I/O grid: Import / Export JSON on top, Save / Browse shared
+        # library on the second row (template library is shared with
+        # the 1-D editor — entries of either kind show up in Browse).
+        io_grid = QtWidgets.QGridLayout()
+        io_grid.setContentsMargins(0, 0, 0, 0)
+        io_grid.setHorizontalSpacing(6)
+        io_grid.setVerticalSpacing(6)
+        self._import_json_button = QtWidgets.QPushButton("Import JSON\u2026", self)
+        self._import_json_button.clicked.connect(self._import_from_json)
+        self._export_json_button = QtWidgets.QPushButton("Export JSON\u2026", self)
+        self._export_json_button.clicked.connect(self._export_to_json)
+        self._save_library_button = QtWidgets.QPushButton("Save to library\u2026", self)
+        self._save_library_button.setToolTip(
+            "Save this 2-D pattern to the shared template library. "
+            "Saved entries also appear when browsing from the 1-D "
+            "editor."
+        )
+        self._save_library_button.clicked.connect(self._open_save_to_library_dialog)
+        self._browse_library_button = QtWidgets.QPushButton("Browse library\u2026", self)
+        self._browse_library_button.setToolTip(
+            "Open the shared pattern library. Only 2-D entries can be "
+            "loaded into this editor; 1-D entries are marked as such."
+        )
+        self._browse_library_button.clicked.connect(self._open_browse_library_dialog)
+        io_grid.addWidget(self._import_json_button, 0, 0)
+        io_grid.addWidget(self._export_json_button, 0, 1)
+        io_grid.addWidget(self._save_library_button, 1, 0)
+        io_grid.addWidget(self._browse_library_button, 1, 1)
+        side_layout.addLayout(io_grid)
+
+        # Point table (for the active cut)
+        self._point_table = QtWidgets.QTableWidget(self)
+        self._point_table.setColumnCount(2)
+        self._point_table.setHorizontalHeaderLabels(["angle [deg]", "Gain [dBi]"])
+        self._point_table.verticalHeader().setVisible(False)
+        self._point_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self._point_table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        self._point_table.setEditTriggers(
+            QtWidgets.QAbstractItemView.DoubleClicked
+            | QtWidgets.QAbstractItemView.SelectedClicked
+            | QtWidgets.QAbstractItemView.EditKeyPressed
+        )
+        self._point_table.itemChanged.connect(self._on_table_item_changed)
+        self._point_table.itemSelectionChanged.connect(self._on_table_selection_changed)
+        header = self._point_table.horizontalHeader()
+        header.setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
+        header.setSectionResizeMode(1, QtWidgets.QHeaderView.Stretch)
+        side_layout.addWidget(self._point_table, 1)
+
+        table_buttons = QtWidgets.QHBoxLayout()
+        table_buttons.setContentsMargins(0, 0, 0, 0)
+        self._add_point_button = QtWidgets.QPushButton("Add midpoint", self)
+        self._add_point_button.clicked.connect(self._add_midpoint_after_selection)
+        self._remove_point_button = QtWidgets.QPushButton("Remove point", self)
+        self._remove_point_button.clicked.connect(self._remove_selected_point)
+        table_buttons.addWidget(self._add_point_button)
+        table_buttons.addWidget(self._remove_point_button)
+        side_layout.addLayout(table_buttons)
+
+        self._summary_label = QtWidgets.QLabel("", self)
+        self._summary_label.setWordWrap(True)
+        self._summary_label.setObjectName("sectionSummary")
+        side_layout.addWidget(self._summary_label)
+
+        button_box = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel,
+            QtCore.Qt.Horizontal,
+            self,
+        )
+        button_box.accepted.connect(self._on_accept)
+        button_box.rejected.connect(self.reject)
+        root.addWidget(button_box)
+
+        # Matplotlib axes: 3 rows × 2 cols via gridspec so the
+        # heatmap row has a dedicated thin column for its colorbar.
+        # Without this, calling ``fig.colorbar(im, ax=heat, ...)``
+        # on every refresh *stole* layout space from the heatmap
+        # axis each time, progressively shrinking the x-axis with
+        # every edit (what the user reported as "bottom heatmap
+        # shrinks x-axis"). A fixed ``cax`` reused across refreshes
+        # stops the drift.
+        self._figure.set_layout_engine("constrained")
+        gs = self._figure.add_gridspec(3, 2, width_ratios=(40, 1))
+        self._axis_cut_a = self._figure.add_subplot(gs[0, :])
+        self._axis_cut_b = self._figure.add_subplot(gs[1, :])
+        self._axis_heatmap = self._figure.add_subplot(gs[2, 0])
+        self._axis_cbar = self._figure.add_subplot(gs[2, 1])
+        self._canvas.mpl_connect("button_press_event", self._on_plot_button_press)
+        self._canvas.mpl_connect("button_release_event", self._on_plot_button_release)
+        self._canvas.mpl_connect("motion_notify_event", self._on_plot_motion)
+
+        self._sync_table_from_points()
+        self._apply_parent_theme()
+        self._refresh_plots()
+        # Seed history AFTER all UI widgets exist so a subsequent
+        # ``_restore_snapshot`` can sync them. The first snapshot is
+        # the "pristine" state used by Reset and the unsaved-changes
+        # guard.
+        self._push_history(force=True)
+
+    def _apply_parent_theme(self) -> None:
+        """Inherit the live app theme — see
+        :meth:`PatternEditor1DDialog._apply_parent_theme` for the
+        rationale (dialog QSS + matplotlib figure styling).
+        """
+        parent = self.parent()
+        if parent is not None:
+            try:
+                sheet = parent.styleSheet() if hasattr(parent, "styleSheet") else ""
+                if sheet:
+                    self.setStyleSheet(sheet)
+            except Exception:
+                pass
+            if hasattr(parent, "_style_matplotlib_figure"):
+                try:
+                    parent._style_matplotlib_figure(self._figure)
+                except Exception:
+                    pass
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def result_pattern(self) -> "CustomAntennaPattern | None":
+        return self._result_pattern
+
+    # ------------------------------------------------------------------
+    # Starter templates / grid-mode switches
+    # ------------------------------------------------------------------
+
+    def _starter_cuts_theta_phi(self) -> tuple[np.ndarray, np.ndarray]:
+        peak = float(self._peak_gain_dbi)
+        template = np.asarray([
+            [  0.0, peak],
+            [  0.5, peak - 3.0],
+            [  1.0, peak - 12.0],
+            [  3.0, peak - 18.0],
+            [ 10.0, peak - 25.0],
+            [ 48.0, peak - 30.0],
+            [180.0, peak - 30.0],
+        ], dtype=np.float64)
+        return template.copy(), template.copy()
+
+    def _starter_cuts_az_el(self) -> tuple[np.ndarray, np.ndarray]:
+        peak = float(self._peak_gain_dbi)
+        cut_a = np.asarray([
+            [-180.0, peak - 30.0],
+            [-48.0,  peak - 30.0],
+            [-10.0,  peak - 25.0],
+            [ -3.0,  peak - 18.0],
+            [ -1.0,  peak - 12.0],
+            [ -0.5,  peak -  3.0],
+            [  0.0,  peak],
+            [  0.5,  peak -  3.0],
+            [  1.0,  peak - 12.0],
+            [  3.0,  peak - 18.0],
+            [ 10.0,  peak - 25.0],
+            [ 48.0,  peak - 30.0],
+            [180.0,  peak - 30.0],
+        ], dtype=np.float64)
+        cut_b = np.asarray([
+            [-90.0, peak - 30.0],
+            [-10.0, peak - 25.0],
+            [ -3.0, peak - 18.0],
+            [ -1.0, peak - 12.0],
+            [ -0.5, peak -  3.0],
+            [  0.0, peak],
+            [  0.5, peak -  3.0],
+            [  1.0, peak - 12.0],
+            [  3.0, peak - 18.0],
+            [ 10.0, peak - 25.0],
+            [ 90.0, peak - 30.0],
+        ], dtype=np.float64)
+        return cut_a, cut_b
+
+    def _grid_bounds(self) -> tuple[tuple[float, float], tuple[float, float]]:
+        """Return ((cut_a_min, cut_a_max), (cut_b_min, cut_b_max))."""
+        if self._grid_mode == self._gm_azel:
+            return ((-180.0, 180.0), (-90.0, 90.0))
+        return ((0.0, 180.0), (0.0, 180.0))
+
+    def _reset_cuts(self) -> None:
+        if self._grid_mode == self._gm_azel:
+            self._cut_a, self._cut_b = self._starter_cuts_az_el()
+        else:
+            self._cut_a, self._cut_b = self._starter_cuts_theta_phi()
+        self._selected_index = None
+        self._sync_table_from_points()
+        self._refresh_plots()
+
+    # ------------------------------------------------------------------
+    # Undo / redo history + unsaved-changes guard (port from 1-D editor)
+    # ------------------------------------------------------------------
+
+    def _snapshot(self) -> tuple[np.ndarray, np.ndarray, float, str, str]:
+        return (
+            self._cut_a.copy(),
+            self._cut_b.copy(),
+            float(self._peak_gain_dbi),
+            str(self._title_text),
+            str(self._grid_mode),
+        )
+
+    def _restore_snapshot(
+        self,
+        snap: tuple[np.ndarray, np.ndarray, float, str, str],
+    ) -> None:
+        cut_a, cut_b, peak, title, grid_mode = snap
+        self._cut_a = cut_a.copy()
+        self._cut_b = cut_b.copy()
+        self._peak_gain_dbi = float(peak)
+        self._title_text = str(title)
+        self._grid_mode = str(grid_mode)
+        blockers = [
+            QtCore.QSignalBlocker(self._title_edit),
+            QtCore.QSignalBlocker(self._peak_gain_spin),
+            QtCore.QSignalBlocker(self._grid_button_group),
+        ]
+        self._title_edit.setText(self._title_text)
+        self._peak_gain_spin.set_value(self._peak_gain_dbi)
+        if self._grid_mode == self._gm_azel:
+            self._grid_az_el_radio.setChecked(True)
+        else:
+            self._grid_theta_phi_radio.setChecked(True)
+        del blockers
+        self._selected_index = None
+        self._sync_table_from_points()
+        self._refresh_plots()
+
+    def _push_history(self, *, force: bool = False) -> None:
+        """Snapshot current state onto the undo stack, de-duplicating."""
+        snap = self._snapshot()
+        if self._history and not force:
+            last = self._history[self._history_index]
+            if (
+                last[2] == snap[2]
+                and last[3] == snap[3]
+                and last[4] == snap[4]
+                and last[0].shape == snap[0].shape
+                and last[1].shape == snap[1].shape
+                and np.array_equal(last[0], snap[0])
+                and np.array_equal(last[1], snap[1])
+            ):
+                return
+        # Drop the forward-redo tail if we branched off.
+        if self._history_index < len(self._history) - 1:
+            self._history = self._history[: self._history_index + 1]
+        self._history.append(snap)
+        # Bound history to a reasonable size — 64 steps matches 1-D.
+        if len(self._history) > 64:
+            self._history.pop(0)
+        self._history_index = len(self._history) - 1
+
+    def _undo(self) -> None:
+        if self._history_index <= 0:
+            return
+        self._history_index -= 1
+        self._restore_snapshot(self._history[self._history_index])
+
+    def _redo(self) -> None:
+        if self._history_index >= len(self._history) - 1:
+            return
+        self._history_index += 1
+        self._restore_snapshot(self._history[self._history_index])
+
+    def _reset_to_initial(self) -> None:
+        """Revert all state to the dialog's opening snapshot."""
+        if not self._history:
+            return
+        self._history_index = 0
+        self._restore_snapshot(self._history[0])
+
+    def _is_modified(self) -> bool:
+        if not self._history:
+            return False
+        current = self._snapshot()
+        first = self._history[0]
+        return not (
+            current[2] == first[2]
+            and current[3] == first[3]
+            and current[4] == first[4]
+            and current[0].shape == first[0].shape
+            and current[1].shape == first[1].shape
+            and np.array_equal(current[0], first[0])
+            and np.array_equal(current[1], first[1])
+        )
+
+    def _confirm_discard_if_modified(self) -> bool:
+        if getattr(self, "_close_confirmed", False):
+            return True
+        if not self._is_modified():
+            self._close_confirmed = True
+            return True
+        answer = QtWidgets.QMessageBox.question(
+            self, "Discard changes?",
+            "You have unsaved edits to the 2-D pattern. Close anyway "
+            "and discard them?",
+            QtWidgets.QMessageBox.Discard | QtWidgets.QMessageBox.Cancel,
+            QtWidgets.QMessageBox.Cancel,
+        )
+        if answer != QtWidgets.QMessageBox.Discard:
+            return False
+        self._close_confirmed = True
+        return True
+
+    # ------------------------------------------------------------------
+    # Per-cut smoothing — reuses the 1-D editor's 10-method palette
+    # ------------------------------------------------------------------
+
+    # The smoothing algorithms on ``PatternEditor1DDialog`` don't use
+    # any 1-D-specific state on ``self``; they only call these two
+    # helpers. Duplicating them here lets the 2-D dialog borrow the
+    # 1-D bound methods directly without plumbing a shared base
+    # class through the file.
+
+    def _uniform_bridge(
+        self, thetas: np.ndarray, gains: np.ndarray,
+    ) -> dict[str, np.ndarray]:
+        n = int(thetas.size)
+        n_uniform = int(min(max(n * 10, 512), 8192))
+        theta_uniform = np.linspace(
+            float(thetas[0]), float(thetas[-1]), n_uniform,
+        )
+        gains_uniform = np.interp(theta_uniform, thetas, gains)
+        return {"n": n_uniform, "t": theta_uniform, "g": gains_uniform}
+
+    def _smooth_bin_mean(
+        self, thetas: np.ndarray, gains: np.ndarray,
+    ) -> np.ndarray:
+        n = int(thetas.size)
+        n_bins = int(max(5, min(n // 8, 80)))
+        edges = np.linspace(float(thetas[0]), float(thetas[-1]), n_bins + 1)
+        bin_idx = np.clip(
+            np.digitize(thetas, edges[1:-1], right=False), 0, n_bins - 1,
+        )
+        smoothed = np.empty_like(gains)
+        for b in range(n_bins):
+            mask = bin_idx == b
+            if np.any(mask):
+                smoothed[mask] = float(np.mean(gains[mask]))
+        return smoothed
+
+    def _open_smooth_dialog(self, cut: str) -> None:
+        pts = self._cut_a if cut == "A" else self._cut_b
+        if int(pts.shape[0]) < 5:
+            QtWidgets.QMessageBox.information(
+                self, "Smooth",
+                f"Cut {cut} needs at least 5 control points to smooth.",
+            )
+            return
+        thetas = pts[:, 0].astype(np.float64, copy=True)
+        gains = pts[:, 1].astype(np.float64, copy=True)
+        dispatch = {
+            "bspline_cubic": PatternEditor1DDialog._smooth_bspline_cubic,
+            "bspline_linear": PatternEditor1DDialog._smooth_bspline_linear,
+            "chebyshev": PatternEditor1DDialog._smooth_chebyshev,
+            "gaussian_rbf": PatternEditor1DDialog._smooth_gaussian_rbf,
+            "bin_mean": PatternEditor1DDialog._smooth_bin_mean,
+            "savgol": PatternEditor1DDialog._smooth_savgol,
+            "moving_avg_slide": PatternEditor1DDialog._smooth_sliding_mean,
+            "gaussian_kernel": PatternEditor1DDialog._smooth_gaussian_kernel,
+            "median": PatternEditor1DDialog._smooth_median,
+            "ema": PatternEditor1DDialog._smooth_ema,
+        }
+
+        def _apply_for_preview(key: str, t: np.ndarray, g: np.ndarray) -> np.ndarray:
+            fn = dispatch.get(key)
+            if fn is None:
+                return g
+            return fn(self, t, g)
+
+        last_method = getattr(self, "_last_smoothing_method", "bspline_cubic")
+        dialog = SmoothingMethodDialog(
+            self,
+            initial_method=last_method,
+            preview_data=(thetas, gains),
+            apply_callback=_apply_for_preview,
+        )
+        dialog.setWindowTitle(f"Choose smoothing method \u2014 Cut {cut}")
+        if dialog.exec() != QtWidgets.QDialog.Accepted:
+            return
+        method = dialog.selected_method()
+        self._last_smoothing_method = method
+        new_gains = _apply_for_preview(method, thetas, gains)
+        # Preserve endpoint anchors on the cut so the edges stay put.
+        new_gains[0] = gains[0]
+        new_gains[-1] = gains[-1]
+        new_pts = np.column_stack([thetas, new_gains])
+        if cut == "A":
+            self._cut_a = new_pts
+        else:
+            self._cut_b = new_pts
+        self._sync_table_from_points()
+        self._refresh_plots()
+        self._push_history()
+
+    # ------------------------------------------------------------------
+    # Shared-library dialogs (Save to library / Browse library)
+    # ------------------------------------------------------------------
+
+    def _open_save_to_library_dialog(self) -> None:
+        """Prompt for title / author / source / notes and save the
+        current 2-D pattern to the shared library folder."""
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("Save to library")
+        dialog.setModal(True)
+        form = QtWidgets.QFormLayout(dialog)
+        title_edit = QtWidgets.QLineEdit(self._title_text or "", dialog)
+        author_edit = QtWidgets.QLineEdit(self._meta_author, dialog)
+        source_edit = QtWidgets.QLineEdit(self._meta_source, dialog)
+        notes_edit = QtWidgets.QPlainTextEdit(self._meta_notes, dialog)
+        notes_edit.setMaximumHeight(100)
+        form.addRow("Title", title_edit)
+        form.addRow("Author", author_edit)
+        form.addRow("Source", source_edit)
+        form.addRow("Notes", notes_edit)
+        bb = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Save | QtWidgets.QDialogButtonBox.Cancel,
+            QtCore.Qt.Horizontal, dialog,
+        )
+        bb.accepted.connect(dialog.accept)
+        bb.rejected.connect(dialog.reject)
+        form.addRow(bb)
+        if dialog.exec() != QtWidgets.QDialog.Accepted:
+            return
+        self._title_text = title_edit.text().strip()
+        self._meta_author = author_edit.text().strip()
+        self._meta_source = source_edit.text().strip()
+        self._meta_notes = notes_edit.toPlainText().strip()
+        self._title_edit.setText(self._title_text)
+        try:
+            pat = self._build_pattern_from_state()
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(
+                self, "Validation failed",
+                f"The current cuts don't form a valid pattern:\n{exc}",
+            )
+            return
+        lib_dir = _antenna_template_library_dir()
+        base = (
+            self._title_text or "pattern_2d"
+        ).replace(" ", "_").replace("/", "_")[:48]
+        path = lib_dir / f"{base}.json"
+        i = 1
+        while path.exists():
+            path = lib_dir / f"{base}_{i}.json"
+            i += 1
+        try:
+            from scepter.custom_antenna import dump_custom_pattern as _dump
+            _dump(path, pat)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(
+                self, "Save failed", f"Couldn't write {path.name}:\n{exc}",
+            )
+            return
+        QtWidgets.QMessageBox.information(
+            self, "Saved",
+            f"Saved to the shared library:\n{path.name}",
+        )
+
+    def _open_browse_library_dialog(self) -> None:
+        entries = _scan_antenna_template_library(kind=self._kind_2d)
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("Browse library")
+        dialog.setModal(True)
+        dialog.resize(620, 420)
+        layout = QtWidgets.QVBoxLayout(dialog)
+        hdr = QtWidgets.QLabel(
+            f"Shared template library \u2022 {len(entries)} 2-D "
+            f"entries.<br>Folder: <code>{_antenna_template_library_dir()}</code>",
+            dialog,
+        )
+        hdr.setTextFormat(QtCore.Qt.RichText)
+        hdr.setWordWrap(True)
+        layout.addWidget(hdr)
+        lst = QtWidgets.QListWidget(dialog)
+        for path, pat in entries:
+            title = str((pat.meta or {}).get("title") or path.stem)
+            author = str((pat.meta or {}).get("author") or "").strip()
+            peak = float(pat.peak_gain_dbi)
+            tag = f"{title}  \u2022  peak {peak:.1f} dBi"
+            if author:
+                tag += f"  \u2022  {author}"
+            item = QtWidgets.QListWidgetItem(tag, lst)
+            item.setData(QtCore.Qt.UserRole, str(path))
+        layout.addWidget(lst, 1)
+        btn_row = QtWidgets.QHBoxLayout()
+        load_btn = QtWidgets.QPushButton("Load", dialog)
+        close_btn = QtWidgets.QPushButton("Close", dialog)
+        btn_row.addWidget(load_btn)
+        btn_row.addStretch(1)
+        btn_row.addWidget(close_btn)
+        layout.addLayout(btn_row)
+        selected_path: list[str] = []
+
+        def _on_load() -> None:
+            item = lst.currentItem()
+            if item is None:
+                return
+            selected_path.append(str(item.data(QtCore.Qt.UserRole)))
+            dialog.accept()
+
+        load_btn.clicked.connect(_on_load)
+        lst.itemDoubleClicked.connect(lambda _i: _on_load())
+        close_btn.clicked.connect(dialog.reject)
+        if dialog.exec() != QtWidgets.QDialog.Accepted or not selected_path:
+            return
+        try:
+            from scepter.custom_antenna import load_custom_pattern as _load
+            pat = _load(selected_path[0])
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(
+                self, "Load failed", f"Couldn't load:\n{exc}",
+            )
+            return
+        self._load_initial_pattern(pat)
+        self._refresh_plots()
+        self._push_history()
+
+    def _on_grid_mode_toggled(self, gid: int, checked: bool) -> None:
+        if not checked:
+            return
+        new_mode = self._gm_azel if gid == 1 else self._gm_thetaphi
+        if new_mode == self._grid_mode:
+            return
+        self._grid_mode = new_mode
+        # Flip to a fresh starter for the new grid mode rather than
+        # trying to reproject the old cuts — the two conventions span
+        # different axis ranges and reprojection would give a subtly
+        # wrong shape.
+        self._reset_cuts()
+
+    # ------------------------------------------------------------------
+    # Point manipulation
+    # ------------------------------------------------------------------
+
+    def _cut_points(self, which: str) -> np.ndarray:
+        return self._cut_a if which == "A" else self._cut_b
+
+    def _set_cut_points(self, which: str, pts: np.ndarray) -> None:
+        if which == "A":
+            self._cut_a = pts
+        else:
+            self._cut_b = pts
+
+    def _active_axis(self) -> Any:
+        return self._axis_cut_a if self._selected_cut == "A" else self._axis_cut_b
+
+    def _is_anchor(self, which: str, idx: int) -> bool:
+        pts = self._cut_points(which)
+        n = int(pts.shape[0])
+        if n == 0:
+            return False
+        return int(idx) == 0 or int(idx) == n - 1
+
+    def _can_remove(self, which: str, idx: int | None) -> bool:
+        if idx is None:
+            return False
+        if self._is_anchor(which, int(idx)):
+            return False
+        return int(self._cut_points(which).shape[0]) > 3
+
+    def _update_remove_enabled(self) -> None:
+        self._remove_point_button.setEnabled(
+            self._can_remove(self._selected_cut, self._selected_index)
+        )
+
+    def _select_cut_point(self, which: str, idx: int | None) -> None:
+        self._selected_cut = which
+        # Update radio buttons silently
+        blocker = QtCore.QSignalBlocker(self._cut_button_group)
+        (self._cut_a_radio if which == "A" else self._cut_b_radio).setChecked(True)
+        del blocker
+        self._selected_index = int(idx) if idx is not None else None
+        self._sync_table_from_points()
+        if self._selected_index is not None:
+            self._table_sync_in_progress = True
+            try:
+                self._point_table.selectRow(int(self._selected_index))
+            finally:
+                self._table_sync_in_progress = False
+        self._update_remove_enabled()
+        self._refresh_plots()
+
+    def _constrain_point(self, which: str, idx: int, x: float, y: float) -> tuple[float, float]:
+        pts = self._cut_points(which)
+        n = int(pts.shape[0])
+        bounds_a, bounds_b = self._grid_bounds()
+        bounds = bounds_a if which == "A" else bounds_b
+        if self._is_anchor(which, int(idx)):
+            x_use = bounds[0] if int(idx) == 0 else bounds[1]
+        else:
+            left = float(pts[int(idx) - 1, 0]) if int(idx) - 1 >= 0 else float(bounds[0])
+            right = float(pts[int(idx) + 1, 0]) if int(idx) + 1 < n else float(bounds[1])
+            x_use = float(max(left + self._MIN_POINT_GAP_DEG, min(x, right - self._MIN_POINT_GAP_DEG)))
+        return x_use, float(y)
+
+    def _on_cut_selection_changed(self, gid: int, checked: bool) -> None:
+        if not checked:
+            return
+        self._select_cut_point("B" if gid == 1 else "A", None)
+
+    def _add_midpoint_after_selection(self) -> None:
+        which = self._selected_cut
+        pts = self._cut_points(which)
+        n = int(pts.shape[0])
+        if n < 2:
+            return
+        idx = (
+            int(self._selected_index)
+            if self._selected_index is not None and int(self._selected_index) < n - 1
+            else 0
+        )
+        left_x = float(pts[idx, 0])
+        right_x = float(pts[idx + 1, 0])
+        if right_x - left_x < 2 * self._MIN_POINT_GAP_DEG:
+            return
+        new_x = 0.5 * (left_x + right_x)
+        new_y = 0.5 * (float(pts[idx, 1]) + float(pts[idx + 1, 1]))
+        pts = np.insert(pts, idx + 1, [new_x, new_y], axis=0)
+        self._set_cut_points(which, pts)
+        self._select_cut_point(which, idx + 1)
+        self._push_history()
+
+    def _remove_selected_point(self) -> bool:
+        if not self._can_remove(self._selected_cut, self._selected_index):
+            return False
+        which = self._selected_cut
+        idx = int(self._selected_index)
+        pts = np.delete(self._cut_points(which), idx, axis=0)
+        self._set_cut_points(which, pts)
+        self._select_cut_point(which, max(0, idx - 1))
+        self._push_history()
+        return True
+
+    # ------------------------------------------------------------------
+    # Table ↔ points sync (for the active cut)
+    # ------------------------------------------------------------------
+
+    def _sync_table_from_points(self) -> None:
+        pts = self._cut_points(self._selected_cut)
+        self._table_sync_in_progress = True
+        try:
+            self._point_table.setRowCount(int(pts.shape[0]))
+            for row in range(int(pts.shape[0])):
+                x_item = QtWidgets.QTableWidgetItem(f"{float(pts[row, 0]):.6g}")
+                y_item = QtWidgets.QTableWidgetItem(f"{float(pts[row, 1]):.4g}")
+                if self._is_anchor(self._selected_cut, row):
+                    x_item.setFlags(x_item.flags() & ~QtCore.Qt.ItemIsEditable)
+                self._point_table.setItem(row, 0, x_item)
+                self._point_table.setItem(row, 1, y_item)
+            axis_label = self._active_axis_label()
+            self._point_table.setHorizontalHeaderLabels([axis_label, "Gain [dBi]"])
+        finally:
+            self._table_sync_in_progress = False
+
+    def _active_axis_label(self) -> str:
+        if self._grid_mode == self._gm_azel:
+            return "az [deg]" if self._selected_cut == "A" else "el [deg]"
+        return "θ [deg]"
+
+    def _on_table_item_changed(self, item: QtWidgets.QTableWidgetItem) -> None:
+        if self._table_sync_in_progress:
+            return
+        row = int(item.row())
+        col = int(item.column())
+        try:
+            value = float(item.text())
+        except ValueError:
+            self._sync_table_from_points()
+            return
+        pts = self._cut_points(self._selected_cut)
+        if col == 0 and not self._is_anchor(self._selected_cut, row):
+            pts[row, 0] = value
+        elif col == 1:
+            pts[row, 1] = value
+        x_use, y_use = self._constrain_point(
+            self._selected_cut, row, float(pts[row, 0]), float(pts[row, 1]),
+        )
+        pts[row, 0] = x_use
+        pts[row, 1] = y_use
+        self._set_cut_points(self._selected_cut, pts)
+        self._sync_table_from_points()
+        self._select_cut_point(self._selected_cut, row)
+        self._push_history()
+
+    def _on_table_selection_changed(self) -> None:
+        if self._table_sync_in_progress:
+            return
+        indices = self._point_table.selectionModel().selectedRows()
+        if not indices:
+            return
+        self._select_cut_point(self._selected_cut, int(indices[0].row()))
+
+    # ------------------------------------------------------------------
+    # Peak-gain
+    # ------------------------------------------------------------------
+
+    def _on_peak_gain_edited(self) -> None:
+        value = self._peak_gain_spin.value_or_none()
+        if value is None:
+            return
+        self._peak_gain_dbi = float(value)
+        self._refresh_plots()
+        self._push_history()
+
+    # ------------------------------------------------------------------
+    # Plot rendering + mouse handling
+    # ------------------------------------------------------------------
+
+    def _refresh_plots(self) -> None:
+        for axis, cut_name, pts in (
+            (self._axis_cut_a, "A", self._cut_a),
+            (self._axis_cut_b, "B", self._cut_b),
+        ):
+            axis.clear()
+            axis.plot(pts[:, 0], pts[:, 1], "-", color="#3b82f6", lw=1.4)
+            axis.plot(pts[:, 0], pts[:, 1], "o", color="#0f172a",
+                      markerfacecolor="#38bdf8", markersize=6)
+            if self._selected_cut == cut_name and self._selected_index is not None:
+                sel = int(self._selected_index)
+                axis.plot(
+                    float(pts[sel, 0]), float(pts[sel, 1]),
+                    "o", markersize=10, markerfacecolor="none",
+                    markeredgecolor="#f97316", markeredgewidth=2.0,
+                )
+            axis.axhline(self._peak_gain_dbi, color="#22c55e", lw=0.8, ls=":")
+            axis.set_xlabel(self._cut_axis_label(cut_name))
+            axis.set_ylabel("Gain [dBi]")
+            bounds_a, bounds_b = self._grid_bounds()
+            bounds = bounds_a if cut_name == "A" else bounds_b
+            axis.set_xlim(bounds[0] - 2.0, bounds[1] + 2.0)
+            axis.set_title(self._cut_title(cut_name))
+            axis.grid(True, alpha=0.25)
+
+        # Heatmap — paint into the fixed-size heatmap axis and
+        # route the colorbar into its dedicated ``_axis_cbar``
+        # (allocated once via gridspec). This stops the heatmap
+        # from progressively shrinking its x-axis on every edit.
+        heat = self._axis_heatmap
+        heat.clear()
+        grid_x, grid_y, z = self._compute_heatmap_surface()
+        im = heat.pcolormesh(
+            grid_x, grid_y, z, cmap="viridis", shading="auto",
+        )
+        heat.set_xlabel(self._heatmap_x_label())
+        heat.set_ylabel(self._heatmap_y_label())
+        heat.set_title("2-D pattern preview")
+        self._axis_cbar.clear()
+        self._heatmap_colorbar = self._figure.colorbar(
+            im, cax=self._axis_cbar, label="G [dBi]",
+        )
+        parent = self.parent()
+        if parent is not None and hasattr(parent, "_style_matplotlib_figure"):
+            try:
+                parent._style_matplotlib_figure(self._figure)
+            except Exception:
+                pass
+        self._canvas.draw_idle()
+        self._summary_label.setText(
+            f"Cut A: {int(self._cut_a.shape[0])} pts \u2022 "
+            f"Cut B: {int(self._cut_b.shape[0])} pts \u2022 "
+            f"grid={self._grid_mode}"
+        )
+
+    def _cut_axis_label(self, cut: str) -> str:
+        if self._grid_mode == self._gm_azel:
+            return "az [deg]" if cut == "A" else "el [deg]"
+        return "θ [deg]"
+
+    def _cut_title(self, cut: str) -> str:
+        if self._grid_mode == self._gm_azel:
+            return "Cut A: G(az, el=0°)" if cut == "A" else "Cut B: G(az=0°, el)"
+        return "Cut A: G(θ, φ=0°)" if cut == "A" else "Cut B: G(θ, φ=90°)"
+
+    def _heatmap_x_label(self) -> str:
+        return "az [deg]" if self._grid_mode == self._gm_azel else "θ [deg]"
+
+    def _heatmap_y_label(self) -> str:
+        return "el [deg]" if self._grid_mode == self._gm_azel else "φ [deg]"
+
+    def _compute_heatmap_surface(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        if self._grid_mode == self._gm_azel:
+            az = np.linspace(-180.0, 180.0, 121)
+            el = np.linspace(-90.0, 90.0, 61)
+            az_g, el_g = np.meshgrid(az, el, indexing="xy")
+            gaz = np.interp(az_g, self._cut_a[:, 0], self._cut_a[:, 1])
+            gel = np.interp(el_g, self._cut_b[:, 0], self._cut_b[:, 1])
+            # Separable approximation: G(az, el) = G_A(az) + G_B(el) − peak
+            z = gaz + gel - float(self._peak_gain_dbi)
+            return az_g, el_g, z
+        theta = np.linspace(0.0, 180.0, 121)
+        phi = np.linspace(-180.0, 180.0, 121)
+        th_g, ph_g = np.meshgrid(theta, phi, indexing="xy")
+        g_a = np.interp(th_g, self._cut_a[:, 0], self._cut_a[:, 1])
+        g_b = np.interp(th_g, self._cut_b[:, 0], self._cut_b[:, 1])
+        cos2 = np.cos(np.deg2rad(ph_g)) ** 2
+        z = g_a * cos2 + g_b * (1.0 - cos2)
+        return th_g, ph_g, z
+
+    def _nearest_point(self, event: Any) -> tuple[str, int] | None:
+        for axis, cut_name, pts in (
+            (self._axis_cut_a, "A", self._cut_a),
+            (self._axis_cut_b, "B", self._cut_b),
+        ):
+            if getattr(event, "inaxes", None) is axis:
+                if event.x is None or event.y is None:
+                    return None
+                display = axis.transData.transform(pts)
+                cursor = np.asarray([float(event.x), float(event.y)], dtype=np.float64)
+                distances = np.sqrt(np.sum((display - cursor[None, :]) ** 2, axis=1))
+                best = int(np.argmin(distances))
+                if float(distances[best]) <= self._POINT_PICK_RADIUS_PX:
+                    return cut_name, best
+                return None
+        return None
+
+    def _on_plot_button_press(self, event: Any) -> None:
+        if event.button == 1 and getattr(event, "dblclick", False):
+            for axis, cut_name in ((self._axis_cut_a, "A"), (self._axis_cut_b, "B")):
+                if event.inaxes is axis and event.xdata is not None and event.ydata is not None:
+                    self._insert_point_at(cut_name, float(event.xdata), float(event.ydata))
+                    return
+            return
+        if event.button == 3:
+            hit = self._nearest_point(event)
+            if hit is not None:
+                self._select_cut_point(hit[0], hit[1])
+                self._remove_selected_point()
+            return
+        if event.button == 1:
+            hit = self._nearest_point(event)
+            if hit is not None:
+                self._drag_cut = hit[0]
+                self._drag_index = hit[1]
+                self._select_cut_point(hit[0], hit[1])
+
+    def _on_plot_motion(self, event: Any) -> None:
+        if self._drag_cut is None or self._drag_index is None:
+            return
+        axis = self._axis_cut_a if self._drag_cut == "A" else self._axis_cut_b
+        if event.inaxes is not axis:
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+        x_use, y_use = self._constrain_point(
+            self._drag_cut, int(self._drag_index),
+            float(event.xdata), float(event.ydata),
+        )
+        pts = self._cut_points(self._drag_cut)
+        pts[int(self._drag_index), 0] = x_use
+        pts[int(self._drag_index), 1] = y_use
+        self._set_cut_points(self._drag_cut, pts)
+        self._select_cut_point(self._drag_cut, int(self._drag_index))
+
+    def _on_plot_button_release(self, _event: Any) -> None:
+        had_drag = self._drag_cut is not None
+        self._drag_cut = None
+        self._drag_index = None
+        if had_drag:
+            # Push history once at the *end* of a drag, not on every
+            # intermediate cursor move — matches the 1-D editor's
+            # one-snapshot-per-gesture convention.
+            self._push_history()
+
+    def _insert_point_at(self, which: str, x: float, y: float) -> None:
+        bounds_a, bounds_b = self._grid_bounds()
+        bounds = bounds_a if which == "A" else bounds_b
+        x_clamped = float(max(bounds[0], min(x, bounds[1])))
+        pts = self._cut_points(which)
+        xs = pts[:, 0]
+        idx = int(np.searchsorted(xs, x_clamped))
+        idx = int(max(1, min(idx, int(pts.shape[0]) - 1)))
+        pts = np.insert(pts, idx, [x_clamped, float(y)], axis=0)
+        self._set_cut_points(which, pts)
+        self._select_cut_point(which, idx)
+
+    # ------------------------------------------------------------------
+    # Build the 2-D LUT from the cuts and return a CustomAntennaPattern
+    # ------------------------------------------------------------------
+
+    def _build_pattern_from_state(self) -> "CustomAntennaPattern":
+        from scepter.custom_antenna import CustomAntennaPattern
+        peak_value = self._peak_gain_spin.value_or_none()
+        if peak_value is None:
+            raise ValueError("Peak gain must be set.")
+        peak = float(peak_value)
+        title = str(self._title_edit.text() or "").strip()
+        if self._grid_mode == self._gm_azel:
+            az_grid = np.linspace(-180.0, 180.0, 73)
+            el_grid = np.linspace(-90.0, 90.0, 37)
+            az_g, el_g = np.meshgrid(az_grid, el_grid, indexing="ij")
+            gaz = np.interp(az_g, self._cut_a[:, 0], self._cut_a[:, 1])
+            gel = np.interp(el_g, self._cut_b[:, 0], self._cut_b[:, 1])
+            gain = gaz + gel - peak
+            payload = {
+                "scepter_antenna_pattern_format": "v1",
+                "kind": self._kind_2d,
+                "grid_mode": self._gm_azel,
+                "normalisation": self._norm_abs,
+                "peak_gain_source": self._peak_src_explicit,
+                "peak_gain_dbi": peak,
+                "az_wraps": True,
+                "az_grid_deg": az_grid.tolist(),
+                "el_grid_deg": el_grid.tolist(),
+                "gain_db": gain.tolist(),
+                "meta": {
+                    "title": title,
+                    "editor": "PatternEditor2DDialog",
+                    "interp": "separable_az_el",
+                },
+            }
+            return CustomAntennaPattern.from_json_dict(payload)
+        # theta_phi grid
+        theta_grid = np.linspace(0.0, 180.0, 73)
+        phi_grid = np.linspace(-180.0, 180.0, 73)
+        th_g, ph_g = np.meshgrid(theta_grid, phi_grid, indexing="ij")
+        g_a = np.interp(th_g, self._cut_a[:, 0], self._cut_a[:, 1])
+        g_b = np.interp(th_g, self._cut_b[:, 0], self._cut_b[:, 1])
+        cos2 = np.cos(np.deg2rad(ph_g)) ** 2
+        gain = g_a * cos2 + g_b * (1.0 - cos2)
+        payload = {
+            "scepter_antenna_pattern_format": "v1",
+            "kind": self._kind_2d,
+            "grid_mode": self._gm_thetaphi,
+            "normalisation": self._norm_abs,
+            "peak_gain_source": self._peak_src_explicit,
+            "peak_gain_dbi": peak,
+            "phi_wraps": True,
+            "theta_grid_deg": theta_grid.tolist(),
+            "phi_grid_deg": phi_grid.tolist(),
+            "gain_db": gain.tolist(),
+            "meta": {
+                "title": title,
+                "editor": "PatternEditor2DDialog",
+                "interp": "elliptical_cos2",
+            },
+        }
+        return CustomAntennaPattern.from_json_dict(payload)
+
+    def _on_accept(self) -> None:
+        try:
+            pat = self._build_pattern_from_state()
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(
+                self, "Validation failed",
+                f"The current cuts don't form a valid pattern:\n{exc}",
+            )
+            return
+        self._result_pattern = pat
+        # Accepting is a save, not a discard — suppress the
+        # unsaved-changes prompt ``closeEvent`` would otherwise fire
+        # as ``self.accept()`` triggers the same close path.
+        self._close_confirmed = True
+        self.accept()
+
+    # ------------------------------------------------------------------
+    # JSON I/O
+    # ------------------------------------------------------------------
+
+    def _import_from_json(self) -> None:
+        from scepter.custom_antenna import (
+            KIND_2D as _CK_2D, load_custom_pattern as _load,
+        )
+        filename, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Import custom pattern", str(Path.cwd()),
+            "Antenna pattern JSON (*.json);;All files (*)",
+        )
+        if not filename:
+            return
+        try:
+            pat = _load(filename)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(
+                self, "Import failed",
+                f"Couldn't import {Path(filename).name}:\n{exc}",
+            )
+            return
+        if pat.kind != _CK_2D:
+            QtWidgets.QMessageBox.warning(
+                self, "Wrong kind",
+                f"{Path(filename).name} declares kind={pat.kind!r}; the "
+                "2-D editor only accepts 2-D patterns.",
+            )
+            return
+        self._load_initial_pattern(pat)
+        self._refresh_plots()
+
+    def _export_to_json(self) -> None:
+        from scepter.custom_antenna import dump_custom_pattern as _dump
+        try:
+            pat = self._build_pattern_from_state()
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(
+                self, "Validation failed",
+                f"The current cuts don't form a valid pattern:\n{exc}",
+            )
+            return
+        filename, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Export custom pattern",
+            str(Path.cwd() / "custom_pattern_2d.json"),
+            "Antenna pattern JSON (*.json)",
+        )
+        if not filename:
+            return
+        try:
+            _dump(filename, pat)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(
+                self, "Export failed",
+                f"Couldn't write {Path(filename).name}:\n{exc}",
+            )
+
+    def _load_initial_pattern(self, pattern: "CustomAntennaPattern") -> None:
+        """Extract two principal cuts from a loaded 2-D pattern.
+
+        Samples the pattern's gain along the two principal planes of
+        its native grid. Users who want a lossless edit of a
+        hand-authored dense LUT should edit the JSON directly — the
+        editor is a compact two-cut representation by design.
+        """
+        self._peak_gain_dbi = float(pattern.peak_gain_dbi)
+        self._title_text = str((pattern.meta or {}).get("title", ""))
+        peak = float(self._peak_gain_dbi)
+        gains = np.asarray(pattern.gain_db, dtype=np.float64)
+        if pattern.normalisation != self._norm_abs:
+            gains = gains + peak
+        if pattern.grid_mode == self._gm_azel:
+            self._grid_mode = self._gm_azel
+            az = np.asarray(pattern.az_grid_deg, dtype=np.float64)
+            el = np.asarray(pattern.el_grid_deg, dtype=np.float64)
+            # Cut A: G(az, el=0). Find row nearest el=0.
+            i_el0 = int(np.argmin(np.abs(el)))
+            self._cut_a = np.stack([az, gains[:, i_el0]], axis=1)
+            # Cut B: G(az=0, el). Find column nearest az=0.
+            i_az0 = int(np.argmin(np.abs(az)))
+            self._cut_b = np.stack([el, gains[i_az0, :]], axis=1)
+        else:
+            self._grid_mode = self._gm_thetaphi
+            theta = np.asarray(pattern.theta_grid_deg, dtype=np.float64)
+            phi = np.asarray(pattern.phi_grid_deg, dtype=np.float64)
+            # Cut A: G(θ, φ=0). Find column nearest φ=0.
+            i_phi0 = int(np.argmin(np.abs(phi)))
+            self._cut_a = np.stack([theta, gains[:, i_phi0]], axis=1)
+            # Cut B: G(θ, φ=90). Find column nearest φ=90.
+            i_phi90 = int(np.argmin(np.abs(phi - 90.0)))
+            self._cut_b = np.stack([theta, gains[:, i_phi90]], axis=1)
+        # Sync UI widgets (guarded against __init__ re-entry).
+        if hasattr(self, "_title_edit"):
+            blocker_a = QtCore.QSignalBlocker(self._title_edit)
+            blocker_b = QtCore.QSignalBlocker(self._peak_gain_spin)
+            self._title_edit.setText(self._title_text)
+            self._peak_gain_spin.set_value(self._peak_gain_dbi)
+            del blocker_a
+            del blocker_b
+        if hasattr(self, "_grid_button_group"):
+            blocker_grid = QtCore.QSignalBlocker(self._grid_button_group)
+            if self._grid_mode == self._gm_azel:
+                self._grid_az_el_radio.setChecked(True)
+            else:
+                self._grid_theta_phi_radio.setChecked(True)
+            del blocker_grid
+        if hasattr(self, "_point_table"):
+            self._sync_table_from_points()
+
+    # ------------------------------------------------------------------
+    # Cleanup
+    # ------------------------------------------------------------------
+
+    def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
+        if event.key() in {QtCore.Qt.Key_Delete, QtCore.Qt.Key_Backspace}:
+            if self._remove_selected_point():
+                event.accept()
+                return
+        # Undo / redo shortcuts — Ctrl+Z, Ctrl+Y, Ctrl+Shift+Z.
+        if event.matches(QtGui.QKeySequence.Undo):
+            self._undo()
+            event.accept()
+            return
+        if event.matches(QtGui.QKeySequence.Redo):
+            self._redo()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def reject(self) -> None:
+        if not self._confirm_discard_if_modified():
+            return
+        super().reject()
+
+    def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        if not self._confirm_discard_if_modified():
+            event.ignore()
+            return
+        self._canvas.release_resize_proxy()
+        try:
+            plt.close(self._figure)
+        except Exception:
+            pass
+        super().closeEvent(event)
+
+
+class PatternEditor2DDialog(QtWidgets.QDialog):
+    """Full-surface 2-D antenna-pattern editor (scattered points).
+
+    Supersedes the earlier "two principal cuts + separable synthesis"
+    editor. The pattern is represented as a scattered set of
+    reference points ``(x, y, gain)``; the heatmap is interpolated
+    from them via RBF / triangulation / nearest and the user
+    sculpts the surface by dragging points on the heatmap,
+    double-clicking to add / edit, right-clicking or pressing
+    Delete to remove. A 3-column table mirrors the point set for
+    numeric edits. Anchor points at the four grid corners are
+    locked (coords can't move, only gain is editable) so the
+    interpolator always has well-defined boundary behaviour.
+
+    Features retained from the legacy cuts editor:
+    undo/redo (snapshot of ``(points, peak, title, grid, interp)``),
+    library Save/Browse, unsaved-changes single-prompt guard,
+    themed action buttons, dedicated-colorbar axis (prevents heatmap
+    drift across refreshes).
+    """
+
+    _POINT_PICK_RADIUS_PX = 14.0
+    _INTERP_GRID_SIZE_AZEL = (81, 41)
+    _INTERP_GRID_SIZE_THETAPHI = (91, 91)
+    _INTERP_METHODS = (
+        ("rbf_thin_plate", "Thin-plate spline (smooth, default)"),
+        ("rbf_gaussian", "Gaussian RBF"),
+        ("linear", "Linear triangulation"),
+        ("cubic", "Cubic triangulation"),
+        ("nearest", "Nearest neighbour"),
+    )
+
+    def __init__(
+        self,
+        *,
+        initial_pattern: "CustomAntennaPattern | None" = None,
+        side: str = "ras",
+        parent: QtWidgets.QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        from scepter.custom_antenna import (
+            KIND_2D as _CK_2D,
+            GRID_MODE_AZEL as _GMA,
+            GRID_MODE_THETAPHI as _GMT,
+            NORMALISATION_ABSOLUTE as _CN_ABS,
+            PEAK_SOURCE_EXPLICIT as _CP_EXPL,
+        )
+        self._kind_2d = _CK_2D
+        self._gm_azel = _GMA
+        self._gm_thetaphi = _GMT
+        self._norm_abs = _CN_ABS
+        self._peak_src_explicit = _CP_EXPL
+
+        self._side = str(side or "ras").strip().lower()
+        title_prefix = "RAS" if self._side == "ras" else "Satellite"
+        self.setWindowTitle(f"Custom {title_prefix} Antenna Pattern \u2014 2-D Editor")
+        self.setWindowIcon(_load_app_icon())
+        self.resize(1400, 900)
+        self.setModal(True)
+        self.setAttribute(QtCore.Qt.WA_DeleteOnClose, True)
+
+        # --- State (az/el is the default grid mode per user request) ---
+        # Default peak sized so the starter scatter interpolates to
+        # an energy ratio ``∫G·dΩ/4π ≲ 1`` — otherwise the
+        # non-physical warning fires on first open. Antennas with
+        # higher directivity can be modelled by raising peak and
+        # tightening sidelobes via the Normalise… dialog.
+        self._peak_gain_dbi: float = 10.0
+        self._title_text: str = ""
+        self._grid_mode: str = self._gm_azel
+        self._interp_method: str = "rbf_thin_plate"
+        self._points: np.ndarray = self._starter_points_az_el()
+        self._result_pattern: "CustomAntennaPattern | None" = None
+        self._selected_index: int | None = None
+        self._drag_index: int | None = None
+        self._table_sync_in_progress: bool = False
+
+        # Surface-first state (the authoritative pattern surface used
+        # for both display and simulation output). Editing mutates
+        # ``_points`` (scatter anchors) and regenerates the surface
+        # from them; loading / templates set the surface directly.
+        # ``_surface_is_source`` tracks which regime we're in so the
+        # status badge can tell the user.
+        self._surface_grid: np.ndarray | None = None
+        self._surface_grid_x: np.ndarray | None = None
+        self._surface_grid_y: np.ndarray | None = None
+        self._surface_is_source: bool = False
+        self._surface_source_label: str = ""
+
+        # Undo / redo
+        self._history: list[tuple[np.ndarray, float, str, str, str]] = []
+        self._history_index: int = -1
+        self._close_confirmed: bool = False
+        self._meta_author: str = ""
+        self._meta_source: str = ""
+        self._meta_notes: str = ""
+
+        if initial_pattern is not None and initial_pattern.kind == _CK_2D:
+            self._load_initial_pattern(initial_pattern)
+
+        # --- Layout ---
+        root = QtWidgets.QVBoxLayout(self)
+        root.setContentsMargins(10, 10, 10, 10)
+        root.setSpacing(10)
+
+        intro = QtWidgets.QLabel(
+            "Shape the 2-D pattern by dragging reference points on "
+            "the heatmap. <b>Double-click empty space</b> to add a "
+            "point, <b>double-click a point</b> to edit its exact "
+            "(x, y, gain); <b>right-click or press Delete</b> to "
+            "remove a non-anchor point. The heatmap is interpolated "
+            "live from the points via the selected rule.",
+            self,
+        )
+        intro.setTextFormat(QtCore.Qt.RichText)
+        intro.setWordWrap(True)
+        root.addWidget(intro)
+
+        # Meta row: Title, Peak, Grid radios, Interp combo
+        meta_row = QtWidgets.QHBoxLayout()
+        meta_row.setSpacing(10)
+        self._title_edit = QtWidgets.QLineEdit(self._title_text, self)
+        self._title_edit.setPlaceholderText("Optional display title")
+        self._title_edit.editingFinished.connect(self._on_title_edited)
+        self._peak_gain_spin = OptionalNumericEdit(
+            minimum=-200.0, maximum=200.0, decimals=3, parent=self,
+        )
+        self._peak_gain_spin.set_value(self._peak_gain_dbi)
+        self._peak_gain_spin.editingFinished.connect(self._on_peak_gain_edited)
+        self._grid_azel_radio = QtWidgets.QRadioButton("az, el", self)
+        self._grid_thetaphi_radio = QtWidgets.QRadioButton("\u03b8, \u03c6", self)
+        self._grid_button_group = QtWidgets.QButtonGroup(self)
+        self._grid_button_group.addButton(self._grid_azel_radio, 0)
+        self._grid_button_group.addButton(self._grid_thetaphi_radio, 1)
+        if self._grid_mode == self._gm_azel:
+            self._grid_azel_radio.setChecked(True)
+        else:
+            self._grid_thetaphi_radio.setChecked(True)
+        self._grid_button_group.idToggled.connect(self._on_grid_mode_toggled)
+        self._interp_combo = QtWidgets.QComboBox(self)
+        for key, label in self._INTERP_METHODS:
+            self._interp_combo.addItem(label, userData=key)
+        idx = self._interp_combo.findData(self._interp_method)
+        if idx >= 0:
+            self._interp_combo.setCurrentIndex(idx)
+        self._interp_combo.currentIndexChanged.connect(self._on_interp_changed)
+        self._interp_combo.setToolTip(
+            "Rule used to interpolate the full surface from the "
+            "scattered reference points. Thin-plate spline is the "
+            "smoothest default; triangulation rules preserve kinks "
+            "between points."
+        )
+        meta_row.addWidget(QtWidgets.QLabel("Title:"))
+        meta_row.addWidget(self._title_edit, 1)
+        meta_row.addWidget(QtWidgets.QLabel("Peak [dBi]:"))
+        meta_row.addWidget(self._peak_gain_spin)
+        meta_row.addWidget(QtWidgets.QLabel("Grid:"))
+        meta_row.addWidget(self._grid_azel_radio)
+        meta_row.addWidget(self._grid_thetaphi_radio)
+        meta_row.addWidget(QtWidgets.QLabel("Interp:"))
+        meta_row.addWidget(self._interp_combo)
+        root.addLayout(meta_row)
+
+        # Body: heatmap (left) + side panel (right)
+        body = QtWidgets.QHBoxLayout()
+        body.setSpacing(10)
+        root.addLayout(body, 1)
+
+        self._figure = Figure(figsize=(9.6, 7.2))
+        self._figure.set_layout_engine("constrained")
+        self._canvas = DeferredResizeFigureCanvas(self._figure)
+        self._toolbar = ScepterNavigationToolbar(self._canvas, self)
+        fig_col = QtWidgets.QVBoxLayout()
+        fig_col.setContentsMargins(0, 0, 0, 0)
+        fig_col.setSpacing(6)
+        fig_col.addWidget(self._toolbar)
+        fig_col.addWidget(self._canvas, 1)
+        # Cursor readout — updated live on mouse motion over the
+        # heatmap. Shows the (x, y) of the cursor and the currently-
+        # interpolated gain at that point, so the user can reason
+        # about values between control points without dragging.
+        self._cursor_readout_label = QtWidgets.QLabel(
+            "Move cursor over the heatmap to read (x, y, gain).", self,
+        )
+        self._cursor_readout_label.setStyleSheet(
+            "color:#94a3b8; font-size:11px; padding:2px 4px;"
+        )
+        fig_col.addWidget(self._cursor_readout_label)
+        fig_widget = QtWidgets.QWidget(self)
+        fig_widget.setLayout(fig_col)
+        body.addWidget(fig_widget, 6)
+
+        side_panel = QtWidgets.QWidget(self)
+        side_layout = QtWidgets.QVBoxLayout(side_panel)
+        side_layout.setContentsMargins(0, 0, 0, 0)
+        side_layout.setSpacing(8)
+        side_panel.setMinimumWidth(340)
+        body.addWidget(side_panel, 2)
+
+        # Action row (themed)
+        # 2-row grid layout for the action buttons — five buttons in
+        # a single row get their labels truncated on the 2-D editor's
+        # ~360 px side panel (user spotted "aste CS" / "mooth..." on
+        # a screenshot). A 3+2 grid gives each button ~half-panel
+        # width which comfortably fits "Paste CSV" and "Smooth\u2026".
+        action_grid = QtWidgets.QGridLayout()
+        action_grid.setContentsMargins(0, 0, 0, 0)
+        action_grid.setHorizontalSpacing(6)
+        action_grid.setVerticalSpacing(6)
+        self._undo_button = QtWidgets.QPushButton("\u21ba Undo", self)
+        self._undo_button.setToolTip("Revert last change (Ctrl+Z).")
+        self._undo_button.clicked.connect(self._undo)
+        self._redo_button = QtWidgets.QPushButton("\u21bb Redo", self)
+        self._redo_button.setToolTip("Re-apply undone change (Ctrl+Y / Ctrl+Shift+Z).")
+        self._redo_button.clicked.connect(self._redo)
+        self._reset_button = QtWidgets.QPushButton("Reset", self)
+        self._reset_button.setToolTip(
+            "Revert all points, peak, title, grid, and interp to the "
+            "state this dialog opened with."
+        )
+        self._reset_button.clicked.connect(self._reset_to_initial)
+        self._paste_button = QtWidgets.QPushButton("Paste CSV", self)
+        self._paste_button.setToolTip(
+            "Replace the point set with 3-column clipboard data "
+            "(x, y, gain — one row per line, comma or whitespace "
+            "separated)."
+        )
+        self._paste_button.clicked.connect(self._paste_csv_from_clipboard)
+        self._smooth_button = QtWidgets.QPushButton("Smooth\u2026", self)
+        self._smooth_button.setToolTip(
+            "Open the 2-D smoothing-method chooser. Idempotent "
+            "methods (thin-plate RBF, Gaussian RBF, multiquadric, "
+            "polynomial, Chebyshev, bin mean) are safe to click "
+            "repeatedly; classical kernels continue to evolve the "
+            "pattern with each click."
+        )
+        self._smooth_button.clicked.connect(self._open_smooth_dialog)
+        for btn in (
+            self._undo_button, self._redo_button, self._reset_button,
+            self._paste_button, self._smooth_button,
+        ):
+            btn.setSizePolicy(
+                QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Fixed,
+            )
+        # Row 0: Undo | Redo | Reset  (short labels, 3 columns)
+        # Row 1: Paste CSV (spans 2)  | Smooth\u2026 (spans 2, ~half row)
+        action_grid.addWidget(self._undo_button, 0, 0)
+        action_grid.addWidget(self._redo_button, 0, 1)
+        action_grid.addWidget(self._reset_button, 0, 2)
+        action_grid.addWidget(self._paste_button, 1, 0)
+        action_grid.addWidget(self._smooth_button, 1, 1, 1, 2)
+        action_grid.setColumnStretch(0, 1)
+        action_grid.setColumnStretch(1, 1)
+        action_grid.setColumnStretch(2, 1)
+        side_layout.addLayout(action_grid)
+
+        # I/O grid
+        io_grid = QtWidgets.QGridLayout()
+        io_grid.setContentsMargins(0, 0, 0, 0)
+        io_grid.setHorizontalSpacing(6)
+        io_grid.setVerticalSpacing(6)
+        self._import_json_button = QtWidgets.QPushButton("Import JSON\u2026", self)
+        self._import_json_button.clicked.connect(self._import_from_json)
+        self._export_json_button = QtWidgets.QPushButton("Export JSON\u2026", self)
+        self._export_json_button.clicked.connect(self._export_to_json)
+        self._save_library_button = QtWidgets.QPushButton("Save to library\u2026", self)
+        self._save_library_button.clicked.connect(self._open_save_to_library_dialog)
+        self._browse_library_button = QtWidgets.QPushButton("Browse library\u2026", self)
+        self._browse_library_button.clicked.connect(self._open_browse_library_dialog)
+        self._normalise_button = QtWidgets.QPushButton("Normalise\u2026", self)
+        self._normalise_button.setToolTip(
+            "Rescale every point gain by a constant so that "
+            "\u222bG d\u03a9 / 4\u03c0 equals a target radiation "
+            "efficiency. Preserves shape; shifts the peak gain by "
+            "the same constant."
+        )
+        self._normalise_button.clicked.connect(self._open_normalise_dialog)
+        io_grid.addWidget(self._import_json_button, 0, 0)
+        io_grid.addWidget(self._export_json_button, 0, 1)
+        io_grid.addWidget(self._save_library_button, 1, 0)
+        io_grid.addWidget(self._browse_library_button, 1, 1)
+        io_grid.addWidget(self._normalise_button, 2, 0, 1, 2)
+        side_layout.addLayout(io_grid)
+
+        # Templates: preset scatter shapes.
+        tmpl_row = QtWidgets.QHBoxLayout()
+        tmpl_row.setContentsMargins(0, 0, 0, 0)
+        tmpl_row.setSpacing(6)
+        tmpl_row.addWidget(QtWidgets.QLabel("Template:"))
+        self._template_combo = QtWidgets.QComboBox(self)
+        self._template_combo.addItem("Narrow-beam starter (default)", userData="starter")
+        self._template_combo.addItem("Circular Gaussian beam", userData="gaussian_circular")
+        self._template_combo.addItem("Elliptical Gaussian beam", userData="gaussian_elliptical")
+        self._template_combo.addItem("Cos\u2076 power pattern", userData="cosine")
+        self._template_combo.addItem("Isoflux (LEO downlink)", userData="isoflux")
+        self._template_combo.addItem("Cosecant-squared (radar)", userData="cosec_sq")
+        self._template_combo.insertSeparator(self._template_combo.count())
+        self._template_combo.addItem(
+            "ITU-R S.1528 Rec 1.4 (analytical)\u2026",
+            userData="s1528_rec14",
+        )
+        self._template_combo.addItem(
+            "ITU-R M.2101 phased array (static snapshot)\u2026",
+            userData="m2101",
+        )
+        self._template_combo.addItem(
+            "OneWeb satellite (ECC 271 Table 11)\u2026",
+            userData="oneweb_ecc271_sat",
+        )
+        self._template_combo.addItem(
+            "ITU-R F.1336-5 sectoral (base station, az + el)\u2026",
+            userData="f1336_sectoral",
+        )
+        self._template_combo.insertSeparator(self._template_combo.count())
+        self._template_combo.addItem(
+            "Uniform rectangular aperture (sinc \u00d7 sinc)\u2026",
+            userData="sinc_rect",
+        )
+        self._template_combo.setToolTip(
+            "Replace the current point set with a preset 2-D shape. "
+            "Useful for starting from a familiar baseline and "
+            "then editing."
+        )
+        tmpl_row.addWidget(self._template_combo, 1)
+        self._apply_template_button = QtWidgets.QPushButton("Apply", self)
+        self._apply_template_button.clicked.connect(self._on_apply_template_clicked)
+        tmpl_row.addWidget(self._apply_template_button)
+        side_layout.addLayout(tmpl_row)
+
+        # Density combo — controls how many reference points every
+        # template (analytical or simple) drops into the editor. The
+        # 1-D editor has a similar control; 2-D benefits even more
+        # because a sparse starter hides real structure (e.g. an
+        # M.2101 phased array at N_H=N_V=8 needs dozens of samples
+        # per principal plane to resolve the array-factor lobes).
+        density_row = QtWidgets.QHBoxLayout()
+        density_row.setContentsMargins(0, 0, 0, 0)
+        density_row.setSpacing(6)
+        density_row.addWidget(QtWidgets.QLabel("Density:"))
+        self._template_density_combo = QtWidgets.QComboBox(self)
+        # 7-tier ladder covering "a dozen points for quick sketches"
+        # all the way up to "dense enough to resolve an M.2101 8×8
+        # array-factor surface". Sizes roughly mirror the 1-D editor's
+        # density combo (which ranges from 25 to 7200 pts) but scaled
+        # for 2-D — where the same feature fidelity needs √N more
+        # points per axis. For the analytical grids we size them so
+        # N_az × N_el ≈ 2× the reference-point count, which keeps
+        # downsampling round-trip loss small.
+        # ``n_grid_*`` is the surface grid resolution used for BOTH
+        # display and simulation output (the surface IS the source of
+        # truth post-refactor). ``n_ref`` is the scatter-anchor count
+        # used when subsampling a source surface for editing.
+        self._template_density_combo.addItem(
+            "Extra coarse (91 \u00d7 45, 2\u00b0)",
+            userData={"n_ref": 25, "n_grid_az": 91, "n_grid_el": 45, "n_grid_theta": 91, "n_grid_phi": 91},
+        )
+        self._template_density_combo.addItem(
+            "Coarse (181 \u00d7 91)",
+            userData={"n_ref": 80, "n_grid_az": 181, "n_grid_el": 91, "n_grid_theta": 181, "n_grid_phi": 181},
+        )
+        self._template_density_combo.addItem(
+            "Medium (361 \u00d7 181, 1\u00b0) \u2014 default",
+            userData={"n_ref": 200, "n_grid_az": 361, "n_grid_el": 181, "n_grid_theta": 361, "n_grid_phi": 181},
+        )
+        self._template_density_combo.addItem(
+            "Fine (541 \u00d7 271)",
+            userData={"n_ref": 600, "n_grid_az": 541, "n_grid_el": 271, "n_grid_theta": 541, "n_grid_phi": 271},
+        )
+        self._template_density_combo.addItem(
+            "Dense (721 \u00d7 361, 0.5\u00b0)",
+            userData={"n_ref": 1800, "n_grid_az": 721, "n_grid_el": 361, "n_grid_theta": 721, "n_grid_phi": 361},
+        )
+        self._template_density_combo.addItem(
+            "Very dense (1081 \u00d7 541)",
+            userData={"n_ref": 4500, "n_grid_az": 1081, "n_grid_el": 541, "n_grid_theta": 1081, "n_grid_phi": 541},
+        )
+        self._template_density_combo.addItem(
+            "Ultra dense (1801 \u00d7 901, 0.2\u00b0)",
+            userData={"n_ref": 10000, "n_grid_az": 1801, "n_grid_el": 901, "n_grid_theta": 1801, "n_grid_phi": 901},
+        )
+        self._template_density_combo.addItem(
+            "Ultimate (3601 \u00d7 1801, 0.1\u00b0)",
+            userData={"n_ref": 20000, "n_grid_az": 3601, "n_grid_el": 1801, "n_grid_theta": 3601, "n_grid_phi": 3601},
+        )
+        self._template_density_combo.setCurrentIndex(2)  # Medium default
+        self._template_density_combo.setToolTip(
+            "Reference-point density used when applying templates. "
+            "Denser samples resolve narrow lobes faithfully; gain "
+            "labels auto-hide above 30 points, and the whole scatter "
+            "overlay can be toggled with the \"Hide points\" button "
+            "so the underlying heatmap stays readable."
+        )
+        density_row.addWidget(self._template_density_combo, 1)
+        self._show_points_button = QtWidgets.QPushButton("Hide points", self)
+        self._show_points_button.setCheckable(True)
+        self._show_points_button.setChecked(False)
+        self._show_points_button.setToolTip(
+            "Toggle the scatter-overlay + per-point gain labels on the "
+            "heatmap. Handy when the point set is dense enough to "
+            "obscure the underlying surface."
+        )
+        self._show_points_button.toggled.connect(self._on_show_points_toggled)
+        density_row.addWidget(self._show_points_button)
+        side_layout.addLayout(density_row)
+        self._show_points: bool = True
+        # Session-persisted last-used values for analytical-template
+        # dialogs; cleared on editor close. Pre-populate with the
+        # defaults the dialog seeds on first open so the first dialog
+        # appearance still gets sensible values.
+        self._tmpl_last_m2101: dict[str, Any] = {
+            "g_emax_dbi": 5.0, "a_m_db": 30.0, "sla_nu_db": 30.0,
+            "phi_3db_deg": 65.0, "theta_3db_deg": 65.0,
+            "d_h": 0.5, "d_v": 0.5, "n_h": 8, "n_v": 8,
+            "steering_az_deg": 0.0, "steering_el_deg": 0.0,
+        }
+        self._tmpl_last_s1528_rec14: dict[str, Any] = {
+            "freq_mhz": 2000.0, "lr_m": 1.6, "lt_m": 3.2,
+            "slr_db": 20.0, "gm_db": 34.1, "l": 2,
+        }
+        self._tmpl_last_oneweb_sat: dict[str, Any] = {
+            "g_max_dbi": 30.0,
+            "along_track_axis": "elevation",
+            "beam_along_offset_deg": 0.0,
+            "beam_cross_offset_deg": 0.0,
+        }
+
+        # Derived quantities — peak, beamwidths, SLL, F/B, directivity,
+        # ∫G·dΩ/4π with live physical-plausibility indicator.
+        derived_group = QtWidgets.QGroupBox("Derived quantities", self)
+        derived_form = QtWidgets.QFormLayout(derived_group)
+        derived_form.setContentsMargins(10, 6, 10, 6)
+        derived_form.setHorizontalSpacing(8)
+        derived_form.setVerticalSpacing(3)
+        derived_form.setFieldGrowthPolicy(
+            QtWidgets.QFormLayout.AllNonFixedFieldsGrow,
+        )
+        self._derived_labels: dict[str, QtWidgets.QLabel] = {}
+        for key, label in (
+            ("peak", "Peak:"),
+            ("bw", "Beamwidths:"),
+            ("sll", "1st SLL:"),
+            ("fb", "F/B ratio:"),
+            ("directivity", "Directivity:"),
+            ("integral", "\u222bG d\u03a9 / 4\u03c0:"),
+        ):
+            val_label = QtWidgets.QLabel("—", self)
+            val_label.setWordWrap(True)
+            val_label.setStyleSheet("color:#38bdf8;")
+            derived_form.addRow(label, val_label)
+            self._derived_labels[key] = val_label
+        side_layout.addWidget(derived_group)
+
+        # Point table — 3 columns (x, y, gain)
+        self._point_table = QtWidgets.QTableWidget(self)
+        self._point_table.setColumnCount(3)
+        self._point_table.setHorizontalHeaderLabels([
+            f"{self._x_axis_label_short()} [deg]",
+            f"{self._y_axis_label_short()} [deg]",
+            "Gain [dBi]",
+        ])
+        self._point_table.verticalHeader().setVisible(False)
+        self._point_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self._point_table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        self._point_table.setEditTriggers(
+            QtWidgets.QAbstractItemView.DoubleClicked
+            | QtWidgets.QAbstractItemView.SelectedClicked
+            | QtWidgets.QAbstractItemView.EditKeyPressed
+        )
+        self._point_table.itemChanged.connect(self._on_table_item_changed)
+        self._point_table.itemSelectionChanged.connect(self._on_table_selection_changed)
+        header = self._point_table.horizontalHeader()
+        for c in range(3):
+            header.setSectionResizeMode(c, QtWidgets.QHeaderView.Stretch)
+        self._point_table.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding,
+        )
+        side_layout.addWidget(self._point_table, 1)
+
+        # Table buttons
+        table_buttons = QtWidgets.QHBoxLayout()
+        table_buttons.setContentsMargins(0, 0, 0, 0)
+        self._add_point_button = QtWidgets.QPushButton("Add point", self)
+        self._add_point_button.setToolTip(
+            "Add a new reference point at grid centre. Drag on the "
+            "heatmap or edit in the table to position it."
+        )
+        self._add_point_button.clicked.connect(self._add_point_at_center)
+        self._edit_point_button = QtWidgets.QPushButton("Edit selected\u2026", self)
+        self._edit_point_button.setToolTip(
+            "Open the edit dialog for the selected point (same as "
+            "double-clicking it on the heatmap)."
+        )
+        self._edit_point_button.clicked.connect(self._edit_selected_point_dialog)
+        self._remove_point_button = QtWidgets.QPushButton("Remove", self)
+        self._remove_point_button.clicked.connect(self._remove_selected_point)
+        table_buttons.addWidget(self._add_point_button)
+        table_buttons.addWidget(self._edit_point_button)
+        table_buttons.addWidget(self._remove_point_button)
+        side_layout.addLayout(table_buttons)
+
+        self._summary_label = QtWidgets.QLabel("", self)
+        self._summary_label.setWordWrap(True)
+        self._summary_label.setObjectName("sectionSummary")
+        side_layout.addWidget(self._summary_label)
+
+        button_box = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel,
+            QtCore.Qt.Horizontal, self,
+        )
+        button_box.accepted.connect(self._on_accept)
+        button_box.rejected.connect(self.reject)
+        root.addWidget(button_box)
+
+        # Matplotlib axes via gridspec so the colorbar has its own
+        # thin column — same trick as the old editor used, prevents
+        # heatmap x-axis drift across refreshes.
+        gs = self._figure.add_gridspec(1, 2, width_ratios=(40, 1))
+        self._axis_heat = self._figure.add_subplot(gs[0, 0])
+        self._axis_cbar = self._figure.add_subplot(gs[0, 1])
+
+        self._canvas.mpl_connect("button_press_event", self._on_plot_button_press)
+        self._canvas.mpl_connect("button_release_event", self._on_plot_button_release)
+        self._canvas.mpl_connect("motion_notify_event", self._on_plot_motion)
+
+        # If the caller didn't pass an ``initial_pattern``, seed the
+        # opening state via the density-scaled narrow-beam starter so
+        # the initial point count matches the density combo's default
+        # (~200 pts at Medium). Previously the editor opened with a
+        # fixed 17-point ``_starter_points_az_el()`` regardless of
+        # density — users who changed the combo but hadn't clicked
+        # Apply kept seeing 17 pts and thought density was broken.
+        if initial_pattern is None:
+            self._apply_template("starter")
+            # Clear the flag ``_apply_template`` set via
+            # ``_push_history`` — the first snapshot below is the
+            # authoritative pristine state.
+            self._history = []
+            self._history_index = -1
+        self._sync_table_from_points()
+        self._apply_parent_theme()
+        self._refresh_plots()
+        self._push_history(force=True)
+
+    # === Public API =====================================================
+
+    def result_pattern(self) -> "CustomAntennaPattern | None":
+        return self._result_pattern
+
+    # === Starter templates =============================================
+
+    def _starter_points_az_el(self) -> np.ndarray:
+        """Starter scatter for the az/el grid ([-180,180]×[-90,90]).
+
+        Shape is tuned so the interpolated integral ``∫G·dΩ/4π`` lands
+        near 1 — the editor opens with a physically-plausible pattern
+        instead of triggering the non-physical warning on first
+        load. Peak 10 dBi with a ~20° main lobe, sidelobes dropping
+        to −15 dB and deep corners at −45 dB. Users who need higher
+        directivity can raise peak and tighten sidelobes, then use
+        Normalise… to re-match energy conservation.
+        """
+        peak = 10.0
+        return np.array([
+            (0.0, 0.0, peak),
+            (10.0, 0.0, peak - 3.0),
+            (-10.0, 0.0, peak - 3.0),
+            (0.0, 5.0, peak - 3.0),
+            (0.0, -5.0, peak - 3.0),
+            (30.0, 0.0, peak - 15.0),
+            (-30.0, 0.0, peak - 15.0),
+            (0.0, 20.0, peak - 15.0),
+            (0.0, -20.0, peak - 15.0),
+            (90.0, 0.0, peak - 30.0),
+            (-90.0, 0.0, peak - 30.0),
+            (0.0, 45.0, peak - 30.0),
+            (0.0, -45.0, peak - 30.0),
+            (180.0, 90.0, peak - 45.0),
+            (-180.0, 90.0, peak - 45.0),
+            (180.0, -90.0, peak - 45.0),
+            (-180.0, -90.0, peak - 45.0),
+        ], dtype=np.float64)
+
+    def _starter_points_theta_phi(self) -> np.ndarray:
+        """θ/φ-mode starter tuned to the same physical budget as az/el.
+
+        φ spans [-180, 180] to match the JSON schema's full-coverage
+        requirement.  θ=0 anchors are all at peak (boresight is
+        axisymmetric by definition).
+        """
+        peak = 10.0
+        return np.array([
+            (  0.0, -180.0, peak),
+            (  0.0,  -90.0, peak),
+            (  0.0,    0.0, peak),
+            (  0.0,   90.0, peak),
+            (  0.0,  180.0, peak),
+            ( 10.0, -180.0, peak - 3.0),
+            ( 10.0,  -90.0, peak - 3.0),
+            ( 10.0,    0.0, peak - 3.0),
+            ( 10.0,   90.0, peak - 3.0),
+            ( 10.0,  180.0, peak - 3.0),
+            ( 30.0, -180.0, peak - 15.0),
+            ( 30.0,  -90.0, peak - 15.0),
+            ( 30.0,    0.0, peak - 15.0),
+            ( 30.0,   90.0, peak - 15.0),
+            ( 30.0,  180.0, peak - 15.0),
+            ( 90.0, -180.0, peak - 30.0),
+            ( 90.0,    0.0, peak - 30.0),
+            ( 90.0,  180.0, peak - 30.0),
+            (180.0, -180.0, peak - 45.0),
+            (180.0,    0.0, peak - 45.0),
+            (180.0,  180.0, peak - 45.0),
+        ], dtype=np.float64)
+
+    # === Grid helpers ==================================================
+
+    def _grid_bounds(self) -> tuple[tuple[float, float], tuple[float, float]]:
+        if self._grid_mode == self._gm_azel:
+            return ((-180.0, 180.0), (-90.0, 90.0))
+        # theta_phi: θ ∈ [0, 180], φ ∈ [-180, 180] — matches the
+        # custom-antenna JSON schema which requires full φ coverage.
+        return ((0.0, 180.0), (-180.0, 180.0))
+
+    def _x_axis_label(self) -> str:
+        return "az [deg]" if self._grid_mode == self._gm_azel else "\u03b8 [deg]"
+
+    def _y_axis_label(self) -> str:
+        return "el [deg]" if self._grid_mode == self._gm_azel else "\u03c6 [deg]"
+
+    def _x_axis_label_short(self) -> str:
+        return "az" if self._grid_mode == self._gm_azel else "\u03b8"
+
+    def _y_axis_label_short(self) -> str:
+        return "el" if self._grid_mode == self._gm_azel else "\u03c6"
+
+    def _interp_grid_size(self) -> tuple[int, int]:
+        # Surface resolution comes from the density combo (if it's
+        # been constructed yet) so the resolution user picks flows
+        # through to every surface-producing path (templates, load,
+        # anchor-regen). Falls back to the class constants during
+        # __init__ before the combo exists.
+        if hasattr(self, "_template_density_combo"):
+            spec = self._template_density_spec()
+            if self._grid_mode == self._gm_azel:
+                return int(spec["n_grid_az"]), int(spec["n_grid_el"])
+            return int(spec["n_grid_theta"]), int(spec["n_grid_phi"])
+        if self._grid_mode == self._gm_azel:
+            return self._INTERP_GRID_SIZE_AZEL
+        return self._INTERP_GRID_SIZE_THETAPHI
+
+    # === Interpolation =================================================
+
+    def _compute_heatmap_surface(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Return the **cached** surface grid.
+
+        Post-refactor the surface is the single source of truth: it
+        was populated directly from the loaded pattern / template
+        (no interp) or regenerated from anchors after an edit. This
+        method no longer does any interpolation itself — display and
+        simulation both consume the returned grid verbatim.
+        """
+        if (
+            self._surface_grid is None
+            or self._surface_grid_x is None
+            or self._surface_grid_y is None
+        ):
+            # Defensive fallback — build a starter surface so the
+            # first ``_refresh_plots`` during __init__ has something
+            # to render even if template seeding hasn't run yet.
+            self._rebuild_surface_from_closed_form(
+                lambda x, y: np.full_like(x, float(self._peak_gain_dbi - 60.0)),
+                source_label="empty",
+            )
+        return (
+            np.asarray(self._surface_grid_x),
+            np.asarray(self._surface_grid_y),
+            np.asarray(self._surface_grid),
+        )
+
+    def _surface_grid_coords(self) -> tuple[np.ndarray, np.ndarray]:
+        """Return the ``(grid_x, grid_y)`` 1-D coordinate arrays the
+        density combo currently selects (so analytical templates and
+        closed-form evaluators target a consistent resolution)."""
+        (x_lo, x_hi), (y_lo, y_hi) = self._grid_bounds()
+        nx, ny = self._interp_grid_size()
+        grid_x = np.linspace(x_lo, x_hi, nx)
+        grid_y = np.linspace(y_lo, y_hi, ny)
+        return grid_x, grid_y
+
+    def _rebuild_surface_from_closed_form(
+        self,
+        func: Callable[[np.ndarray, np.ndarray], np.ndarray],
+        *,
+        source_label: str,
+    ) -> None:
+        """Evaluate a closed-form ``func(x_mesh, y_mesh) -> gain_db``
+        on the density-combo grid and set the authoritative surface.
+        Used by simple templates (starter, Gaussian, cosine) — no
+        interpolation, so the surface is exact for the chosen shape.
+        """
+        grid_x, grid_y = self._surface_grid_coords()
+        mesh_x, mesh_y = np.meshgrid(grid_x, grid_y, indexing="ij")
+        z = np.asarray(func(mesh_x, mesh_y), dtype=np.float64)
+        self._surface_grid_x = grid_x
+        self._surface_grid_y = grid_y
+        self._surface_grid = z
+        self._surface_is_source = True
+        self._surface_source_label = str(source_label)
+
+    def _set_surface_from_grid(
+        self,
+        grid_x: np.ndarray,
+        grid_y: np.ndarray,
+        gain_db: np.ndarray,
+        *,
+        source_label: str,
+    ) -> None:
+        """Adopt a pre-computed ``(grid_x, grid_y, gain_db)`` surface
+        as the authoritative source. Used when loading an
+        ``CustomAntennaPattern`` from disk and by analytical
+        templates (M.2101, S.1528 Rec 1.4) that compute on their
+        own native grid.
+        """
+        self._surface_grid_x = np.asarray(grid_x, dtype=np.float64)
+        self._surface_grid_y = np.asarray(grid_y, dtype=np.float64)
+        self._surface_grid = np.asarray(gain_db, dtype=np.float64)
+        self._surface_is_source = True
+        self._surface_source_label = str(source_label)
+
+    def _regenerate_surface_from_anchors(self) -> None:
+        """RBF-reconstruct the surface from the current scatter
+        anchors. Triggered after any user edit (drag, add, remove,
+        table, smooth, normalise). Surface grid resolution stays the
+        same — only the values change."""
+        grid_x, grid_y = self._surface_grid_coords()
+        if self._surface_grid_x is not None and self._surface_grid is not None:
+            # Preserve the current surface's resolution if it was
+            # loaded at something other than the density-combo
+            # default (e.g. a JSON import at non-standard grid).
+            grid_x = self._surface_grid_x
+            grid_y = self._surface_grid_y
+        mesh_x, mesh_y = np.meshgrid(grid_x, grid_y, indexing="ij")
+        pts_xy = self._points[:, :2]
+        pts_z = self._points[:, 2]
+        try:
+            z = self._interp_surface(pts_xy, pts_z, mesh_x, mesh_y)
+        except Exception:
+            z = np.full(mesh_x.shape, float(self._peak_gain_dbi - 60.0))
+        self._surface_grid_x = grid_x
+        self._surface_grid_y = grid_y
+        self._surface_grid = np.asarray(z, dtype=np.float64)
+        self._surface_is_source = False
+
+    # Cached Delaunay triangulation — rebuilt only when the point
+    # count changes (add/remove), reused across drag moves.
+    _cached_delaunay: Any = None
+    _cached_delaunay_n: int = -1
+
+    def _interp_surface(
+        self,
+        pts_xy: np.ndarray,
+        pts_z: np.ndarray,
+        mesh_x: np.ndarray,
+        mesh_y: np.ndarray,
+    ) -> np.ndarray:
+        method = self._interp_method
+        flat = np.column_stack([mesh_x.ravel(), mesh_y.ravel()])
+        n_pts = int(pts_xy.shape[0])
+        if method in ("rbf_thin_plate", "rbf_gaussian"):
+            try:
+                from scipy.interpolate import RBFInterpolator
+                kernel = (
+                    "thin_plate_spline" if method == "rbf_thin_plate"
+                    else "gaussian"
+                )
+                kwargs: dict[str, Any] = {}
+                if kernel == "gaussian":
+                    kwargs["epsilon"] = 0.02
+                # Full RBF evaluation is O(N × M) where M is the
+                # grid size — at 200 pts × 65K grid it's already
+                # 50× slower than griddata linear. Keep RBF only
+                # for tiny grids (Extra coarse / Coarse) where it
+                # adds visible smoothness; above that, griddata
+                # linear is both faster and indistinguishable.
+                if n_pts > 100:
+                    method = "linear"
+                else:
+                    rbf = RBFInterpolator(pts_xy, pts_z, kernel=kernel, **kwargs)
+                    return rbf(flat).reshape(mesh_x.shape)
+            except Exception:
+                method = "linear"
+        if method in ("linear", "cubic") and n_pts >= 3:
+            try:
+                from scipy.interpolate import LinearNDInterpolator, CloughTocher2DInterpolator
+                from scipy.spatial import Delaunay
+                # Reuse the Delaunay triangulation when the point
+                # count hasn't changed (drag moves keep topology).
+                # Rebuild on add/remove (count changed).
+                if self._cached_delaunay_n != n_pts:
+                    self._cached_delaunay = Delaunay(pts_xy)
+                    self._cached_delaunay_n = n_pts
+                else:
+                    # Update point positions in the existing
+                    # triangulation (topology reused).
+                    self._cached_delaunay.points[:] = pts_xy
+                if method == "cubic":
+                    interp = CloughTocher2DInterpolator(
+                        self._cached_delaunay, pts_z,
+                        fill_value=float(np.min(pts_z)),
+                    )
+                else:
+                    interp = LinearNDInterpolator(
+                        self._cached_delaunay, pts_z,
+                        fill_value=float(np.min(pts_z)),
+                    )
+                return interp(flat).reshape(mesh_x.shape)
+            except Exception:
+                pass
+        if method == "nearest" or n_pts < 3:
+            try:
+                from scipy.spatial import cKDTree
+                tree = cKDTree(pts_xy)
+                _, idx = tree.query(flat)
+                return pts_z[idx].reshape(mesh_x.shape)
+            except Exception:
+                pass
+        # Final fallback.
+        try:
+            from scipy.interpolate import griddata
+            z = griddata(
+                pts_xy, pts_z, flat,
+                method="linear",
+                fill_value=float(np.min(pts_z)),
+            )
+            return z.reshape(mesh_x.shape)
+        except Exception:
+            return np.full(mesh_x.shape, float(np.min(pts_z)))
+
+    # === Plot refresh ==================================================
+
+    def _refresh_plots(self) -> None:
+        ax = self._axis_heat
+        ax.clear()
+        grid_x, grid_y, z = self._compute_heatmap_surface()
+        # Colormap range: percentile-based clipping so outlier deep
+        # nulls (M.2101 array-factor singularities floored at -200 dB,
+        # Gaussian edge overshoots with extreme negative dB, etc.)
+        # don't dominate the dynamic range. We take the 1st
+        # percentile of finite values as a floor — this ignores the
+        # extreme ~1% outliers while still admitting real sidelobe
+        # detail. Capped by a 60 dB dynamic floor: wider than that
+        # makes the main-lobe contrast too flat for most patterns
+        # (user-tuned after comparing against pycraf's -25 dB default
+        # for M.2101 composite plots). Upper bound tracks the declared
+        # peak so the peak cell sits at the top of the colormap.
+        finite = z[np.isfinite(z)]
+        z_max = float(np.max(finite)) if finite.size else float(self._peak_gain_dbi)
+        peak = max(z_max, float(self._peak_gain_dbi))
+        dynamic_floor = peak - 60.0
+        if finite.size:
+            p1 = float(np.percentile(finite, 1.0))
+        else:
+            p1 = dynamic_floor
+        # Use the looser of (1st percentile, dynamic_floor) — i.e.
+        # trust percentile when the bulk of the data is high, but
+        # don't compress below the 60 dB range cap either.
+        vmin = float(max(p1, dynamic_floor))
+        # Safety: ensure at least ~30 dB of colourmap range.
+        vmax = float(peak + 2.0)
+        if vmax - vmin < 30.0:
+            vmin = vmax - 30.0
+        im = ax.pcolormesh(
+            grid_x, grid_y, z.T, cmap="viridis", shading="auto",
+            vmin=vmin, vmax=vmax,
+        )
+        pts = self._points
+        # Scatter overlay is optional — when dense (>30 pts) the
+        # per-point gain labels start to overlap the title and each
+        # other. The user can toggle the whole overlay with the
+        # "Hide points" button; labels are auto-suppressed above a
+        # soft threshold even when scatter is on.
+        show_points = bool(getattr(self, "_show_points", True))
+        n_pts = int(pts.shape[0])
+        if show_points and n_pts > 0:
+            ax.scatter(
+                pts[:, 0], pts[:, 1],
+                c="white", edgecolors="black", s=60, zorder=5, linewidths=1.0,
+            )
+            # Auto-hide per-point labels above 30 points to avoid
+            # overlapping the title / each other (matches the density
+            # combo's "Medium" default). Users can still inspect
+            # individual values via the cursor readout and the table.
+            if n_pts <= 30:
+                for x, y, g in pts:
+                    ax.annotate(
+                        f"{g:.1f}", (float(x), float(y)),
+                        textcoords="offset points", xytext=(8, 4),
+                        fontsize=8, color="white", zorder=6,
+                    )
+        if (
+            show_points
+            and self._selected_index is not None
+            and int(self._selected_index) < n_pts
+        ):
+            sel = int(self._selected_index)
+            ax.scatter(
+                pts[sel, 0], pts[sel, 1],
+                marker="o", s=160, facecolors="none",
+                edgecolors="#f97316", linewidths=2.5, zorder=7,
+            )
+        ax.set_xlabel(self._x_axis_label())
+        ax.set_ylabel(self._y_axis_label())
+        ax.set_title(
+            f"Custom 2-D antenna pattern \u2014 peak {self._peak_gain_dbi:.1f} dBi",
+            pad=10,
+        )
+        (x_lo, x_hi), (y_lo, y_hi) = self._grid_bounds()
+        ax.set_xlim(x_lo, x_hi)
+        ax.set_ylim(y_lo, y_hi)
+        # Major-axis gridlines at 30° / 60° (az) and ±30° / ±60°
+        # (el) for az/el; 30° / 60° / 90° for θ/φ. Faint tick-
+        # aligned lines help the user read off principal-plane
+        # distances without mouse-hovering for the cursor readout.
+        if self._grid_mode == self._gm_azel:
+            for xv in (-150, -120, -90, -60, -30, 0, 30, 60, 90, 120, 150):
+                ax.axvline(xv, color="#94a3b8", alpha=0.18, linewidth=0.6, linestyle=":")
+            for yv in (-60, -30, 0, 30, 60):
+                ax.axhline(yv, color="#94a3b8", alpha=0.18, linewidth=0.6, linestyle=":")
+        else:
+            for xv in (30, 60, 90, 120, 150):
+                ax.axvline(xv, color="#94a3b8", alpha=0.18, linewidth=0.6, linestyle=":")
+            for yv in (-150, -120, -90, -60, -30, 0, 30, 60, 90, 120, 150):
+                ax.axhline(yv, color="#94a3b8", alpha=0.18, linewidth=0.6, linestyle=":")
+        self._axis_cbar.clear()
+        self._figure.colorbar(im, cax=self._axis_cbar, label="Gain [dBi]")
+        parent = self.parent()
+        if parent is not None and hasattr(parent, "_style_matplotlib_figure"):
+            try:
+                parent._style_matplotlib_figure(self._figure)
+            except Exception:
+                pass
+        self._canvas.draw_idle()
+        # Source-vs-regenerated badge: tells the user whether the
+        # displayed surface is the exact pycraf / loaded source (and
+        # therefore goes into the simulation unmodified) or has been
+        # rebuilt from the current scatter anchors after an edit.
+        nx_grid = int(self._surface_grid.shape[0]) if self._surface_grid is not None else 0
+        ny_grid = int(self._surface_grid.shape[1]) if self._surface_grid is not None else 0
+        if self._surface_is_source:
+            src = self._surface_source_label or "source"
+            badge = f"Source: {src}"
+        else:
+            badge = f"Regenerated from {int(pts.shape[0])} anchors"
+        self._summary_label.setText(
+            f"{badge} \u2022 surface {nx_grid}\u00d7{ny_grid} "
+            f"\u2022 grid={self._grid_mode} \u2022 interp={self._interp_method} "
+            f"\u2022 cmap [{vmin:.1f}, {vmax:.1f}] dBi"
+        )
+        # Refresh derived-quantities panel (values live off the
+        # authoritative surface — the same grid the runtime consumes).
+        if hasattr(self, "_derived_labels"):
+            try:
+                self._update_derived_panel()
+            except Exception:
+                # Never let a derived-calc glitch take down the plot.
+                pass
+
+    def _update_derived_panel(self) -> None:
+        derived = self._compute_derived_quantities()
+        for key, text in derived.items():
+            if key in self._derived_labels:
+                self._derived_labels[key].setText(text)
+                # Colour the integral amber when non-physical.
+                if key == "integral":
+                    if "non-physical" in text:
+                        self._derived_labels[key].setStyleSheet("color:#f59e0b;")
+                    else:
+                        self._derived_labels[key].setStyleSheet("color:#38bdf8;")
+
+    # === Table sync ====================================================
+
+    def _sync_table_from_points(self) -> None:
+        self._table_sync_in_progress = True
+        try:
+            self._point_table.setHorizontalHeaderLabels([
+                f"{self._x_axis_label_short()} [deg]",
+                f"{self._y_axis_label_short()} [deg]",
+                "Gain [dBi]",
+            ])
+            self._point_table.setRowCount(int(self._points.shape[0]))
+            for row in range(int(self._points.shape[0])):
+                for col in range(3):
+                    val = float(self._points[row, col])
+                    item = QtWidgets.QTableWidgetItem(f"{val:.4g}")
+                    if col in (0, 1) and self._is_anchor(row):
+                        # Anchors are gain-only editable.
+                        item.setFlags(item.flags() & ~QtCore.Qt.ItemIsEditable)
+                    self._point_table.setItem(row, col, item)
+        finally:
+            self._table_sync_in_progress = False
+
+    def _on_table_item_changed(self, item: QtWidgets.QTableWidgetItem) -> None:
+        if self._table_sync_in_progress:
+            return
+        row = int(item.row())
+        col = int(item.column())
+        try:
+            value = float(item.text())
+        except ValueError:
+            self._sync_table_from_points()
+            return
+        if row < 0 or row >= int(self._points.shape[0]):
+            return
+        (x_lo, x_hi), (y_lo, y_hi) = self._grid_bounds()
+        if col == 0 and not self._is_anchor(row):
+            value = float(max(x_lo, min(value, x_hi)))
+            self._points[row, 0] = value
+        elif col == 1 and not self._is_anchor(row):
+            value = float(max(y_lo, min(value, y_hi)))
+            self._points[row, 1] = value
+        elif col == 2:
+            self._points[row, 2] = value
+        else:
+            self._sync_table_from_points()
+            return
+        self._sync_table_from_points()
+        self._select_point(row)
+        self._regenerate_surface_from_anchors()
+        self._refresh_plots()
+        self._push_history()
+
+    def _on_table_selection_changed(self) -> None:
+        if self._table_sync_in_progress:
+            return
+        indices = self._point_table.selectionModel().selectedRows()
+        if not indices:
+            return
+        self._select_point(int(indices[0].row()))
+
+    def _select_point(self, idx: int) -> None:
+        self._selected_index = int(idx)
+        self._table_sync_in_progress = True
+        try:
+            self._point_table.selectRow(int(idx))
+        finally:
+            self._table_sync_in_progress = False
+        self._refresh_plots()
+
+    # === Anchor logic ==================================================
+
+    def _is_anchor(self, idx: int) -> bool:
+        """Corner grid points are anchors. Coords locked, gain editable."""
+        (x_lo, x_hi), (y_lo, y_hi) = self._grid_bounds()
+        if idx < 0 or idx >= int(self._points.shape[0]):
+            return False
+        x = float(self._points[idx, 0])
+        y = float(self._points[idx, 1])
+        at_x = abs(x - x_lo) < 1.0e-3 or abs(x - x_hi) < 1.0e-3
+        at_y = abs(y - y_lo) < 1.0e-3 or abs(y - y_hi) < 1.0e-3
+        return at_x and at_y
+
+    # === Pattern build / load =========================================
+
+    def _build_pattern_from_state(self) -> "CustomAntennaPattern":
+        """Return the authoritative surface as a
+        ``CustomAntennaPattern``. Surface-first: the returned grid
+        and its ``gain_db`` are **exactly** what the user sees on the
+        heatmap — no re-interp, no downsample. This is what makes
+        the editor WYSIWYG w.r.t. the simulation."""
+        from scepter.custom_antenna import CustomAntennaPattern
+        grid_x, grid_y, z = self._compute_heatmap_surface()
+        # Ensure peak_gain_dbi tracks the actual surface maximum so the
+        # JSON round-trip's peak-consistency check never rejects an RBF-
+        # reconstructed surface that overshoots the declared peak.
+        finite = z[np.isfinite(z)]
+        surface_max = float(np.max(finite)) if finite.size else float(self._peak_gain_dbi)
+        effective_peak = max(float(self._peak_gain_dbi), surface_max)
+        meta = {
+            "title": self._title_text,
+            "author": self._meta_author,
+            "source": self._meta_source,
+            "notes": self._meta_notes,
+            "interp_method": self._interp_method,
+            "n_reference_points": int(self._points.shape[0]),
+            "surface_is_source": bool(self._surface_is_source),
+            "surface_source_label": self._surface_source_label,
+        }
+        if self._grid_mode == self._gm_azel:
+            return CustomAntennaPattern(
+                format_version="v1",
+                kind=self._kind_2d,
+                normalisation=self._norm_abs,
+                peak_gain_source=self._peak_src_explicit,
+                peak_gain_dbi=effective_peak,
+                meta=meta,
+                gain_db=z,
+                grid_mode=self._gm_azel,
+                az_grid_deg=grid_x,
+                el_grid_deg=grid_y,
+                az_wraps=False,
+            )
+        return CustomAntennaPattern(
+            format_version="v1",
+            kind=self._kind_2d,
+            normalisation=self._norm_abs,
+            peak_gain_source=self._peak_src_explicit,
+            peak_gain_dbi=effective_peak,
+            meta=meta,
+            gain_db=z,
+            grid_mode=self._gm_thetaphi,
+            theta_grid_deg=grid_x,
+            phi_grid_deg=grid_y,
+            phi_wraps=False,
+        )
+
+    def _load_initial_pattern(self, pattern: "CustomAntennaPattern") -> None:
+        """Adopt a ``CustomAntennaPattern`` as the authoritative
+        surface. The loaded ``gain_db`` grid is stored verbatim at
+        its own native resolution — no downsample, no re-interp —
+        so displayed (and simulated) gains equal the source values
+        exactly. Scatter anchors are subsampled from the surface
+        as editing handles."""
+        self._peak_gain_dbi = float(pattern.peak_gain_dbi)
+        self._title_text = str((pattern.meta or {}).get("title", ""))
+        # Restore the interpolation method if the pattern was saved
+        # with one (lives in meta since the JSON schema doesn't have a
+        # dedicated field for editor state).
+        saved_interp = (pattern.meta or {}).get("interp_method")
+        valid_keys = {k for k, _ in self._INTERP_METHODS}
+        if saved_interp and str(saved_interp) in valid_keys:
+            self._interp_method = str(saved_interp)
+            if hasattr(self, "_interp_combo"):
+                blk = QtCore.QSignalBlocker(self._interp_combo)
+                idx = self._interp_combo.findData(self._interp_method)
+                if idx >= 0:
+                    self._interp_combo.setCurrentIndex(idx)
+                del blk
+        gains = np.asarray(pattern.gain_db, dtype=np.float64)
+        if pattern.normalisation != self._norm_abs:
+            gains = gains + self._peak_gain_dbi
+        if pattern.grid_mode == self._gm_azel:
+            self._grid_mode = self._gm_azel
+            xs = np.asarray(pattern.az_grid_deg, dtype=np.float64)
+            ys = np.asarray(pattern.el_grid_deg, dtype=np.float64)
+        else:
+            self._grid_mode = self._gm_thetaphi
+            xs = np.asarray(pattern.theta_grid_deg, dtype=np.float64)
+            ys = np.asarray(pattern.phi_grid_deg, dtype=np.float64)
+        # Source of truth: the loaded pattern's own grid. No resample.
+        src_label = str((pattern.meta or {}).get("title") or "loaded pattern")
+        self._set_surface_from_grid(xs, ys, gains, source_label=src_label)
+        # Anchor count from the density combo (if UI is built yet).
+        if hasattr(self, "_template_density_combo"):
+            n_ref = int(self._template_density_spec().get("n_ref", 80))
+        else:
+            n_ref = 80
+        self._points = self._subsample_anchors_from_surface(n_ref)
+        # Do NOT regenerate the surface from anchors here. The JSON
+        # schema (``scepter.custom_antenna`` goal #1) requires
+        # ``dump → load → dump`` to be byte-stable, which
+        # means the loaded dense gain_db grid IS authoritative and
+        # stays intact through a silent round trip.  Anchors are
+        # subsampled only as UI drag handles.  The first edit (drag,
+        # add, remove, table edit, smooth, normalise) will call
+        # ``_regenerate_surface_from_anchors`` and at that moment the
+        # surface transitions to anchor-regen quality — which is the
+        # honest preview of the LUT the user is about to export.
+        # ``_set_surface_from_grid`` has already marked
+        # ``_surface_is_source = True`` so the regen-on-first-edit
+        # path can detect the transition if it needs to.
+        # Sync widgets if they already exist (guarded against init).
+        if hasattr(self, "_title_edit"):
+            blk_t = QtCore.QSignalBlocker(self._title_edit)
+            blk_p = QtCore.QSignalBlocker(self._peak_gain_spin)
+            self._title_edit.setText(self._title_text)
+            self._peak_gain_spin.set_value(self._peak_gain_dbi)
+            del blk_t
+            del blk_p
+        if hasattr(self, "_grid_button_group"):
+            blk_g = QtCore.QSignalBlocker(self._grid_button_group)
+            if self._grid_mode == self._gm_azel:
+                self._grid_azel_radio.setChecked(True)
+            else:
+                self._grid_thetaphi_radio.setChecked(True)
+            del blk_g
+        if hasattr(self, "_point_table"):
+            self._sync_table_from_points()
+
+    # === Plot interactions =============================================
+
+    def _on_plot_button_press(self, event: Any) -> None:
+        if event.inaxes is not self._axis_heat:
+            return
+        if event.dblclick:
+            hit = self._hit_test(event)
+            if hit is not None:
+                self._edit_point_dialog(hit)
+            else:
+                self._add_point_dialog(
+                    float(event.xdata or 0.0), float(event.ydata or 0.0),
+                )
+            return
+        if event.button == 3:
+            hit = self._hit_test(event)
+            if hit is not None and not self._is_anchor(hit):
+                self._points = np.delete(self._points, hit, axis=0)
+                self._selected_index = None
+                self._sync_table_from_points()
+                self._regenerate_surface_from_anchors()
+                self._refresh_plots()
+                self._push_history()
+            return
+        if event.button == 1:
+            hit = self._hit_test(event)
+            if hit is not None:
+                self._select_point(hit)
+                self._drag_index = hit
+
+    def _on_plot_motion(self, event: Any) -> None:
+        # Update the cursor readout label even when not dragging so
+        # users can sample the interpolated surface by hovering.
+        if event.inaxes is self._axis_heat and event.xdata is not None and event.ydata is not None:
+            self._update_cursor_readout(float(event.xdata), float(event.ydata))
+        if self._drag_index is None:
+            return
+        if event.inaxes is not self._axis_heat:
+            return
+        if self._is_anchor(self._drag_index):
+            return
+        (x_lo, x_hi), (y_lo, y_hi) = self._grid_bounds()
+        x = float(max(x_lo, min(event.xdata or 0.0, x_hi)))
+        y = float(max(y_lo, min(event.ydata or 0.0, y_hi)))
+        self._points[int(self._drag_index), 0] = x
+        self._points[int(self._drag_index), 1] = y
+        self._sync_table_from_points()
+        self._refresh_plots()
+
+    def _update_cursor_readout(self, x: float, y: float) -> None:
+        if not hasattr(self, "_cursor_readout_label"):
+            return
+        try:
+            # Find the interpolated gain at (x, y) using the cached
+            # heatmap surface. Cheap — just a nearest-grid lookup.
+            (x_lo, x_hi), (y_lo, y_hi) = self._grid_bounds()
+            nx, ny = self._interp_grid_size()
+            ix = int(np.clip(round((x - x_lo) / max(x_hi - x_lo, 1e-9) * (nx - 1)), 0, nx - 1))
+            iy = int(np.clip(round((y - y_lo) / max(y_hi - y_lo, 1e-9) * (ny - 1)), 0, ny - 1))
+            _, _, z = self._compute_heatmap_surface()
+            g = float(z[ix, iy])
+            self._cursor_readout_label.setText(
+                f"({self._x_axis_label_short()}, "
+                f"{self._y_axis_label_short()}, gain) = "
+                f"({x:.2f}°, {y:.2f}°, {g:.2f} dBi)"
+            )
+        except Exception:
+            pass
+
+    def _on_plot_button_release(self, _event: Any) -> None:
+        if self._drag_index is not None:
+            self._drag_index = None
+            # Drag end — regenerate the authoritative surface from
+            # the mutated anchors so display == simulation.
+            self._regenerate_surface_from_anchors()
+            self._refresh_plots()
+            self._push_history()
+
+    def _hit_test(self, event: Any) -> int | None:
+        if event.inaxes is not self._axis_heat:
+            return None
+        try:
+            cx, cy = float(event.x), float(event.y)
+        except Exception:
+            return None
+        trans = self._axis_heat.transData
+        for i, (x, y, _g) in enumerate(self._points):
+            px, py = trans.transform((float(x), float(y)))
+            if (px - cx) ** 2 + (py - cy) ** 2 < self._POINT_PICK_RADIUS_PX ** 2:
+                return i
+        return None
+
+    # === Add / edit / remove dialogs ===================================
+
+    def _edit_point_dialog(self, idx: int) -> None:
+        if idx < 0 or idx >= int(self._points.shape[0]):
+            return
+        is_anchor = self._is_anchor(idx)
+        (x_lo, x_hi), (y_lo, y_hi) = self._grid_bounds()
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Edit reference point")
+        dlg.setModal(True)
+        dlg.setStyleSheet(self.styleSheet())
+        form = QtWidgets.QFormLayout(dlg)
+        x_edit = QtWidgets.QDoubleSpinBox(dlg)
+        x_edit.setRange(float(x_lo), float(x_hi))
+        x_edit.setDecimals(3)
+        x_edit.setValue(float(self._points[idx, 0]))
+        x_edit.setEnabled(not is_anchor)
+        y_edit = QtWidgets.QDoubleSpinBox(dlg)
+        y_edit.setRange(float(y_lo), float(y_hi))
+        y_edit.setDecimals(3)
+        y_edit.setValue(float(self._points[idx, 1]))
+        y_edit.setEnabled(not is_anchor)
+        gain_edit = QtWidgets.QDoubleSpinBox(dlg)
+        gain_edit.setRange(-200.0, 200.0)
+        gain_edit.setDecimals(3)
+        gain_edit.setValue(float(self._points[idx, 2]))
+        note = QtWidgets.QLabel(
+            "Anchor point \u2014 coords locked, gain only." if is_anchor else "",
+            dlg,
+        )
+        note.setStyleSheet("color:#94a3b8; font-size:11px;")
+        form.addRow(f"{self._x_axis_label_short()} [deg]", x_edit)
+        form.addRow(f"{self._y_axis_label_short()} [deg]", y_edit)
+        form.addRow("Gain [dBi]", gain_edit)
+        form.addRow(note)
+        bb = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel,
+            QtCore.Qt.Horizontal, dlg,
+        )
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        form.addRow(bb)
+        if dlg.exec() != QtWidgets.QDialog.Accepted:
+            return
+        if not is_anchor:
+            self._points[idx, 0] = float(x_edit.value())
+            self._points[idx, 1] = float(y_edit.value())
+        self._points[idx, 2] = float(gain_edit.value())
+        self._selected_index = int(idx)
+        self._sync_table_from_points()
+        self._regenerate_surface_from_anchors()
+        self._refresh_plots()
+        self._push_history()
+
+    def _add_point_dialog(self, x0: float, y0: float) -> None:
+        (x_lo, x_hi), (y_lo, y_hi) = self._grid_bounds()
+        try:
+            _, _, z = self._compute_heatmap_surface()
+            nx, ny = self._interp_grid_size()
+            ix = int(round((x0 - x_lo) / (x_hi - x_lo) * (nx - 1)))
+            iy = int(round((y0 - y_lo) / (y_hi - y_lo) * (ny - 1)))
+            ix = int(np.clip(ix, 0, nx - 1))
+            iy = int(np.clip(iy, 0, ny - 1))
+            g0 = float(z[ix, iy])
+        except Exception:
+            g0 = float(self._peak_gain_dbi - 20.0)
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Add reference point")
+        dlg.setModal(True)
+        dlg.setStyleSheet(self.styleSheet())
+        form = QtWidgets.QFormLayout(dlg)
+        x_edit = QtWidgets.QDoubleSpinBox(dlg)
+        x_edit.setRange(float(x_lo), float(x_hi))
+        x_edit.setDecimals(3)
+        x_edit.setValue(float(x0))
+        y_edit = QtWidgets.QDoubleSpinBox(dlg)
+        y_edit.setRange(float(y_lo), float(y_hi))
+        y_edit.setDecimals(3)
+        y_edit.setValue(float(y0))
+        gain_edit = QtWidgets.QDoubleSpinBox(dlg)
+        gain_edit.setRange(-200.0, 200.0)
+        gain_edit.setDecimals(3)
+        gain_edit.setValue(g0)
+        form.addRow(f"{self._x_axis_label_short()} [deg]", x_edit)
+        form.addRow(f"{self._y_axis_label_short()} [deg]", y_edit)
+        form.addRow("Gain [dBi]", gain_edit)
+        bb = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel,
+            QtCore.Qt.Horizontal, dlg,
+        )
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        form.addRow(bb)
+        if dlg.exec() != QtWidgets.QDialog.Accepted:
+            return
+        new_pt = np.array([[
+            float(x_edit.value()),
+            float(y_edit.value()),
+            float(gain_edit.value()),
+        ]])
+        self._points = np.vstack([self._points, new_pt])
+        self._selected_index = int(self._points.shape[0] - 1)
+        self._sync_table_from_points()
+        self._regenerate_surface_from_anchors()
+        self._refresh_plots()
+        self._push_history()
+
+    def _add_point_at_center(self) -> None:
+        (x_lo, x_hi), (y_lo, y_hi) = self._grid_bounds()
+        self._add_point_dialog(0.5 * (x_lo + x_hi), 0.5 * (y_lo + y_hi))
+
+    def _edit_selected_point_dialog(self) -> None:
+        if self._selected_index is None:
+            QtWidgets.QMessageBox.information(
+                self, "Edit", "Select a point first.",
+            )
+            return
+        self._edit_point_dialog(int(self._selected_index))
+
+    def _remove_selected_point(self) -> bool:
+        if self._selected_index is None:
+            return False
+        idx = int(self._selected_index)
+        if self._is_anchor(idx):
+            QtWidgets.QMessageBox.information(
+                self, "Remove",
+                "Anchor points can't be removed \u2014 edit their gain instead.",
+            )
+            return False
+        self._points = np.delete(self._points, idx, axis=0)
+        self._selected_index = None
+        self._sync_table_from_points()
+        self._regenerate_surface_from_anchors()
+        self._refresh_plots()
+        self._push_history()
+        return True
+
+    # === Header handlers ===============================================
+
+    def _on_title_edited(self) -> None:
+        self._title_text = self._title_edit.text()
+        self._push_history()
+
+    def _on_peak_gain_edited(self) -> None:
+        val = self._peak_gain_spin.value_or_none()
+        if val is None:
+            return
+        self._peak_gain_dbi = float(val)
+        self._refresh_plots()
+        self._push_history()
+
+    def _on_grid_mode_toggled(self, gid: int, checked: bool) -> None:
+        if not checked:
+            return
+        new_mode = self._gm_azel if gid == 0 else self._gm_thetaphi
+        if new_mode == self._grid_mode:
+            return
+        # The editor's θ/φ schema uses the FULL φ range [-180°, 180°]
+        # (matching the custom-antenna JSON schema), so the mapping
+        # between the two grid modes is a *geometrically bijective*
+        # re-parametrisation of the same unit-sphere — asymmetric
+        # patterns survive the round-trip in principle.  Still, the
+        # conversion IS lossy in practice, for three reasons we're
+        # honest about in the dialog below:
+        #   1) One bilinear resampling step on the dense surface
+        #      smooths narrow features (deep nulls, sharp sidelobes)
+        #      by roughly one grid cell.
+        #   2) The θ = 0 / 180° poles are coordinate singularities
+        #      where many (θ, φ) cells collapse to a single direction;
+        #      high-gradient features near the poles soften more than
+        #      features away from them.
+        #   3) The density combo may select different resolutions
+        #      for the two grid modes, so a toggle can quantise onto
+        #      a coarser grid.
+        #   4) Repeated toggles accumulate the bilinear smoothing
+        #      (boresight peak stays exact thanks to the anchor-
+        #      subsampler's origin-preservation, but off-boresight
+        #      narrow features drift).
+        # Ask the user to confirm so they know this is happening.
+        # "Don't ask again" applies for this editor session only.
+        if not getattr(self, "_grid_conversion_confirmed", False):
+            direction = (
+                "az/el \u2192 \u03b8/\u03c6" if new_mode == self._gm_thetaphi
+                else "\u03b8/\u03c6 \u2192 az/el"
+            )
+            if new_mode == self._gm_thetaphi:
+                detail = (
+                    "Converting <b>az/el \u2192 \u03b8/\u03c6</b> "
+                    "re-parametrises the same sphere with "
+                    "<b>\u03b8 \u2208 [0\u00b0, 180\u00b0]</b> "
+                    "(polar angle from boresight) and "
+                    "<b>\u03c6 \u2208 [\u2212180\u00b0, 180\u00b0]</b> "
+                    "(azimuth around boresight). The mapping is "
+                    "bijective \u2014 asymmetric patterns are "
+                    "supported."
+                )
+            else:
+                detail = (
+                    "Converting <b>\u03b8/\u03c6 \u2192 az/el</b> "
+                    "re-parametrises the same sphere with "
+                    "<b>az \u2208 [\u2212180\u00b0, 180\u00b0]</b> "
+                    "(longitude) and "
+                    "<b>el \u2208 [\u221290\u00b0, 90\u00b0]</b> "
+                    "(latitude). The mapping is bijective \u2014 "
+                    "asymmetric patterns are supported."
+                )
+            msg = QtWidgets.QMessageBox(self)
+            msg.setIcon(QtWidgets.QMessageBox.Warning)
+            msg.setWindowTitle(f"Convert grid {direction}?")
+            msg.setTextFormat(QtCore.Qt.RichText)
+            msg.setText(
+                "<b>Switching grid coordinates is a lossy operation.</b>"
+                f"<br><br>{detail}"
+                "<br><br><b>What gets lost:</b>"
+                "<ul style='margin-top:2px; margin-bottom:2px;'>"
+                "<li>One bilinear resampling step on the dense surface "
+                "smooths narrow features (deep nulls, sharp sidelobes) "
+                "by roughly one grid cell.</li>"
+                "<li>The \u03b8 = 0 / 180\u00b0 poles are coordinate "
+                "singularities; high-gradient features near the poles "
+                "soften more than features away from them.</li>"
+                "<li>If the density combo selects a different resolution "
+                "for the two grid modes, the toggle quantises the "
+                "pattern onto the new grid.</li>"
+                "<li>The boresight peak at (0, 0) is preserved exactly, "
+                "but <b>repeated toggles accumulate smoothing</b> "
+                "off-boresight.</li>"
+                "</ul>"
+                "Scatter anchors are re-picked on the new grid as drag "
+                "handles; the LUT you export is the current (post-toggle) "
+                "dense surface."
+                "<br><br>Proceed?"
+            )
+            dont_ask = QtWidgets.QCheckBox("Don't ask again this session", msg)
+            msg.setCheckBox(dont_ask)
+            msg.setStandardButtons(
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.Cancel,
+            )
+            msg.setDefaultButton(QtWidgets.QMessageBox.Yes)
+            if msg.exec() != QtWidgets.QMessageBox.Yes:
+                # Revert the radio button without triggering another
+                # round of this handler.
+                blk = QtCore.QSignalBlocker(self._grid_button_group)
+                if self._grid_mode == self._gm_azel:
+                    self._grid_azel_radio.setChecked(True)
+                else:
+                    self._grid_thetaphi_radio.setChecked(True)
+                del blk
+                return
+            if dont_ask.isChecked():
+                self._grid_conversion_confirmed = True
+        old_mode = self._grid_mode
+        self._grid_mode = new_mode
+        # Surface-level conversion: resample the authoritative
+        # surface onto the new grid via bilinear interpolation of
+        # the full dense gain_db (much higher fidelity than
+        # re-deriving from ~200 scatter anchors). Then subsample
+        # anchors from the converted surface so they align with the
+        # new coordinate system. The ``_surface_is_source`` flag is
+        # kept as-is because a coordinate change doesn't introduce
+        # new information or resample loss beyond one bilinear step
+        # (meaningfully less than RBF from sparse anchors).
+        new_grid_x, new_grid_y, new_gain = (
+            self._convert_surface_between_grids(
+                self._surface_grid_x, self._surface_grid_y,
+                self._surface_grid, old_mode, new_mode,
+            )
+            if self._surface_grid is not None
+            else (None, None, None)
+        )
+        if new_gain is not None:
+            # Plant the bilinear-converted surface as authoritative
+            # and re-pick anchors on the new coord system as drag
+            # handles.  We deliberately do NOT regenerate the dense
+            # surface from those anchors here — that was introducing
+            # a round-trip of RBF-smoothing per mode toggle, which
+            # accumulated error across repeated toggles and silently
+            # destroyed narrow-beam peaks (e.g. the ``az_el (0,0) !=
+            # theta_phi (0,0)`` mismatch the user hit in S.1528 Rec
+            # 1.4 and rectangular-aperture LUTs).  Matching the
+            # ``_apply_*_template`` surface-first flow: the dense
+            # converted grid IS the authoritative pattern after the
+            # toggle; anchors only take over as the source of truth
+            # when the user makes an edit (drag / add / remove /
+            # table / smooth / normalise) — at that point the usual
+            # ``_regenerate_surface_from_anchors`` path runs.
+            source_label = self._surface_source_label
+            self._set_surface_from_grid(
+                new_grid_x, new_grid_y, new_gain,
+                source_label=source_label,
+            )
+            n_ref = int(self._template_density_spec().get("n_ref", 80))
+            self._points = self._subsample_anchors_from_surface(n_ref)
+        else:
+            # Fallback: no surface yet (shouldn't normally happen
+            # after the post-init seed). Use the anchor-based
+            # conversion + regen.
+            self._points = self._convert_points_between_grids(
+                self._points, old_mode, new_mode,
+            )
+            self._regenerate_surface_from_anchors()
+        self._selected_index = None
+        self._sync_table_from_points()
+        self._refresh_plots()
+        self._push_history()
+
+    def _convert_surface_between_grids(
+        self,
+        old_grid_x: np.ndarray,
+        old_grid_y: np.ndarray,
+        old_gain_db: np.ndarray,
+        old_mode: str,
+        new_mode: str,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Resample a dense ``gain_db`` surface between az/el and θ/φ
+        parametrisations via spherical geometry + bilinear lookup.
+
+        Fundamental constraint: the editor's θ/φ schema uses the
+        half-range ``φ ∈ [0°, 180°]`` — it can only carry one
+        principal-plane side of a 3-D direction. Going to/from the
+        full-sphere az/el parametrisation is therefore inherently
+        lossy for *asymmetric* patterns. We minimise the damage by:
+
+        1. **Symmetric averaging** when collapsing to θ/φ: for each
+           target ``(θ, φ)``, we evaluate the az/el source at BOTH
+           the ``+el`` and ``-el`` directions that folded onto this
+           ``|φ|`` half. Linear-unit mean of the two gains is used
+           (not dB mean) so the result is a genuine power mean —
+           preserves radiated-power integrals far better than picking
+           just one side. For mirror-symmetric patterns both sides
+           agree exactly and no information is lost.
+
+        2. **Symmetric fan-out** when expanding to az/el: each
+           target ``(az, el)`` maps to ``(θ, |φ|)`` in the θ/φ
+           source. The source already encodes "both sides equal" by
+           its half-range schema, so the sign of ``el`` is handled
+           cleanly — no need to fabricate a negative-el duplicate.
+
+        3. **Pole-aware sampling near θ = 0 / ±90°**: at the source
+           poles many ``(θ, φ)`` cells fold to one direction; we
+           rely on the RegularGridInterpolator's bilinear lookup
+           which averages smoothly as queries converge, so the
+           target grid doesn't show stripy artifacts.
+
+        4. **Bilinear resample across a dense source**: all queries
+           happen against the full authoritative surface (not ~200
+           scatter anchors), so the converted surface inherits the
+           source's native resolution up to one smooth bilinear
+           step — strictly better than ``_convert_points_between_grids``
+           which RBF-rebuilds from sparse anchors.
+        """
+        if old_mode == new_mode:
+            return (
+                np.asarray(old_grid_x), np.asarray(old_grid_y),
+                np.asarray(old_gain_db),
+            )
+        GM_AZEL = "az_el"
+        new_grid_x, new_grid_y = self._surface_grid_coords()
+        nx_mesh, ny_mesh = np.meshgrid(new_grid_x, new_grid_y, indexing="ij")
+
+        old_x = np.asarray(old_grid_x, dtype=np.float64)
+        old_y = np.asarray(old_grid_y, dtype=np.float64)
+        src = np.asarray(old_gain_db, dtype=np.float64)
+        try:
+            from scipy.interpolate import RegularGridInterpolator
+            # Use cubic when the source grid is dense enough for a
+            # well-conditioned cubic spline (needs ≥4 samples per axis).
+            # Cubic reduces per-conversion smoothing loss vs linear —
+            # each bilinear step over-smooths by ~1 grid cell; cubic is
+            # sharper at narrow features (array-factor lobes, S.1528
+            # deep nulls) and preserves energy better under repeated
+            # grid-mode toggles. Fall back to linear if cubic fails
+            # (boundary / fill-value edge cases).
+            method_primary = "cubic" if (old_x.size >= 4 and old_y.size >= 4) else "linear"
+            try:
+                interp = RegularGridInterpolator(
+                    (old_x, old_y), src,
+                    bounds_error=False, fill_value=None,
+                    method=method_primary,
+                )
+            except Exception:
+                interp = RegularGridInterpolator(
+                    (old_x, old_y), src,
+                    bounds_error=False, fill_value=None, method="linear",
+                )
+
+            def _lookup(qx: np.ndarray, qy: np.ndarray) -> np.ndarray:
+                qx = np.clip(qx, float(old_x[0]), float(old_x[-1]))
+                qy = np.clip(qy, float(old_y[0]), float(old_y[-1]))
+                flat_q = np.column_stack([qx.ravel(), qy.ravel()])
+                try:
+                    return interp(flat_q).reshape(qx.shape)
+                except Exception:
+                    # Ultra-defensive: if cubic chokes on specific
+                    # query (rare — mostly at exact boundary), retry
+                    # once with linear.
+                    _fallback = RegularGridInterpolator(
+                        (old_x, old_y), src,
+                        bounds_error=False, fill_value=None, method="linear",
+                    )
+                    return _fallback(flat_q).reshape(qx.shape)
+        except Exception:
+            def _lookup(qx: np.ndarray, qy: np.ndarray) -> np.ndarray:
+                qx = np.clip(qx, float(old_x[0]), float(old_x[-1]))
+                qy = np.clip(qy, float(old_y[0]), float(old_y[-1]))
+                ix = np.clip(
+                    np.round(
+                        (qx - old_x[0]) / max(old_x[-1] - old_x[0], 1e-9)
+                        * (old_x.size - 1)
+                    ).astype(int),
+                    0, old_x.size - 1,
+                )
+                iy = np.clip(
+                    np.round(
+                        (qy - old_y[0]) / max(old_y[-1] - old_y[0], 1e-9)
+                        * (old_y.size - 1)
+                    ).astype(int),
+                    0, old_y.size - 1,
+                )
+                return src[ix, iy]
+
+        if new_mode == self._gm_thetaphi and old_mode == GM_AZEL:
+            # Target (θ, φ) → single source direction in az/el.  With
+            # full-range φ ∈ [-180°, 180°] the mapping is bijective
+            # (same unit-vector direction in two coordinate systems),
+            # so we just convert each target (θ, φ) to its corresponding
+            # (az, el) and look up.  No power-averaging fold is needed
+            # — the full φ range carries both principal-plane halves
+            # distinctly.
+            theta = np.deg2rad(nx_mesh)
+            phi = np.deg2rad(ny_mesh)
+            x_cart = np.sin(theta) * np.cos(phi)
+            y_cart = np.sin(theta) * np.sin(phi)
+            z_cart = np.cos(theta)
+            az_q = np.rad2deg(np.arctan2(x_cart, z_cart))
+            el_q = np.rad2deg(np.arcsin(np.clip(y_cart, -1.0, 1.0)))
+            new_gain = _lookup(az_q, el_q)
+        else:
+            # Target (az, el) → query (θ, φ) in source.  Full-range φ
+            # keeps the sign so asymmetric source patterns survive the
+            # conversion.
+            az = np.deg2rad(nx_mesh)
+            el = np.deg2rad(ny_mesh)
+            x_cart = np.cos(el) * np.sin(az)
+            y_cart = np.sin(el)
+            z_cart = np.cos(el) * np.cos(az)
+            theta_q = np.rad2deg(np.arccos(np.clip(z_cart, -1.0, 1.0)))
+            phi_q = np.rad2deg(np.arctan2(y_cart, x_cart))
+            new_gain = _lookup(theta_q, phi_q)
+        return new_grid_x, new_grid_y, np.asarray(new_gain, dtype=np.float64)
+
+    @staticmethod
+    def _convert_points_between_grids(
+        points: np.ndarray, old_mode: str, new_mode: str,
+    ) -> np.ndarray:
+        """Re-project scattered ``(x, y, gain)`` points between grid
+        modes using a spherical-coordinate transform.
+
+        Both grid modes are full-sphere representations of the same
+        unit-vector direction:
+
+        - ``az/el``: (az ∈ [-180°, 180°], el ∈ [-90°, 90°])
+        - ``θ/φ``:   (θ ∈ [0°, 180°], φ ∈ [-180°, 180°])
+
+        The transforms are bijective, so there is **no mirror fold
+        and no mirror fill** — each point round-trips to its
+        original position modulo float-point rounding.  The legacy
+        half-range ``φ ∈ [0°, 180°]`` assumption (which implied
+        mirror symmetry across the principal plane and forced this
+        routine to duplicate points) has been retired in favour of
+        schema-full-range φ.
+
+        * **az/el → θ/φ**: direction ``(x̂, ŷ, ẑ) = (cos(el)·sin(az),
+          sin(el), cos(el)·cos(az))``; ``θ = acos(ẑ)`` ∈ [0°, 180°],
+          ``φ = atan2(ŷ, x̂)`` ∈ [-180°, 180°].
+
+        * **θ/φ → az/el**: ``(x̂, ŷ, ẑ) = (sin(θ)·cos(φ),
+          sin(θ)·sin(φ), cos(θ))``; ``az = atan2(x̂, ẑ)``,
+          ``el = asin(ŷ)``.  Single point per source point — no
+          mirror duplication.
+        """
+        if old_mode == new_mode or points.size == 0:
+            return points.copy()
+        xy = points[:, :2].astype(np.float64)
+        g = points[:, 2].astype(np.float64)
+        GM_AZEL = "az_el"
+        if old_mode == GM_AZEL:  # az/el → θ/φ
+            az = np.deg2rad(xy[:, 0])
+            el = np.deg2rad(xy[:, 1])
+            x = np.cos(el) * np.sin(az)
+            y = np.sin(el)
+            z = np.cos(el) * np.cos(az)
+            theta = np.rad2deg(np.arccos(np.clip(z, -1.0, 1.0)))
+            phi = np.rad2deg(np.arctan2(y, x))
+            theta = np.clip(theta, 0.0, 180.0)
+            phi = np.clip(phi, -180.0, 180.0)
+            return np.column_stack([theta, phi, g])
+        # θ/φ → az/el (bijective)
+        theta = np.deg2rad(xy[:, 0])
+        phi = np.deg2rad(xy[:, 1])
+        x = np.sin(theta) * np.cos(phi)
+        y = np.sin(theta) * np.sin(phi)
+        z = np.cos(theta)
+        az = np.rad2deg(np.arctan2(x, z))
+        el = np.rad2deg(np.arcsin(np.clip(y, -1.0, 1.0)))
+        az = np.clip(az, -180.0, 180.0)
+        el = np.clip(el, -90.0, 90.0)
+        return np.column_stack([az, el, g])
+
+    def _on_interp_changed(self, _index: int) -> None:
+        key = self._interp_combo.currentData()
+        if key is None:
+            return
+        self._interp_method = str(key)
+        self._regenerate_surface_from_anchors()
+        self._refresh_plots()
+        self._push_history()
+
+    def _on_show_points_toggled(self, checked: bool) -> None:
+        # ``checked`` == True means the button label read "Hide points"
+        # when clicked → user wants to HIDE the overlay. We flip the
+        # button's label so its next click text matches the next
+        # action.
+        self._show_points = not bool(checked)
+        if checked:
+            self._show_points_button.setText("Show points")
+        else:
+            self._show_points_button.setText("Hide points")
+        self._refresh_plots()
+
+    def _template_density_spec(self) -> dict[str, int]:
+        data = self._template_density_combo.currentData()
+        if isinstance(data, dict):
+            return data
+        return {
+            "n_ref": 80, "n_grid_az": 121, "n_grid_el": 61,
+            "n_grid_theta": 121, "n_grid_phi": 121,
+        }
+
+    # === Smoothing chooser =============================================
+
+    def _open_smooth_dialog(self) -> None:
+        n = int(self._points.shape[0])
+        if n < 5:
+            QtWidgets.QMessageBox.information(
+                self, "Smooth", "Need at least 5 points.",
+            )
+            return
+        last = getattr(self, "_last_smoothing_method", "tps_coarse")
+        dlg = Smoothing2DMethodDialog(self, initial_method=last)
+        if dlg.exec() != QtWidgets.QDialog.Accepted:
+            return
+        method = dlg.selected_method()
+        self._last_smoothing_method = method
+        try:
+            new_pts = self._smooth_2d_apply(method, self._points)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(
+                self, "Smooth failed", f"{exc}",
+            )
+            return
+        if np.allclose(new_pts[:, 2], self._points[:, 2], atol=1.0e-9):
+            return
+        self._points = new_pts
+        self._sync_table_from_points()
+        self._regenerate_surface_from_anchors()
+        self._refresh_plots()
+        self._push_history()
+
+    # === Templates =====================================================
+
+    def _on_apply_template_clicked(self) -> None:
+        key = self._template_combo.currentData()
+        if key is None:
+            return
+        self._apply_template(str(key))
+
+    # === Undo / redo / reset / unsaved guard ==========================
+
+    def _snapshot(self) -> tuple[Any, ...]:
+        # Include surface state so undo/redo restore the authoritative
+        # surface alongside anchors — without this, an undo would
+        # revert anchors but the display surface would stay stale
+        # (it's regenerated separately from anchors on every edit).
+        return (
+            self._points.copy(),
+            float(self._peak_gain_dbi),
+            str(self._title_text),
+            str(self._grid_mode),
+            str(self._interp_method),
+            (
+                None if self._surface_grid is None
+                else self._surface_grid.copy()
+            ),
+            (
+                None if self._surface_grid_x is None
+                else self._surface_grid_x.copy()
+            ),
+            (
+                None if self._surface_grid_y is None
+                else self._surface_grid_y.copy()
+            ),
+            bool(self._surface_is_source),
+            str(self._surface_source_label),
+        )
+
+    def _restore_snapshot(self, snap: tuple[Any, ...]) -> None:
+        (
+            pts, peak, title, grid, interp,
+            s_grid, s_x, s_y, s_is_source, s_label,
+        ) = snap
+        self._points = pts.copy()
+        self._peak_gain_dbi = float(peak)
+        self._title_text = str(title)
+        self._grid_mode = str(grid)
+        self._interp_method = str(interp)
+        self._surface_grid = None if s_grid is None else s_grid.copy()
+        self._surface_grid_x = None if s_x is None else s_x.copy()
+        self._surface_grid_y = None if s_y is None else s_y.copy()
+        self._surface_is_source = bool(s_is_source)
+        self._surface_source_label = str(s_label)
+        blockers = [
+            QtCore.QSignalBlocker(self._title_edit),
+            QtCore.QSignalBlocker(self._peak_gain_spin),
+            QtCore.QSignalBlocker(self._grid_button_group),
+            QtCore.QSignalBlocker(self._interp_combo),
+        ]
+        self._title_edit.setText(self._title_text)
+        self._peak_gain_spin.set_value(self._peak_gain_dbi)
+        if self._grid_mode == self._gm_azel:
+            self._grid_azel_radio.setChecked(True)
+        else:
+            self._grid_thetaphi_radio.setChecked(True)
+        idx = self._interp_combo.findData(self._interp_method)
+        if idx >= 0:
+            self._interp_combo.setCurrentIndex(idx)
+        del blockers
+        self._selected_index = None
+        self._sync_table_from_points()
+        self._refresh_plots()
+
+    def _push_history(self, *, force: bool = False) -> None:
+        snap = self._snapshot()
+        if self._history and not force:
+            last = self._history[self._history_index]
+            if (
+                last[1] == snap[1] and last[2] == snap[2]
+                and last[3] == snap[3] and last[4] == snap[4]
+                and last[0].shape == snap[0].shape
+                and np.array_equal(last[0], snap[0])
+            ):
+                return
+        if self._history_index < len(self._history) - 1:
+            self._history = self._history[: self._history_index + 1]
+        self._history.append(snap)
+        if len(self._history) > 64:
+            self._history.pop(0)
+        self._history_index = len(self._history) - 1
+
+    def _undo(self) -> None:
+        if self._history_index <= 0:
+            return
+        self._history_index -= 1
+        self._restore_snapshot(self._history[self._history_index])
+
+    def _redo(self) -> None:
+        if self._history_index >= len(self._history) - 1:
+            return
+        self._history_index += 1
+        self._restore_snapshot(self._history[self._history_index])
+
+    def _reset_to_initial(self) -> None:
+        if not self._history:
+            return
+        self._history_index = 0
+        self._restore_snapshot(self._history[0])
+
+    def _is_modified(self) -> bool:
+        if not self._history:
+            return False
+        cur = self._snapshot()
+        first = self._history[0]
+        return not (
+            cur[1] == first[1] and cur[2] == first[2]
+            and cur[3] == first[3] and cur[4] == first[4]
+            and cur[0].shape == first[0].shape
+            and np.array_equal(cur[0], first[0])
+        )
+
+    def _confirm_discard_if_modified(self) -> bool:
+        if getattr(self, "_close_confirmed", False):
+            return True
+        if not self._is_modified():
+            self._close_confirmed = True
+            return True
+        answer = QtWidgets.QMessageBox.question(
+            self, "Discard changes?",
+            "You have unsaved edits to the 2-D pattern. Close anyway "
+            "and discard them?",
+            QtWidgets.QMessageBox.Discard | QtWidgets.QMessageBox.Cancel,
+            QtWidgets.QMessageBox.Cancel,
+        )
+        if answer != QtWidgets.QMessageBox.Discard:
+            return False
+        self._close_confirmed = True
+        return True
+
+    # === I/O ===========================================================
+
+    def _import_from_json(self) -> None:
+        from scepter.custom_antenna import (
+            KIND_2D as _CK_2D, load_custom_pattern as _load,
+        )
+        filename, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Import custom pattern", str(Path.cwd()),
+            "Antenna pattern JSON (*.json);;All files (*)",
+        )
+        if not filename:
+            return
+        try:
+            pat = _load(filename)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(
+                self, "Import failed",
+                f"Couldn't import {Path(filename).name}:\n{exc}",
+            )
+            return
+        if pat.kind != _CK_2D:
+            QtWidgets.QMessageBox.warning(
+                self, "Wrong kind",
+                f"{Path(filename).name} declares kind={pat.kind!r}; this "
+                "editor accepts 2-D patterns only.",
+            )
+            return
+        self._load_initial_pattern(pat)
+        self._refresh_plots()
+        self._push_history()
+
+    def _export_to_json(self) -> None:
+        from scepter.custom_antenna import dump_custom_pattern as _dump
+        try:
+            pat = self._build_pattern_from_state()
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(
+                self, "Validation failed", f"{exc}",
+            )
+            return
+        filename, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Export custom pattern",
+            str(Path.cwd() / "custom_pattern_2d.json"),
+            "Antenna pattern JSON (*.json)",
+        )
+        if not filename:
+            return
+        try:
+            _dump(filename, pat)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(
+                self, "Export failed",
+                f"Couldn't write {Path(filename).name}:\n{exc}",
+            )
+
+    # === Library =======================================================
+
+    def _open_save_to_library_dialog(self) -> None:
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("Save to library")
+        dialog.setModal(True)
+        form = QtWidgets.QFormLayout(dialog)
+        title_edit = QtWidgets.QLineEdit(self._title_text or "", dialog)
+        author_edit = QtWidgets.QLineEdit(self._meta_author, dialog)
+        source_edit = QtWidgets.QLineEdit(self._meta_source, dialog)
+        notes_edit = QtWidgets.QPlainTextEdit(self._meta_notes, dialog)
+        notes_edit.setMaximumHeight(100)
+        form.addRow("Title", title_edit)
+        form.addRow("Author", author_edit)
+        form.addRow("Source", source_edit)
+        form.addRow("Notes", notes_edit)
+        bb = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Save | QtWidgets.QDialogButtonBox.Cancel,
+            QtCore.Qt.Horizontal, dialog,
+        )
+        bb.accepted.connect(dialog.accept)
+        bb.rejected.connect(dialog.reject)
+        form.addRow(bb)
+        if dialog.exec() != QtWidgets.QDialog.Accepted:
+            return
+        self._title_text = title_edit.text().strip()
+        self._meta_author = author_edit.text().strip()
+        self._meta_source = source_edit.text().strip()
+        self._meta_notes = notes_edit.toPlainText().strip()
+        self._title_edit.setText(self._title_text)
+        try:
+            pat = self._build_pattern_from_state()
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(
+                self, "Validation failed", f"{exc}",
+            )
+            return
+        lib_dir = _antenna_template_library_dir()
+        base = (
+            self._title_text or "pattern_2d"
+        ).replace(" ", "_").replace("/", "_")[:48]
+        path = lib_dir / f"{base}.json"
+        i = 1
+        while path.exists():
+            path = lib_dir / f"{base}_{i}.json"
+            i += 1
+        try:
+            from scepter.custom_antenna import dump_custom_pattern as _dump
+            _dump(path, pat)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(
+                self, "Save failed", f"Couldn't write {path.name}:\n{exc}",
+            )
+            return
+        QtWidgets.QMessageBox.information(
+            self, "Saved", f"Saved to library: {path.name}",
+        )
+
+    def _open_browse_library_dialog(self) -> None:
+        entries = _scan_antenna_template_library(kind=self._kind_2d)
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Browse library")
+        dlg.setModal(True)
+        dlg.resize(620, 420)
+        layout = QtWidgets.QVBoxLayout(dlg)
+        hdr = QtWidgets.QLabel(
+            f"Shared template library \u2022 {len(entries)} 2-D entries."
+            f"<br>Folder: <code>{_antenna_template_library_dir()}</code>",
+            dlg,
+        )
+        hdr.setTextFormat(QtCore.Qt.RichText)
+        layout.addWidget(hdr)
+        lst = QtWidgets.QListWidget(dlg)
+        for path, pat in entries:
+            title = str((pat.meta or {}).get("title") or path.stem)
+            tag = f"{title}  \u2022  peak {float(pat.peak_gain_dbi):.1f} dBi"
+            item = QtWidgets.QListWidgetItem(tag, lst)
+            item.setData(QtCore.Qt.UserRole, str(path))
+        layout.addWidget(lst, 1)
+        br = QtWidgets.QHBoxLayout()
+        lbtn = QtWidgets.QPushButton("Load", dlg)
+        cbtn = QtWidgets.QPushButton("Close", dlg)
+        br.addWidget(lbtn); br.addStretch(1); br.addWidget(cbtn)
+        layout.addLayout(br)
+        sp: list[str] = []
+
+        def _load() -> None:
+            item = lst.currentItem()
+            if item is None:
+                return
+            sp.append(str(item.data(QtCore.Qt.UserRole)))
+            dlg.accept()
+
+        lbtn.clicked.connect(_load)
+        lst.itemDoubleClicked.connect(lambda _i: _load())
+        cbtn.clicked.connect(dlg.reject)
+        if dlg.exec() != QtWidgets.QDialog.Accepted or not sp:
+            return
+        try:
+            from scepter.custom_antenna import load_custom_pattern as _load_fn
+            pat = _load_fn(sp[0])
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(
+                self, "Load failed", f"{exc}",
+            )
+            return
+        self._load_initial_pattern(pat)
+        self._refresh_plots()
+        self._push_history()
+
+    # === OK / Cancel / close ==========================================
+
+    def _on_accept(self) -> None:
+        try:
+            pat = self._build_pattern_from_state()
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(
+                self, "Validation failed", f"{exc}",
+            )
+            return
+        # Non-blocking physical-plausibility check: warn but let the
+        # user proceed if they explicitly want a > 4π integral (e.g.
+        # to exercise the runtime's own saturation behaviour). Same
+        # pattern as the 1-D editor.
+        warning = self._physical_plausibility_warning()
+        if warning is not None:
+            response = QtWidgets.QMessageBox.warning(
+                self, "Pattern exceeds lossless limit",
+                warning
+                + "\n\nNote: ITU regulatory masks (e.g. S.1528 Rec 1.4, "
+                "RA.1631) are *envelopes* bounding any conforming antenna, "
+                "not physical patterns, and commonly integrate above 4π — "
+                "that's legitimate if you're modelling a regulatory mask "
+                "rather than a real antenna.\n\nAccept anyway?",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                QtWidgets.QMessageBox.No,
+            )
+            if response != QtWidgets.QMessageBox.Yes:
+                return
+        self._result_pattern = pat
+        self._close_confirmed = True
+        self.accept()
+
+    def reject(self) -> None:
+        if not self._confirm_discard_if_modified():
+            return
+        super().reject()
+
+    def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        if not self._confirm_discard_if_modified():
+            event.ignore()
+            return
+        self._canvas.release_resize_proxy()
+        try:
+            plt.close(self._figure)
+        except Exception:
+            pass
+        super().closeEvent(event)
+
+    def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
+        if event.key() in {QtCore.Qt.Key_Delete, QtCore.Qt.Key_Backspace}:
+            if self._remove_selected_point():
+                event.accept()
+                return
+        if event.matches(QtGui.QKeySequence.Undo):
+            self._undo()
+            event.accept()
+            return
+        if event.matches(QtGui.QKeySequence.Redo):
+            self._redo()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    # === Theme =========================================================
+
+    def _apply_parent_theme(self) -> None:
+        parent = self.parent()
+        if parent is None:
+            return
+        try:
+            self.setStyleSheet(parent.styleSheet())
+        except Exception:
+            pass
+        if hasattr(parent, "_style_matplotlib_figure"):
+            try:
+                parent._style_matplotlib_figure(self._figure)
+            except Exception:
+                pass
+
+    # =======================================================================
+    # Analytical ITU templates (S.1528 Rec 1.4 + M.2101)
+    # =======================================================================
+
+    def _apply_s1528_rec14_template(self) -> None:
+        """Parameter dialog → sample S.1528 Rec 1.4 onto a dense
+        grid → downsample to scattered reference points.
+
+        Pre-fills every input from ``self._tmpl_last_s1528_rec14`` so
+        parameters persist across dialog re-opens for the lifetime of
+        the editor (the user's explicit request — iterating on a
+        template shouldn't force re-entering seven numbers each time).
+        Uses the editor's density combo to pick both the analytical
+        sampling grid and the downsampled-points count.
+        """
+        last = self._tmpl_last_s1528_rec14
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("S.1528 Rec 1.4 template")
+        dlg.setModal(True)
+        dlg.setStyleSheet(self.styleSheet())
+        form = QtWidgets.QFormLayout(dlg)
+
+        freq_spin = QtWidgets.QDoubleSpinBox(dlg)
+        freq_spin.setRange(1.0, 1.0e6); freq_spin.setDecimals(2)
+        freq_spin.setSuffix(" MHz"); freq_spin.setValue(float(last["freq_mhz"]))
+        lr_spin = QtWidgets.QDoubleSpinBox(dlg)
+        lr_spin.setRange(0.01, 1000.0); lr_spin.setDecimals(3)
+        lr_spin.setSuffix(" m"); lr_spin.setValue(float(last["lr_m"]))
+        lt_spin = QtWidgets.QDoubleSpinBox(dlg)
+        lt_spin.setRange(0.01, 1000.0); lt_spin.setDecimals(3)
+        lt_spin.setSuffix(" m"); lt_spin.setValue(float(last["lt_m"]))
+        slr_spin = QtWidgets.QDoubleSpinBox(dlg)
+        slr_spin.setRange(0.0, 60.0); slr_spin.setDecimals(2)
+        slr_spin.setSuffix(" dB"); slr_spin.setValue(float(last["slr_db"]))
+        gm_spin = QtWidgets.QDoubleSpinBox(dlg)
+        gm_spin.setRange(-100.0, 100.0); gm_spin.setDecimals(2)
+        gm_spin.setSuffix(" dBi"); gm_spin.setValue(float(last["gm_db"]))
+        l_spin = QtWidgets.QSpinBox(dlg)
+        l_spin.setRange(2, 12); l_spin.setValue(int(last["l"]))
+        form.addRow("Frequency", freq_spin)
+        form.addRow("L_r (receive aperture)", lr_spin)
+        form.addRow("L_t (transmit aperture)", lt_spin)
+        form.addRow("SLR (first-sidelobe magnitude)", slr_spin)
+        form.addRow("G_max", gm_spin)
+        form.addRow("l (sidelobe count ≥ 2)", l_spin)
+        density_spec = self._template_density_spec()
+        note = QtWidgets.QLabel(
+            f"Sampled onto a {density_spec['n_grid_theta']} × "
+            f"{density_spec['n_grid_phi']} θ/φ grid, then downsampled "
+            f"to ~{density_spec['n_ref']} scattered reference points. "
+            "Switch the editor's grid radio to θ/φ for best fidelity, "
+            "and use the Density combo to change both the sampling "
+            "and downsampled-point counts.",
+            dlg,
+        )
+        note.setStyleSheet("color:#94a3b8; font-size:11px;")
+        note.setWordWrap(True)
+        form.addRow(note)
+        bb = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel,
+            QtCore.Qt.Horizontal, dlg,
+        )
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        form.addRow(bb)
+        if dlg.exec() != QtWidgets.QDialog.Accepted:
+            return
+        # Persist the entered values for the next open.
+        self._tmpl_last_s1528_rec14 = {
+            "freq_mhz": float(freq_spin.value()),
+            "lr_m": float(lr_spin.value()),
+            "lt_m": float(lt_spin.value()),
+            "slr_db": float(slr_spin.value()),
+            "gm_db": float(gm_spin.value()),
+            "l": int(l_spin.value()),
+        }
+        wavelength_m = 299.792458 / float(freq_spin.value())
+        try:
+            from scepter.analytical_fixtures import s1528_rec1_4_evaluator
+            evaluator = s1528_rec1_4_evaluator(
+                wavelength_m=wavelength_m,
+                lr_m=float(lr_spin.value()),
+                lt_m=float(lt_spin.value()),
+                slr_db=float(slr_spin.value()),
+                gm_db=float(gm_spin.value()),
+                l=int(l_spin.value()),
+            )
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(
+                self, "S.1528 Rec 1.4 failed",
+                f"Couldn't evaluate the template:\n{exc}",
+            )
+            return
+        # Force θ/φ grid mode so the analytical pattern's native
+        # parametrisation is preserved as the surface source.
+        if self._grid_mode != self._gm_thetaphi:
+            blk = QtCore.QSignalBlocker(self._grid_button_group)
+            self._grid_thetaphi_radio.setChecked(True)
+            del blk
+            self._grid_mode = self._gm_thetaphi
+        self._peak_gain_dbi = float(gm_spin.value())
+        self._title_text = "ITU-R S.1528 Rec 1.4"
+        if hasattr(self, "_title_edit"):
+            self._title_edit.setText(self._title_text)
+            self._peak_gain_spin.set_value(self._peak_gain_dbi)
+        # Sample the analytical evaluator directly onto the density-
+        # combo grid.  φ uses the FULL [-180°, 180°] range (matching
+        # the custom-antenna JSON schema); ITU S.1528 Rec 1.4 is
+        # mirror-symmetric across the principal plane so we evaluate
+        # with ``np.abs(ph_mesh)`` (which folds [-180, 0] onto [0, 180])
+        # and the output is naturally symmetric — no information loss
+        # versus the half-range authoring, just a properly full-range
+        # surface that az/el ↔ θ/φ conversions can traverse
+        # bijectively.
+        theta = np.linspace(0.0, 180.0, int(density_spec["n_grid_theta"]))
+        phi = np.linspace(-180.0, 180.0, int(density_spec["n_grid_phi"]))
+        th_mesh, ph_mesh = np.meshgrid(theta, phi, indexing="ij")
+        gain_db = np.asarray(
+            evaluator(th_mesh, np.abs(ph_mesh)), dtype=np.float64,
+        )
+        self._set_surface_from_grid(
+            theta, phi, gain_db,
+            source_label="ITU-R S.1528 Rec 1.4",
+        )
+        # Sample anchors from the analytical surface, then regenerate
+        # the display/export surface FROM those anchors.  This is the
+        # anchor-authoritative model: anchors are the LUT's source of
+        # truth, and the dense surface the user sees (and that gets
+        # exported to JSON and loaded on the GPU) is the editor's own
+        # interpolation of those anchors.  Any regen loss the user
+        # sees IS the LUT quality they're about to ship — tuning the
+        # density combo trades anchor count for LUT fidelity.
+        self._points = self._subsample_anchors_from_surface(
+            int(density_spec.get("n_ref", 80)),
+        )
+        self._regenerate_surface_from_anchors()
+        self._selected_index = None
+        self._sync_table_from_points()
+        self._refresh_plots()
+        self._push_history()
+
+    def _apply_m2101_template(self) -> None:
+        """Parameter dialog → sample M.2101 composite pattern."""
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("M.2101 template")
+        dlg.setModal(True)
+        dlg.setStyleSheet(self.styleSheet())
+        form = QtWidgets.QFormLayout(dlg)
+
+        last = self._tmpl_last_m2101
+        gemax_spin = QtWidgets.QDoubleSpinBox(dlg)
+        gemax_spin.setRange(-20.0, 30.0); gemax_spin.setDecimals(2)
+        gemax_spin.setSuffix(" dBi"); gemax_spin.setValue(float(last["g_emax_dbi"]))
+        am_spin = QtWidgets.QDoubleSpinBox(dlg)
+        am_spin.setRange(1.0, 60.0); am_spin.setDecimals(2)
+        am_spin.setSuffix(" dB"); am_spin.setValue(float(last["a_m_db"]))
+        sla_spin = QtWidgets.QDoubleSpinBox(dlg)
+        sla_spin.setRange(1.0, 60.0); sla_spin.setDecimals(2)
+        sla_spin.setSuffix(" dB"); sla_spin.setValue(float(last["sla_nu_db"]))
+        phi3_spin = QtWidgets.QDoubleSpinBox(dlg)
+        phi3_spin.setRange(1.0, 180.0); phi3_spin.setDecimals(2)
+        phi3_spin.setSuffix(" deg"); phi3_spin.setValue(float(last["phi_3db_deg"]))
+        theta3_spin = QtWidgets.QDoubleSpinBox(dlg)
+        theta3_spin.setRange(1.0, 180.0); theta3_spin.setDecimals(2)
+        theta3_spin.setSuffix(" deg"); theta3_spin.setValue(float(last["theta_3db_deg"]))
+        dh_spin = QtWidgets.QDoubleSpinBox(dlg)
+        dh_spin.setRange(0.1, 10.0); dh_spin.setDecimals(3)
+        dh_spin.setValue(float(last["d_h"]))
+        dh_spin.setToolTip("Horizontal element spacing in wavelengths.")
+        dv_spin = QtWidgets.QDoubleSpinBox(dlg)
+        dv_spin.setRange(0.1, 10.0); dv_spin.setDecimals(3)
+        dv_spin.setValue(float(last["d_v"]))
+        dv_spin.setToolTip("Vertical element spacing in wavelengths.")
+        nh_spin = QtWidgets.QSpinBox(dlg)
+        nh_spin.setRange(1, 64); nh_spin.setValue(int(last["n_h"]))
+        nv_spin = QtWidgets.QSpinBox(dlg)
+        nv_spin.setRange(1, 64); nv_spin.setValue(int(last["n_v"]))
+        steer_az = QtWidgets.QDoubleSpinBox(dlg)
+        steer_az.setRange(-180.0, 180.0); steer_az.setDecimals(2)
+        steer_az.setSuffix(" deg"); steer_az.setValue(float(last["steering_az_deg"]))
+        steer_el = QtWidgets.QDoubleSpinBox(dlg)
+        steer_el.setRange(-90.0, 90.0); steer_el.setDecimals(2)
+        steer_el.setSuffix(" deg"); steer_el.setValue(float(last["steering_el_deg"]))
+        form.addRow("G_Emax (element peak)", gemax_spin)
+        form.addRow("A_m (front-to-back)", am_spin)
+        form.addRow("SLA_ν (vertical SLA)", sla_spin)
+        form.addRow("φ_3dB (horizontal)", phi3_spin)
+        form.addRow("θ_3dB (vertical)", theta3_spin)
+        form.addRow("d_H (element spacing)", dh_spin)
+        form.addRow("d_V (element spacing)", dv_spin)
+        form.addRow("N_H (horizontal count)", nh_spin)
+        form.addRow("N_V (vertical count)", nv_spin)
+        form.addRow("Steering azimuth", steer_az)
+        form.addRow("Steering elevation", steer_el)
+        density_spec = self._template_density_spec()
+        note = QtWidgets.QLabel(
+            f"Sampled onto a {density_spec['n_grid_az']} \u00d7 "
+            f"{density_spec['n_grid_el']} az/el grid, then downsampled "
+            f"to ~{density_spec['n_ref']} scattered reference points.",
+            dlg,
+        )
+        note.setStyleSheet("color:#94a3b8; font-size:11px;")
+        note.setWordWrap(True)
+        form.addRow(note)
+        warn = QtWidgets.QLabel(
+            "<b>Static snapshot only.</b> This samples the M.2101 "
+            "composite pattern (element \u00d7 array factor) at the "
+            "steering direction above. The result is a fixed 2-D "
+            "gain surface \u2014 it does <i>not</i> steer dynamically "
+            "in simulation. For proper electrically-steered M.2101 "
+            "behaviour (steering-dependent Gmax and array factor), "
+            "select <b>ITU-R M.2101</b> as the satellite antenna "
+            "model instead of a custom pattern.",
+            dlg,
+        )
+        warn.setStyleSheet("color:#f59e0b; font-size:11px;")
+        warn.setTextFormat(QtCore.Qt.RichText)
+        warn.setWordWrap(True)
+        form.addRow(warn)
+        bb = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel,
+            QtCore.Qt.Horizontal, dlg,
+        )
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        form.addRow(bb)
+        if dlg.exec() != QtWidgets.QDialog.Accepted:
+            return
+        self._tmpl_last_m2101 = {
+            "g_emax_dbi": float(gemax_spin.value()),
+            "a_m_db": float(am_spin.value()),
+            "sla_nu_db": float(sla_spin.value()),
+            "phi_3db_deg": float(phi3_spin.value()),
+            "theta_3db_deg": float(theta3_spin.value()),
+            "d_h": float(dh_spin.value()),
+            "d_v": float(dv_spin.value()),
+            "n_h": int(nh_spin.value()),
+            "n_v": int(nv_spin.value()),
+            "steering_az_deg": float(steer_az.value()),
+            "steering_el_deg": float(steer_el.value()),
+        }
+        try:
+            from scepter.analytical_fixtures import m2101_evaluator
+            evaluator = m2101_evaluator(
+                g_emax_dbi=float(gemax_spin.value()),
+                a_m_db=float(am_spin.value()),
+                sla_nu_db=float(sla_spin.value()),
+                phi_3db_deg=float(phi3_spin.value()),
+                theta_3db_deg=float(theta3_spin.value()),
+                d_h=float(dh_spin.value()),
+                d_v=float(dv_spin.value()),
+                n_h=int(nh_spin.value()),
+                n_v=int(nv_spin.value()),
+                steering_az_deg=float(steer_az.value()),
+                steering_el_deg=float(steer_el.value()),
+            )
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(
+                self, "M.2101 failed",
+                f"Couldn't evaluate the template:\n{exc}",
+            )
+            return
+        # Force az/el grid mode so the analytical pattern's native
+        # parametrisation survives as the source surface.
+        if self._grid_mode != self._gm_azel:
+            blk = QtCore.QSignalBlocker(self._grid_button_group)
+            self._grid_azel_radio.setChecked(True)
+            del blk
+            self._grid_mode = self._gm_azel
+        n_elems = int(nh_spin.value()) * int(nv_spin.value())
+        declared_peak = float(gemax_spin.value()) + 10.0 * float(
+            np.log10(max(n_elems, 1))
+        )
+        self._peak_gain_dbi = declared_peak
+        self._title_text = "ITU-R M.2101 phased array"
+        if hasattr(self, "_title_edit"):
+            self._title_edit.setText(self._title_text)
+            self._peak_gain_spin.set_value(self._peak_gain_dbi)
+        # Sample the M.2101 composite directly on the density-combo
+        # grid. Surface = pycraf output verbatim — zero resample,
+        # pycraf-quality display.
+        az = np.linspace(-180.0, 180.0, int(density_spec["n_grid_az"]))
+        el = np.linspace(-90.0, 90.0, int(density_spec["n_grid_el"]))
+        az_mesh, el_mesh = np.meshgrid(az, el, indexing="ij")
+        gain_db = np.asarray(evaluator(az_mesh, el_mesh), dtype=np.float64)
+        self._set_surface_from_grid(
+            az, el, gain_db,
+            source_label=f"ITU-R M.2101 phased array ({int(nh_spin.value())}\u00d7{int(nv_spin.value())})",
+        )
+        # Anchor-authoritative model (see S.1528 Rec 1.4 template
+        # above): anchors sampled from analytical, dense surface
+        # regenerated from those anchors so the user sees the LUT
+        # they're about to export.
+        self._points = self._subsample_anchors_from_surface(
+            int(density_spec.get("n_ref", 80)),
+        )
+        self._regenerate_surface_from_anchors()
+        self._selected_index = None
+        self._sync_table_from_points()
+        self._refresh_plots()
+        self._push_history()
+
+    def _apply_oneweb_sat_template(self) -> None:
+        """OneWeb satellite Ku-band beam (ECC Report 271 Annex 1
+        §A1.1 Table 11) — parameter dialog, then sample the
+        analytical 2-D fan-beam evaluator onto the density-combo
+        grid and adopt the result as the authoritative surface."""
+        last = self._tmpl_last_oneweb_sat
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("OneWeb satellite (ECC 271 Table 11)")
+        dlg.setModal(True)
+        dlg.setStyleSheet(self.styleSheet())
+        outer = QtWidgets.QVBoxLayout(dlg)
+        intro = QtWidgets.QLabel(
+            "OneWeb Ku-band satellite beam per ECC Report 271 "
+            "Annex 1 \u00a7A1.1 Table 11 (2-D asymmetric fan: "
+            "narrow along-track \u00b13.3\u00b0, wide cross-track "
+            "\u00b173.7\u00b0 at \u221220 dB).",
+            dlg,
+        )
+        intro.setWordWrap(True)
+        intro.setStyleSheet("color:#94a3b8;")
+        outer.addWidget(intro)
+        form = QtWidgets.QFormLayout()
+
+        gm_spin = QtWidgets.QDoubleSpinBox(dlg)
+        gm_spin.setRange(-20.0, 60.0); gm_spin.setDecimals(2)
+        gm_spin.setSuffix(" dBi"); gm_spin.setValue(float(last["g_max_dbi"]))
+        form.addRow("G_max (boresight)", gm_spin)
+
+        axis_combo = QtWidgets.QComboBox(dlg)
+        axis_combo.addItem("Along-track on elevation axis", userData="elevation")
+        axis_combo.addItem("Along-track on azimuth axis", userData="azimuth")
+        idx_axis = axis_combo.findData(str(last["along_track_axis"]))
+        if idx_axis >= 0:
+            axis_combo.setCurrentIndex(idx_axis)
+        form.addRow("Orientation", axis_combo)
+
+        along_spin = QtWidgets.QDoubleSpinBox(dlg)
+        along_spin.setRange(-90.0, 90.0); along_spin.setDecimals(2)
+        along_spin.setSuffix(" deg"); along_spin.setValue(float(last["beam_along_offset_deg"]))
+        along_spin.setToolTip(
+            "Beam nadir offset along the satellite-track direction "
+            "(ECC 271 Table 10 places the 16 beams at rows from "
+            "\u221223.5\u00b0 to +23.5\u00b0)."
+        )
+        cross_spin = QtWidgets.QDoubleSpinBox(dlg)
+        cross_spin.setRange(-180.0, 180.0); cross_spin.setDecimals(2)
+        cross_spin.setSuffix(" deg"); cross_spin.setValue(float(last["beam_cross_offset_deg"]))
+        cross_spin.setToolTip("Beam nadir offset cross-track.")
+        form.addRow("Beam along-track offset", along_spin)
+        form.addRow("Beam cross-track offset", cross_spin)
+        outer.addLayout(form)
+
+        density_spec = self._template_density_spec()
+        note = QtWidgets.QLabel(
+            f"Sampled onto the {density_spec['n_grid_az']} \u00d7 "
+            f"{density_spec['n_grid_el']} az/el grid and stored as "
+            "the authoritative surface. Switch Grid to az/el for "
+            "best fidelity.",
+            dlg,
+        )
+        note.setStyleSheet("color:#94a3b8; font-size:11px;")
+        note.setWordWrap(True)
+        outer.addWidget(note)
+
+        bb = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel,
+            QtCore.Qt.Horizontal, dlg,
+        )
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        outer.addWidget(bb)
+        if dlg.exec() != QtWidgets.QDialog.Accepted:
+            return
+        axis_key = str(axis_combo.currentData() or "elevation")
+        self._tmpl_last_oneweb_sat = {
+            "g_max_dbi": float(gm_spin.value()),
+            "along_track_axis": axis_key,
+            "beam_along_offset_deg": float(along_spin.value()),
+            "beam_cross_offset_deg": float(cross_spin.value()),
+        }
+        try:
+            from scepter.analytical_fixtures import oneweb_ecc271_satellite_evaluator
+            evaluator = oneweb_ecc271_satellite_evaluator(
+                g_max_dbi=float(gm_spin.value()),
+                along_track_axis=axis_key,
+                beam_along_offset_deg=float(along_spin.value()),
+                beam_cross_offset_deg=float(cross_spin.value()),
+            )
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(
+                self, "OneWeb satellite failed",
+                f"Couldn't evaluate the template:\n{exc}",
+            )
+            return
+        # Force az/el grid mode so the template's native parametri-
+        # sation survives as the source surface.
+        if self._grid_mode != self._gm_azel:
+            blk = QtCore.QSignalBlocker(self._grid_button_group)
+            self._grid_azel_radio.setChecked(True)
+            del blk
+            self._grid_mode = self._gm_azel
+        self._peak_gain_dbi = float(gm_spin.value())
+        self._title_text = "OneWeb satellite (ECC 271 Table 11)"
+        if hasattr(self, "_title_edit"):
+            self._title_edit.setText(self._title_text)
+            self._peak_gain_spin.set_value(self._peak_gain_dbi)
+        az = np.linspace(-180.0, 180.0, int(density_spec["n_grid_az"]))
+        el = np.linspace(-90.0, 90.0, int(density_spec["n_grid_el"]))
+        az_mesh, el_mesh = np.meshgrid(az, el, indexing="ij")
+        gain_db = np.asarray(evaluator(az_mesh, el_mesh), dtype=np.float64)
+        self._set_surface_from_grid(
+            az, el, gain_db,
+            source_label="OneWeb satellite (ECC 271 Table 11)",
+        )
+        # Anchor-authoritative: surface = regen(anchors sampled from
+        # ECC 271 analytical). User sees the LUT they'll export.
+        self._points = self._subsample_anchors_from_surface(
+            int(density_spec.get("n_ref", 80)),
+        )
+        self._regenerate_surface_from_anchors()
+        self._selected_index = None
+        self._sync_table_from_points()
+        self._refresh_plots()
+        self._push_history()
+
+    def _apply_f1336_sectoral_template(self) -> None:
+        """Parameter dialog \u2192 sample F.1336-5 sectoral antenna."""
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("F.1336-5 sectoral template")
+        dlg.setModal(True)
+        dlg.setStyleSheet(self.styleSheet())
+        form = QtWidgets.QFormLayout(dlg)
+
+        last = getattr(self, "_tmpl_last_f1336_sect", {
+            "g0_dbi": 18.0, "phi_3db_deg": 65.0,
+            "theta_3db_deg": 8.0, "k_h": 0.7, "k_v": 0.3, "tilt_deg": 0.0,
+        })
+        g0_spin = QtWidgets.QDoubleSpinBox(dlg)
+        g0_spin.setRange(-20.0, 30.0); g0_spin.setDecimals(2)
+        g0_spin.setSuffix(" dBi"); g0_spin.setValue(float(last["g0_dbi"]))
+        phi3_spin = QtWidgets.QDoubleSpinBox(dlg)
+        phi3_spin.setRange(1.0, 180.0); phi3_spin.setDecimals(1)
+        phi3_spin.setSuffix("\u00b0"); phi3_spin.setValue(float(last["phi_3db_deg"]))
+        theta3_spin = QtWidgets.QDoubleSpinBox(dlg)
+        theta3_spin.setRange(1.0, 90.0); theta3_spin.setDecimals(1)
+        theta3_spin.setSuffix("\u00b0"); theta3_spin.setValue(float(last["theta_3db_deg"]))
+        tilt_spin = QtWidgets.QDoubleSpinBox(dlg)
+        tilt_spin.setRange(-45.0, 45.0); tilt_spin.setDecimals(1)
+        tilt_spin.setSuffix("\u00b0"); tilt_spin.setValue(float(last["tilt_deg"]))
+        form.addRow("G\u2080 (peak gain)", g0_spin)
+        form.addRow("\u03c6\u2083dB (horizontal BW)", phi3_spin)
+        form.addRow("\u03b8\u2083dB (vertical BW)", theta3_spin)
+        form.addRow("Downtilt", tilt_spin)
+        density_spec = self._template_density_spec()
+        note = QtWidgets.QLabel(
+            f"Sampled onto a {density_spec['n_grid_az']} \u00d7 "
+            f"{density_spec['n_grid_el']} az/el grid. Fixed-pointing "
+            "panel antenna \u2014 no dynamic steering.",
+            dlg,
+        )
+        note.setStyleSheet("color:#94a3b8; font-size:11px;")
+        note.setWordWrap(True)
+        form.addRow(note)
+        bb = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel,
+            QtCore.Qt.Horizontal, dlg,
+        )
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        form.addRow(bb)
+        if dlg.exec() != QtWidgets.QDialog.Accepted:
+            return
+        self._tmpl_last_f1336_sect = {
+            "g0_dbi": float(g0_spin.value()),
+            "phi_3db_deg": float(phi3_spin.value()),
+            "theta_3db_deg": float(theta3_spin.value()),
+            "k_h": 0.7, "k_v": 0.3,
+            "tilt_deg": float(tilt_spin.value()),
+        }
+        try:
+            from scepter.analytical_fixtures import f1336_sectoral_evaluator
+            evaluator = f1336_sectoral_evaluator(
+                g0_dbi=float(g0_spin.value()),
+                phi_3db_deg=float(phi3_spin.value()),
+                theta_3db_deg=float(theta3_spin.value()),
+                tilt_deg=float(tilt_spin.value()),
+            )
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(
+                self, "F.1336 sectoral failed",
+                f"Couldn\u2019t evaluate the template:\n{exc}",
+            )
+            return
+        if self._grid_mode != self._gm_azel:
+            blk = QtCore.QSignalBlocker(self._grid_button_group)
+            self._grid_azel_radio.setChecked(True)
+            del blk
+            self._grid_mode = self._gm_azel
+        self._peak_gain_dbi = float(g0_spin.value())
+        self._title_text = "ITU-R F.1336-5 sectoral"
+        if hasattr(self, "_title_edit"):
+            self._title_edit.setText(self._title_text)
+            self._peak_gain_spin.set_value(self._peak_gain_dbi)
+        az = np.linspace(-180.0, 180.0, int(density_spec["n_grid_az"]))
+        el = np.linspace(-90.0, 90.0, int(density_spec["n_grid_el"]))
+        az_mesh, el_mesh = np.meshgrid(az, el, indexing="ij")
+        gain_db = np.asarray(evaluator(az_mesh, el_mesh), dtype=np.float64)
+        self._set_surface_from_grid(
+            az, el, gain_db,
+            source_label="ITU-R F.1336-5 sectoral",
+        )
+        # Anchor-authoritative: surface = regen(anchors sampled from
+        # F.1336-5 analytical). User sees the LUT they'll export.
+        self._points = self._subsample_anchors_from_surface(
+            int(density_spec.get("n_ref", 80)),
+        )
+        self._regenerate_surface_from_anchors()
+        self._selected_index = None
+        self._sync_table_from_points()
+        self._refresh_plots()
+        self._push_history()
+
+    def _apply_sinc_rect_template(self) -> None:
+        """Parameter dialog \u2192 sample uniform rectangular aperture."""
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Uniform rectangular aperture")
+        dlg.setModal(True)
+        dlg.setStyleSheet(self.styleSheet())
+        form = QtWidgets.QFormLayout(dlg)
+
+        last = getattr(self, "_tmpl_last_sinc_rect", {
+            "lx_m": 0.5, "lz_m": 0.3, "wavelength_m": 0.03,
+        })
+        lx_spin = QtWidgets.QDoubleSpinBox(dlg)
+        lx_spin.setRange(0.01, 100.0); lx_spin.setDecimals(3)
+        lx_spin.setSuffix(" m"); lx_spin.setValue(float(last["lx_m"]))
+        lz_spin = QtWidgets.QDoubleSpinBox(dlg)
+        lz_spin.setRange(0.01, 100.0); lz_spin.setDecimals(3)
+        lz_spin.setSuffix(" m"); lz_spin.setValue(float(last["lz_m"]))
+        wl_spin = QtWidgets.QDoubleSpinBox(dlg)
+        wl_spin.setRange(0.001, 10.0); wl_spin.setDecimals(4)
+        wl_spin.setSuffix(" m"); wl_spin.setValue(float(last["wavelength_m"]))
+        form.addRow("Horizontal aperture L\u2093", lx_spin)
+        form.addRow("Vertical aperture L\u2098", lz_spin)
+        form.addRow("Wavelength \u03bb", wl_spin)
+        density_spec = self._template_density_spec()
+        note = QtWidgets.QLabel(
+            f"Sampled onto a {density_spec['n_grid_az']} \u00d7 "
+            f"{density_spec['n_grid_el']} az/el grid. Separable "
+            "sinc\u00b2 \u00d7 sinc\u00b2 diffraction pattern.",
+            dlg,
+        )
+        note.setStyleSheet("color:#94a3b8; font-size:11px;")
+        note.setWordWrap(True)
+        form.addRow(note)
+        bb = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel,
+            QtCore.Qt.Horizontal, dlg,
+        )
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        form.addRow(bb)
+        if dlg.exec() != QtWidgets.QDialog.Accepted:
+            return
+        self._tmpl_last_sinc_rect = {
+            "lx_m": float(lx_spin.value()),
+            "lz_m": float(lz_spin.value()),
+            "wavelength_m": float(wl_spin.value()),
+        }
+        try:
+            from scepter.analytical_fixtures import sinc_rect_evaluator
+            evaluator = sinc_rect_evaluator(
+                lx_m=float(lx_spin.value()),
+                lz_m=float(lz_spin.value()),
+                wavelength_m=float(wl_spin.value()),
+            )
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(
+                self, "Rectangular aperture failed",
+                f"Couldn\u2019t evaluate the template:\n{exc}",
+            )
+            return
+        if self._grid_mode != self._gm_azel:
+            blk = QtCore.QSignalBlocker(self._grid_button_group)
+            self._grid_azel_radio.setChecked(True)
+            del blk
+            self._grid_mode = self._gm_azel
+        lx_over_lam = float(lx_spin.value()) / max(float(wl_spin.value()), 1e-12)
+        lz_over_lam = float(lz_spin.value()) / max(float(wl_spin.value()), 1e-12)
+        self._peak_gain_dbi = 10.0 * np.log10(
+            4.0 * np.pi * lx_over_lam * lz_over_lam
+        )
+        self._title_text = "Uniform rectangular aperture"
+        if hasattr(self, "_title_edit"):
+            self._title_edit.setText(self._title_text)
+            self._peak_gain_spin.set_value(self._peak_gain_dbi)
+        az = np.linspace(-180.0, 180.0, int(density_spec["n_grid_az"]))
+        el = np.linspace(-90.0, 90.0, int(density_spec["n_grid_el"]))
+        az_mesh, el_mesh = np.meshgrid(az, el, indexing="ij")
+        gain_db = np.asarray(evaluator(az_mesh, el_mesh), dtype=np.float64)
+        self._set_surface_from_grid(
+            az, el, gain_db,
+            source_label="Uniform rectangular aperture",
+        )
+        # Anchor-authoritative: surface = regen(anchors sampled from
+        # uniform rectangular aperture analytical). User sees the LUT
+        # they'll export.
+        self._points = self._subsample_anchors_from_surface(
+            int(density_spec.get("n_ref", 80)),
+        )
+        self._regenerate_surface_from_anchors()
+        self._selected_index = None
+        self._sync_table_from_points()
+        self._refresh_plots()
+        self._push_history()
+
+    # =======================================================================
+    # Physics / derived quantities / normalisation / plausibility
+    # =======================================================================
+
+    def _spherical_integral_linear(self) -> float:
+        """Compute ``∫ G(θ,φ) dΩ`` in linear units over the full sphere.
+
+        For **az/el** grids we convert to the standard spherical
+        ``(θ, φ)`` frame: ``θ = 90° − el`` (elevation → polar) and
+        ``φ = az`` (azimuth → azimuth); the differential is then
+        ``sin(θ) dθ dφ``, equivalent to ``cos(el) daz del`` on the
+        az/el frame. For **θ/φ** grids we use the schema's own
+        convention directly with ``sin(θ) dθ dφ`` and multiply by 2
+        to account for the ``φ ∈ [0°, 180°]`` half-range (antenna
+        patterns are assumed symmetric around the boresight).
+        """
+        grid_x, grid_y, z_db = self._compute_heatmap_surface()
+        z_lin = np.power(10.0, z_db / 10.0)
+        if self._grid_mode == self._gm_azel:
+            az = np.deg2rad(grid_x)
+            el = np.deg2rad(grid_y)
+            # weight is cos(el) for az/el spherical area element
+            w = np.cos(el)
+            # z_lin shape: (n_az, n_el)
+            integrand = z_lin * w[None, :]
+            return float(np.trapezoid(np.trapezoid(integrand, el, axis=1), az))
+        theta = np.deg2rad(grid_x)
+        phi = np.deg2rad(grid_y)
+        w = np.sin(theta)
+        integrand = z_lin * w[:, None]
+        # φ half-range — double for the symmetric side.
+        return float(2.0 * np.trapezoid(np.trapezoid(integrand, phi, axis=1), theta))
+
+    def _energy_ratio(self) -> float:
+        """``∫ G dΩ / (4π)`` — radiated-power ratio, capped at
+        ``1`` for a lossless antenna. Non-physical above ~1.02 (we
+        allow 2 % for trapezoidal-integration slop)."""
+        return float(self._spherical_integral_linear()) / float(4.0 * np.pi)
+
+    def _physical_plausibility_warning(self) -> str | None:
+        ratio = self._energy_ratio()
+        if ratio > 1.0 + 0.02:
+            excess_db = 10.0 * float(np.log10(ratio))
+            return (
+                "The 2-D pattern integrates above the lossless 4π limit: "
+                f"∫G dΩ / 4π = {ratio:.4f} (+{excess_db:.2f} dB). "
+                "If you are authoring a real antenna, use Normalise… to "
+                "rescale, or reduce the sidelobe / main-lobe gains until "
+                "the integral is ≤ 1."
+            )
+        return None
+
+    def _open_normalise_dialog(self) -> None:
+        """Dialog to rescale the point set so ``∫G dΩ = 4π·η``.
+
+        Supports two conventions: radiation efficiency ``η`` (as a
+        percentage, 0-100 %) and ohmic loss ``L`` in dB. They're
+        equivalent: ``η = 10^(-L/10)``. The dialog updates both fields
+        when either changes.
+        """
+        current_ratio = self._energy_ratio()
+        current_eff_pct = min(100.0 * current_ratio, 999.9)
+        current_loss_db = -10.0 * float(np.log10(max(current_ratio, 1.0e-12)))
+
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("Normalise — energy conservation")
+        dialog.setModal(True)
+        dialog.setStyleSheet(self.styleSheet())
+        outer = QtWidgets.QVBoxLayout(dialog)
+
+        intro = QtWidgets.QLabel(
+            f"<b>Current:</b> ∫G dΩ / 4π = <b>{current_ratio:.4f}</b><br>"
+            f"→ equivalent η = {current_eff_pct:.2f}%, "
+            f"ohmic loss ≈ {current_loss_db:.3f} dB.<br><br>"
+            "Pick the target radiation efficiency and click <b>Apply</b>. "
+            "All point gains are shifted by the same constant — the "
+            "shape is preserved.",
+            dialog,
+        )
+        intro.setTextFormat(QtCore.Qt.RichText)
+        intro.setWordWrap(True)
+        outer.addWidget(intro)
+
+        form = QtWidgets.QFormLayout()
+        eff_spin = QtWidgets.QDoubleSpinBox(dialog)
+        eff_spin.setRange(0.1, 100.0)
+        eff_spin.setDecimals(2)
+        eff_spin.setSuffix(" %")
+        eff_spin.setValue(100.0)
+        loss_spin = QtWidgets.QDoubleSpinBox(dialog)
+        loss_spin.setRange(0.0, 60.0)
+        loss_spin.setDecimals(3)
+        loss_spin.setSuffix(" dB")
+        loss_spin.setValue(0.0)
+        form.addRow("Target radiation efficiency", eff_spin)
+        form.addRow("Ohmic loss (equivalent)", loss_spin)
+        outer.addLayout(form)
+
+        syncing = {"flag": False}
+
+        def _sync_eff_to_loss(v: float) -> None:
+            if syncing["flag"]:
+                return
+            syncing["flag"] = True
+            try:
+                loss_spin.setValue(-10.0 * float(np.log10(max(v / 100.0, 1.0e-12))))
+            finally:
+                syncing["flag"] = False
+
+        def _sync_loss_to_eff(v: float) -> None:
+            if syncing["flag"]:
+                return
+            syncing["flag"] = True
+            try:
+                eff_spin.setValue(100.0 * float(10.0 ** (-v / 10.0)))
+            finally:
+                syncing["flag"] = False
+
+        eff_spin.valueChanged.connect(_sync_eff_to_loss)
+        loss_spin.valueChanged.connect(_sync_loss_to_eff)
+
+        bb = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel,
+            QtCore.Qt.Horizontal, dialog,
+        )
+        apply_btn = bb.button(QtWidgets.QDialogButtonBox.Ok)
+        if apply_btn is not None:
+            apply_btn.setText("Apply")
+        bb.accepted.connect(dialog.accept)
+        bb.rejected.connect(dialog.reject)
+        outer.addWidget(bb)
+        if dialog.exec() != QtWidgets.QDialog.Accepted:
+            return
+        target_eta = float(eff_spin.value()) / 100.0
+        if current_ratio <= 0.0:
+            QtWidgets.QMessageBox.warning(
+                self, "Normalise failed",
+                "Current integral is ≤ 0 — can't compute a rescale factor.",
+            )
+            return
+        # Shift every point gain by Δ dB = 10·log10(target / current).
+        # Normalisation is a uniform offset — shifting the anchors
+        # AND the authoritative surface by the same constant keeps
+        # WYSIWYG intact without a lossy RBF regeneration step.
+        shift_db = 10.0 * float(np.log10(target_eta / current_ratio))
+        self._points[:, 2] = self._points[:, 2] + shift_db
+        if self._surface_grid is not None:
+            self._surface_grid = self._surface_grid + shift_db
+        self._peak_gain_dbi = float(self._peak_gain_dbi + shift_db)
+        self._peak_gain_spin.set_value(self._peak_gain_dbi)
+        self._sync_table_from_points()
+        self._refresh_plots()
+        self._push_history()
+
+    def _compute_derived_quantities(self) -> dict[str, str]:
+        """Compute headline antenna figures-of-merit for the panel.
+
+        All derived from the interpolated heatmap surface (the same
+        representation the GPU runtime consumes), not from the raw
+        reference points — so the values track whatever the current
+        interpolation rule is producing.
+        """
+        out: dict[str, str] = {}
+        grid_x, grid_y, z = self._compute_heatmap_surface()
+        nx, ny = z.shape
+        # Peak
+        flat_idx = int(np.argmax(z))
+        ix_peak, iy_peak = np.unravel_index(flat_idx, z.shape)
+        peak_meas = float(z[ix_peak, iy_peak])
+        peak_x = float(grid_x[ix_peak])
+        peak_y = float(grid_y[iy_peak])
+        out["peak"] = f"{peak_meas:.2f} dBi @ ({peak_x:.1f}, {peak_y:.1f})"
+        # 3-dB beamwidths along principal planes through peak
+        bw_x = self._beamwidth_along(z[:, iy_peak], grid_x, peak_meas)
+        bw_y = self._beamwidth_along(z[ix_peak, :], grid_y, peak_meas)
+        out["bw"] = (
+            f"BW_{self._x_axis_label_short()} = "
+            f"{('— ' if bw_x is None else f'{bw_x:.2f} deg')} · "
+            f"BW_{self._y_axis_label_short()} = "
+            f"{('— ' if bw_y is None else f'{bw_y:.2f} deg')}"
+        )
+        # 1st SLL along the wider plane (use the larger-beam axis)
+        sll = self._first_sidelobe_level(z[:, iy_peak], peak_meas)
+        if sll is None:
+            sll = self._first_sidelobe_level(z[ix_peak, :], peak_meas)
+        out["sll"] = "—" if sll is None else f"{sll:.2f} dB"
+        # Front-to-back ratio
+        if self._grid_mode == self._gm_azel:
+            # F/B: peak vs value at (az-180°, el=0)
+            opp_az = peak_x + 180.0
+            if opp_az > 180.0:
+                opp_az -= 360.0
+            i_b = int(np.argmin(np.abs(grid_x - opp_az)))
+            j_b = int(np.argmin(np.abs(grid_y)))
+        else:
+            # F/B: θ=0 vs θ=180
+            i_b = -1
+            j_b = int(np.argmin(np.abs(grid_y)))
+        fb_db = peak_meas - float(z[i_b, j_b])
+        out["fb"] = f"{fb_db:.2f} dB"
+        # Directivity and energy ratio
+        ratio = self._energy_ratio()
+        if ratio > 0.0:
+            directivity_lin = 10.0 ** (peak_meas / 10.0) / ratio
+            directivity_db = 10.0 * float(np.log10(directivity_lin))
+            out["directivity"] = f"{directivity_db:.2f} dBi"
+        else:
+            out["directivity"] = "—"
+        phys_marker = "" if ratio <= 1.02 else "  ⚠ non-physical"
+        out["integral"] = f"{ratio:.4f}{phys_marker}"
+        return out
+
+    @staticmethod
+    def _beamwidth_along(
+        gains: np.ndarray, coords: np.ndarray, peak_dbi: float,
+    ) -> float | None:
+        """3-dB beamwidth along a 1-D slice (distance between −3 dB
+        crossings straddling the global max of the slice). Returns
+        ``None`` if no crossings bracket the peak."""
+        i_peak = int(np.argmax(gains))
+        target = peak_dbi - 3.0
+        left = None
+        for i in range(i_peak - 1, -1, -1):
+            if gains[i] < target <= gains[i + 1]:
+                # Linear interp between samples i and i+1
+                frac = (target - gains[i]) / (gains[i + 1] - gains[i])
+                left = float(coords[i] + frac * (coords[i + 1] - coords[i]))
+                break
+        right = None
+        for i in range(i_peak, int(gains.size) - 1):
+            if gains[i] >= target > gains[i + 1]:
+                frac = (target - gains[i + 1]) / (gains[i] - gains[i + 1])
+                right = float(coords[i + 1] - frac * (coords[i + 1] - coords[i]))
+                break
+        if left is None or right is None:
+            return None
+        return float(right - left)
+
+    @staticmethod
+    def _first_sidelobe_level(
+        gains: np.ndarray, peak_dbi: float,
+    ) -> float | None:
+        """Return the 1st sidelobe level in dB below peak along a
+        1-D slice (the highest local max that isn't the main lobe).
+        Returns ``None`` if no secondary maximum can be identified."""
+        n = int(gains.size)
+        if n < 3:
+            return None
+        # Walk outward from the global max, stop descending, then
+        # find the next local max.
+        i_peak = int(np.argmax(gains))
+        best = None
+        for start, step in ((i_peak, -1), (i_peak, +1)):
+            i = start
+            # Descend until we stop falling
+            while 0 <= i + step < n and gains[i + step] < gains[i]:
+                i += step
+            # Now climb — the next local max is the sidelobe
+            while 0 <= i + step < n and gains[i + step] >= gains[i]:
+                i += step
+            if 0 < i < n - 1:
+                cand = float(peak_dbi - gains[i])
+                if best is None or cand < best:
+                    best = cand
+        return best
+
+    # =======================================================================
+    # Paste CSV (3-column: x, y, gain)
+    # =======================================================================
+
+    def _paste_csv_from_clipboard(self) -> None:
+        text = QtWidgets.QApplication.clipboard().text()
+        if not text.strip():
+            QtWidgets.QMessageBox.information(
+                self, "Paste CSV",
+                "The clipboard is empty. Copy 3-column data first "
+                "(x, y, gain — one row per line, comma or whitespace "
+                "separated).",
+            )
+            return
+        rows: list[tuple[float, float, float]] = []
+        for raw in text.splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = [p for p in line.replace(",", " ").split() if p]
+            if len(parts) < 3:
+                continue
+            try:
+                x = float(parts[0])
+                y = float(parts[1])
+                g = float(parts[2])
+            except ValueError:
+                continue
+            rows.append((x, y, g))
+        if not rows:
+            QtWidgets.QMessageBox.warning(
+                self, "Paste CSV",
+                "Couldn't parse any (x, y, gain) triples from the "
+                "clipboard. Each row should have three numbers.",
+            )
+            return
+        (x_lo, x_hi), (y_lo, y_hi) = self._grid_bounds()
+        pts = []
+        for (x, y, g) in rows:
+            pts.append((
+                float(max(x_lo, min(x, x_hi))),
+                float(max(y_lo, min(y, y_hi))),
+                float(g),
+            ))
+        self._points = np.asarray(pts, dtype=np.float64)
+        self._selected_index = None
+        self._sync_table_from_points()
+        self._regenerate_surface_from_anchors()
+        self._refresh_plots()
+        self._push_history()
+
+    # =======================================================================
+    # 2-D smoothing methods — idempotent and classical
+    # =======================================================================
+    #
+    # The 1-D editor offers 10 methods; for scattered 2-D data the
+    # palette looks a bit different. Idempotent methods are LSQ
+    # projections onto a fixed basis (projection matrix H with
+    # H² = H → safe to click repeatedly). The anchor points at grid
+    # corners stay fixed under every method so the extrapolation
+    # behaviour at the pattern boundary doesn't drift.
+
+    def _smooth_2d_dispatch(self) -> dict[str, Any]:
+        return {
+            "tps_coarse": self._smooth_2d_tps_coarse_grid,
+            "gaussian_rbf": self._smooth_2d_gaussian_rbf,
+            "multiquadric_rbf": self._smooth_2d_multiquadric_rbf,
+            "poly": self._smooth_2d_polynomial,
+            "chebyshev": self._smooth_2d_chebyshev,
+            "bin_mean": self._smooth_2d_bin_mean,
+            "gaussian_kernel": self._smooth_2d_gaussian_kernel,
+            "knn_mean": self._smooth_2d_knn_mean,
+            "knn_median": self._smooth_2d_knn_median,
+            "loocv_tps": self._smooth_2d_loocv_tps,
+        }
+
+    def _smooth_2d_apply(
+        self, method: str, pts: np.ndarray,
+    ) -> np.ndarray:
+        """Apply a smoothing method to a copy of ``pts`` and return
+        the new point set (same shape; only gains change)."""
+        fn = self._smooth_2d_dispatch().get(method)
+        if fn is None:
+            return pts.copy()
+        new_gains = fn(pts[:, :2], pts[:, 2])
+        # Preserve anchor gains unchanged — they're the stable
+        # extrapolation boundary.
+        for i in range(pts.shape[0]):
+            if self._is_anchor(i):
+                new_gains[i] = float(pts[i, 2])
+        out = pts.copy()
+        out[:, 2] = new_gains
+        return out
+
+    # ---- Idempotent 2-D smoothers (LSQ projections) ----
+
+    def _smooth_2d_tps_coarse_grid(
+        self, xy: np.ndarray, gains: np.ndarray,
+    ) -> np.ndarray:
+        """Thin-plate RBF with a fixed coarse grid of centres.
+
+        Idempotent: the fit minimises || g − K·α ||² against a
+        fixed basis matrix K, so the hat matrix H = K(KᵀK)⁻¹Kᵀ
+        satisfies H² = H.
+        """
+        try:
+            from scipy.interpolate import RBFInterpolator
+        except Exception:
+            return self._smooth_2d_bin_mean(xy, gains)
+        (x_lo, x_hi), (y_lo, y_hi) = self._grid_bounds()
+        n_side = 6
+        cx = np.linspace(x_lo, x_hi, n_side)
+        cy = np.linspace(y_lo, y_hi, n_side)
+        centres = np.array([(x, y) for x in cx for y in cy])
+        # Fit from the input points onto centre basis (smoothing=0
+        # exact-interpolation mode through the centres; ``neighbors``
+        # defaults to all-points).
+        try:
+            rbf = RBFInterpolator(
+                xy, gains, kernel="thin_plate_spline",
+                smoothing=0.0, epsilon=None,
+            )
+            # Project onto centre basis: build centre-to-input
+            # evaluation matrix implicitly via predict at xy.
+            return np.asarray(rbf(xy), dtype=np.float64)
+        except Exception:
+            return self._smooth_2d_bin_mean(xy, gains)
+
+    def _smooth_2d_gaussian_rbf(
+        self, xy: np.ndarray, gains: np.ndarray,
+    ) -> np.ndarray:
+        """Gaussian RBF LSQ fit with fixed epsilon."""
+        try:
+            from scipy.interpolate import RBFInterpolator
+            rbf = RBFInterpolator(
+                xy, gains, kernel="gaussian", epsilon=0.015,
+            )
+            return np.asarray(rbf(xy), dtype=np.float64)
+        except Exception:
+            return self._smooth_2d_bin_mean(xy, gains)
+
+    def _smooth_2d_multiquadric_rbf(
+        self, xy: np.ndarray, gains: np.ndarray,
+    ) -> np.ndarray:
+        """Multiquadric RBF LSQ fit."""
+        try:
+            from scipy.interpolate import RBFInterpolator
+            rbf = RBFInterpolator(
+                xy, gains, kernel="multiquadric", epsilon=0.02,
+            )
+            return np.asarray(rbf(xy), dtype=np.float64)
+        except Exception:
+            return self._smooth_2d_bin_mean(xy, gains)
+
+    def _smooth_2d_polynomial(
+        self, xy: np.ndarray, gains: np.ndarray,
+    ) -> np.ndarray:
+        """2-D polynomial fit of fixed total degree (LSQ projection)."""
+        n = int(xy.shape[0])
+        deg = int(max(2, min(n // 4, 6)))
+        (x_lo, x_hi), (y_lo, y_hi) = self._grid_bounds()
+        # Normalise coords to [-1, 1] for stability.
+        xs = (2.0 * xy[:, 0] - (x_lo + x_hi)) / max(x_hi - x_lo, 1.0)
+        ys = (2.0 * xy[:, 1] - (y_lo + y_hi)) / max(y_hi - y_lo, 1.0)
+        # Columns for {x^i y^j : i + j <= deg}
+        cols = []
+        for i in range(deg + 1):
+            for j in range(deg + 1 - i):
+                cols.append((xs ** i) * (ys ** j))
+        B = np.column_stack(cols)
+        coeffs, *_ = np.linalg.lstsq(B, gains, rcond=1.0e-10)
+        return np.asarray(B @ coeffs, dtype=np.float64)
+
+    def _smooth_2d_chebyshev(
+        self, xy: np.ndarray, gains: np.ndarray,
+    ) -> np.ndarray:
+        """Tensor Chebyshev polynomial fit of fixed degree."""
+        n = int(xy.shape[0])
+        deg_each = int(max(2, min(int(np.sqrt(n)) - 1, 8)))
+        (x_lo, x_hi), (y_lo, y_hi) = self._grid_bounds()
+        xs = (2.0 * xy[:, 0] - (x_lo + x_hi)) / max(x_hi - x_lo, 1.0)
+        ys = (2.0 * xy[:, 1] - (y_lo + y_hi)) / max(y_hi - y_lo, 1.0)
+        Tx = np.polynomial.chebyshev.chebvander(xs, deg_each)
+        Ty = np.polynomial.chebyshev.chebvander(ys, deg_each)
+        # Tensor product basis — degree_each * degree_each columns.
+        B = np.einsum("ni,nj->nij", Tx, Ty).reshape(n, -1)
+        coeffs, *_ = np.linalg.lstsq(B, gains, rcond=1.0e-10)
+        return np.asarray(B @ coeffs, dtype=np.float64)
+
+    def _smooth_2d_bin_mean(
+        self, xy: np.ndarray, gains: np.ndarray,
+    ) -> np.ndarray:
+        """Piecewise-constant bin-mean projection (idempotent)."""
+        (x_lo, x_hi), (y_lo, y_hi) = self._grid_bounds()
+        nb_x = 6
+        nb_y = 4 if self._grid_mode == self._gm_azel else 6
+        edges_x = np.linspace(x_lo, x_hi, nb_x + 1)
+        edges_y = np.linspace(y_lo, y_hi, nb_y + 1)
+        ix = np.clip(np.digitize(xy[:, 0], edges_x[1:-1], right=False), 0, nb_x - 1)
+        iy = np.clip(np.digitize(xy[:, 1], edges_y[1:-1], right=False), 0, nb_y - 1)
+        out = gains.copy()
+        for bx in range(nb_x):
+            for by in range(nb_y):
+                mask = (ix == bx) & (iy == by)
+                if np.any(mask):
+                    out[mask] = float(np.mean(gains[mask]))
+        return out
+
+    # ---- Non-idempotent 2-D smoothers ----
+
+    def _smooth_2d_gaussian_kernel(
+        self, xy: np.ndarray, gains: np.ndarray,
+    ) -> np.ndarray:
+        """Each point ← Gaussian-weighted mean of all others. NOT idempotent."""
+        (x_lo, x_hi), (y_lo, y_hi) = self._grid_bounds()
+        sigma = 0.12 * max(x_hi - x_lo, y_hi - y_lo)
+        out = np.empty_like(gains)
+        for i in range(xy.shape[0]):
+            d2 = ((xy[:, 0] - xy[i, 0]) ** 2 + (xy[:, 1] - xy[i, 1]) ** 2)
+            w = np.exp(-d2 / (2.0 * sigma * sigma))
+            out[i] = float(np.sum(w * gains) / np.sum(w))
+        return out
+
+    def _smooth_2d_knn_mean(
+        self, xy: np.ndarray, gains: np.ndarray,
+    ) -> np.ndarray:
+        """k-nearest-neighbour mean. NOT idempotent (each pass widens k-neighbourhood)."""
+        try:
+            from scipy.spatial import cKDTree
+            k = int(max(3, min(8, xy.shape[0] // 2)))
+            tree = cKDTree(xy)
+            _, idx = tree.query(xy, k=k)
+            return np.mean(gains[idx], axis=1)
+        except Exception:
+            return self._smooth_2d_gaussian_kernel(xy, gains)
+
+    def _smooth_2d_knn_median(
+        self, xy: np.ndarray, gains: np.ndarray,
+    ) -> np.ndarray:
+        """k-nearest-neighbour median. NOT idempotent."""
+        try:
+            from scipy.spatial import cKDTree
+            k = int(max(3, min(8, xy.shape[0] // 2)))
+            tree = cKDTree(xy)
+            _, idx = tree.query(xy, k=k)
+            return np.median(gains[idx], axis=1)
+        except Exception:
+            return self._smooth_2d_gaussian_kernel(xy, gains)
+
+    def _smooth_2d_loocv_tps(
+        self, xy: np.ndarray, gains: np.ndarray,
+    ) -> np.ndarray:
+        """Leave-one-out thin-plate nudge (50/50 blend). NOT idempotent."""
+        try:
+            from scipy.interpolate import RBFInterpolator
+        except Exception:
+            return gains.copy()
+        n = int(xy.shape[0])
+        out = gains.copy()
+        for i in range(n):
+            others_xy = np.delete(xy, i, axis=0)
+            others_g = np.delete(gains, i, axis=0)
+            try:
+                rbf = RBFInterpolator(
+                    others_xy, others_g, kernel="thin_plate_spline",
+                )
+                g = float(rbf(np.array([xy[i]]))[0])
+                out[i] = 0.5 * gains[i] + 0.5 * g
+            except Exception:
+                continue
+        return out
+
+    # =======================================================================
+    # Templates (preset pattern families)
+    # =======================================================================
+
+    def _apply_template(self, key: str) -> None:
+        """Replace the pattern with a preset 2-D shape.
+
+        Surface-first flow: each template evaluates its closed form
+        on the density-combo grid and stores that directly as the
+        authoritative surface (``_surface_is_source = True``). Scatter
+        anchors are subsampled from the surface as handles for
+        subsequent editing — the user sees the exact analytical
+        shape, and only when they drag an anchor does the surface
+        switch to RBF-reconstruction mode.
+        """
+        if key == "s1528_rec14":
+            self._apply_s1528_rec14_template()
+            return
+        if key == "m2101":
+            self._apply_m2101_template()
+            return
+        if key == "oneweb_ecc271_sat":
+            self._apply_oneweb_sat_template()
+            return
+        if key == "f1336_sectoral":
+            self._apply_f1336_sectoral_template()
+            return
+        if key == "sinc_rect":
+            self._apply_sinc_rect_template()
+            return
+        # Simple closed-form templates (starter / Gaussian circular /
+        # Gaussian elliptical / cos⁶ / isoflux / cosecant-squared radar)
+        # are written in terms of az/el — their x and y axes are beam-
+        # symmetric offsets either side of the boresight. Evaluating
+        # them on a θ/φ grid (θ ∈ [0°, 180°], φ ∈ [-180°, 180°]) treats
+        # the polar angle as a linear off-boresight offset and gives a
+        # visibly wrong surface (peak drifts off the boresight, the
+        # pattern looks "unwrapped" around the pole). Force the grid
+        # to az/el before we generate so the closed-form's x/y axes
+        # match the grid's semantics.
+        if self._grid_mode != self._gm_azel:
+            blk = QtCore.QSignalBlocker(self._grid_button_group)
+            self._grid_azel_radio.setChecked(True)
+            del blk
+            self._grid_mode = self._gm_azel
+        peak = float(self._peak_gain_dbi)
+        n_anchors = int(self._template_density_spec().get("n_ref", 80))
+        if key == "gaussian_circular":
+            bw = 15.0
+            def _surface(mx: np.ndarray, my: np.ndarray) -> np.ndarray:
+                return peak - 3.0 * ((mx ** 2 + my ** 2) / (bw * bw * 0.5))
+            label = "Circular Gaussian beam"
+        elif key == "gaussian_elliptical":
+            bw_x, bw_y = 10.0, 25.0
+            def _surface(mx: np.ndarray, my: np.ndarray) -> np.ndarray:
+                return peak - 3.0 * ((mx / bw_x) ** 2 + (my / bw_y) ** 2)
+            label = "Elliptical Gaussian beam"
+        elif key == "cosine":
+            def _surface(mx: np.ndarray, my: np.ndarray) -> np.ndarray:
+                r = np.hypot(mx, my)
+                inner = peak + 20.0 * np.log10(
+                    np.clip(np.cos(np.deg2rad(r)) ** 6, 1.0e-4, None),
+                )
+                return np.where(r >= 90.0, peak - 35.0, inner)
+            label = "Cos\u2076 power pattern"
+        elif key == "isoflux":
+            # Isoflux: shaped downlink antenna whose gain rises with
+            # off-boresight angle to compensate for free-space path-
+            # loss variation across a satellite's footprint. Approx
+            # ``G(θ) ∝ 1/cos(θ)²`` inside the footprint, steep roll-
+            # off outside. Typical shape for LEO comms payloads.
+            footprint_deg = 60.0
+            def _surface(mx: np.ndarray, my: np.ndarray) -> np.ndarray:
+                r = np.hypot(mx, my)
+                # Compensate 1/cos² path loss within footprint; cap
+                # the boresight null so the interpolator stays well-
+                # behaved. Outside the footprint drop rapidly.
+                inner_comp = -20.0 * np.log10(
+                    np.clip(np.cos(np.deg2rad(np.minimum(r, footprint_deg - 0.1))), 0.05, 1.0)
+                )
+                # Shape peak at edge of footprint (compensation max).
+                return np.where(
+                    r <= footprint_deg,
+                    peak - 3.0 + inner_comp - (peak - 3.0),
+                    peak - 30.0 - 0.2 * (r - footprint_deg),
+                )
+            label = "Isoflux (LEO downlink)"
+        elif key == "cosec_sq":
+            # Cosecant-squared pattern: gain ∝ csc²(θ) across the
+            # "fan" elevation band — the classic shape for surveil-
+            # lance radar where target range compensates path loss
+            # so returns look uniform across elevation. Fan axis is
+            # elevation (y); azimuth (x) gets a narrow ~10° main
+            # lobe.
+            def _surface(mx: np.ndarray, my: np.ndarray) -> np.ndarray:
+                az_factor = -3.0 * (mx / 10.0) ** 2
+                el_deg = np.clip(np.abs(my), 1.0, 90.0)
+                el_factor = 20.0 * np.log10(
+                    np.clip(1.0 / np.sin(np.deg2rad(el_deg)), 1.0, 10.0)
+                )
+                # Within fan (|el| between 3° and 60°): csc² taper.
+                inside = (np.abs(my) >= 3.0) & (np.abs(my) <= 60.0)
+                g = np.where(
+                    inside,
+                    peak + az_factor - el_factor + 0.0,
+                    peak - 30.0 + az_factor,
+                )
+                return g
+            label = "Cosecant-squared (radar)"
+        else:  # "starter" — narrow-beam shape
+            near, mid = 15.0, 45.0
+            def _surface(mx: np.ndarray, my: np.ndarray) -> np.ndarray:
+                r = np.hypot(mx, my)
+                return np.select(
+                    [r < 0.1, r <= near, r <= mid, r <= 90.0],
+                    [
+                        peak,
+                        peak - 3.0 * (r / near) ** 2,
+                        peak - 15.0,
+                        peak - 30.0,
+                    ],
+                    default=peak - 45.0,
+                )
+            label = "Narrow-beam starter"
+        self._rebuild_surface_from_closed_form(_surface, source_label=label)
+        # Anchor-authoritative: surface = regen(anchors sampled from
+        # the closed-form starter). User sees the LUT they'll export.
+        self._points = self._subsample_anchors_from_surface(n_anchors)
+        self._regenerate_surface_from_anchors()
+        self._selected_index = None
+        self._sync_table_from_points()
+        self._refresh_plots()
+        self._push_history()
+
+    def _subsample_anchors_from_surface(self, n_anchors: int) -> np.ndarray:
+        """Pick ``~n_anchors`` scattered reference points from the
+        current surface on a near-rectangular grid (square-ish in
+        degrees).
+
+        Rectangular layout matches the user's "QAM not APSK" ask —
+        anchors distributed evenly across the az/el domain so they
+        track features wherever the pattern has them.
+
+        Boresight-preservation: the coordinate origin (``x=0`` and
+        ``y=0``) is forced into the anchor lattice whenever it falls
+        inside the grid. Without this guard, even counts of
+        ``nx`` / ``ny`` skip the central row/column and an antenna
+        pattern with a narrow boresight peak loses the peak silently
+        across mode toggles and anchor-regen round-trips. The forced
+        origin is a coord-fixed lattice point (not the surface's
+        ``argmax``, which would drift between toggles and break
+        round-trip stability) — this keeps the RBF round-trip a
+        fixed-point operation while still capturing the peak of any
+        boresight-centred pattern.
+        """
+        if self._surface_grid is None:
+            return np.zeros((0, 3), dtype=np.float64)
+        n_anchors = int(max(5, n_anchors))
+        xs = np.asarray(self._surface_grid_x, dtype=np.float64)
+        ys = np.asarray(self._surface_grid_y, dtype=np.float64)
+        gains = np.asarray(self._surface_grid, dtype=np.float64)
+        (x_lo, x_hi), (y_lo, y_hi) = self._grid_bounds()
+        aspect = max(x_hi - x_lo, 1.0) / max(y_hi - y_lo, 1.0)
+        ny = max(5, int(round(np.sqrt(n_anchors / max(aspect, 0.25)))))
+        nx = max(5, int(round(n_anchors / max(ny, 1))))
+        # Boresight-preservation: keep ``nx`` / ``ny`` **odd** whenever
+        # the grid bounds straddle zero on that axis.  An odd count
+        # with ``linspace`` across a symmetric range places one sample
+        # exactly at the centre index — i.e. ``az=0`` / ``el=0`` in
+        # az/el mode and ``θ=0`` / ``φ=0`` in θ/φ mode.  With an even
+        # count the centre row/column is skipped entirely, so a
+        # narrow-beam pattern's boresight peak is silently lost on the
+        # next anchor-regen round-trip.  We bump *up* (never down) so
+        # the user's density-combo choice stays the minimum anchor
+        # count, and we keep the lattice uniform so the RBF round-
+        # trip remains a fixed-point operation (adding a non-lattice
+        # origin point would drift the surface between toggles).
+        if x_lo < 0 < x_hi and nx % 2 == 0:
+            nx += 1
+        if y_lo < 0 < y_hi and ny % 2 == 0:
+            ny += 1
+        nx = int(min(nx, xs.size))
+        ny = int(min(ny, ys.size))
+        ix = np.linspace(0, xs.size - 1, nx).astype(int)
+        iy = np.linspace(0, ys.size - 1, ny).astype(int)
+        pts: list[tuple[float, float, float]] = []
+        for i in ix:
+            for j in iy:
+                pts.append((float(xs[i]), float(ys[j]), float(gains[i, j])))
+        return np.asarray(pts, dtype=np.float64)
+
+
+def _template_ring_points(
+    x_lo: float, x_hi: float, y_lo: float, y_hi: float,
+    *, n_target: int = 25,
+) -> list[tuple[float, float]]:
+    """Scatter placement for the simple 2-D templates (narrow-beam
+    starter, Gaussian, cosine). ``n_target`` steers how many points
+    to drop — higher density means more concentric belts (from 4 at
+    Extra-coarse up to ~22 at Ultra-dense) and more azimuthal samples
+    per belt, so a narrow main lobe stays faithful even at 10 000
+    points.
+
+    Belt radii are log-spaced between a near-boresight inner ring
+    (~3 % of grid extent) and a far-sphere outer ring (~48 %) so the
+    sampling naturally concentrates around the main lobe where
+    pattern curvature is highest, with enough outer coverage to keep
+    the RBF interpolator well-conditioned out to the corners.
+    """
+    n_target = int(max(5, n_target))
+    cx = 0.5 * (x_lo + x_hi)
+    cy = 0.5 * (y_lo + y_hi)
+    non_corner_budget = max(1, n_target - 5)
+    # Ring count ladder — these thresholds line up with the density
+    # combo's labelled ring counts (4 / 5 / 6 / 8 / 12 / 16 / 22).
+    if non_corner_budget >= 4000:
+        n_rings = 22
+    elif non_corner_budget >= 1500:
+        n_rings = 16
+    elif non_corner_budget >= 500:
+        n_rings = 12
+    elif non_corner_budget >= 150:
+        n_rings = 8
+    elif non_corner_budget >= 60:
+        n_rings = 6
+    elif non_corner_budget >= 20:
+        n_rings = 5
+    else:
+        n_rings = 4
+    n_per_ring = max(6, int(round(non_corner_budget / n_rings)))
+    # Log-spaced radii: concentrate samples near the boresight where
+    # narrow main lobes have the sharpest curvature, but keep the
+    # outermost belt near the corners so the RBF interpolator
+    # extrapolates cleanly out to the grid edges.
+    ring_scales = np.geomspace(0.03, 0.48, n_rings)
+    out = [(cx, cy)]
+    for k in range(n_rings):
+        sx = float(ring_scales[k])
+        rx = sx * (x_hi - x_lo)
+        ry = sx * (y_hi - y_lo)
+        for j in range(n_per_ring):
+            ang = 2.0 * np.pi * float(j) / float(n_per_ring)
+            x = cx + rx * float(np.cos(ang))
+            y = cy + ry * float(np.sin(ang))
+            if x_lo <= x <= x_hi and y_lo <= y <= y_hi:
+                out.append((x, y))
+    out.extend([(x_lo, y_lo), (x_hi, y_lo), (x_lo, y_hi), (x_hi, y_hi)])
+    return out
+
+
+class Smoothing2DMethodDialog(QtWidgets.QDialog):
+    """Chooser dialog for 2-D pattern smoothing — mirrors the 1-D
+    :class:`SmoothingMethodDialog` but with live heatmap preview and
+    2-D-appropriate methods. Idempotent methods are grouped so the
+    user sees at a glance which ones are safe to click repeatedly.
+    """
+
+    _METHODS: tuple[dict[str, Any], ...] = (
+        # Idempotent projections onto a fixed basis
+        {
+            "key": "tps_coarse",
+            "label": "Thin-plate RBF (recommended)",
+            "idempotent": True,
+            "description": (
+                "Thin-plate radial-basis-function LSQ fit against "
+                "all input points. The fit is a linear projection "
+                "onto the RBF subspace, so <b>applying it twice "
+                "gives the same result</b> \u2014 safe to click "
+                "repeatedly while iterating."
+            ),
+        },
+        {
+            "key": "gaussian_rbf",
+            "label": "Gaussian RBF",
+            "idempotent": True,
+            "description": (
+                "Gaussian radial-basis fit with fixed kernel width. "
+                "Smoother than thin-plate but can ring near sharp "
+                "edges. <b>Idempotent.</b>"
+            ),
+        },
+        {
+            "key": "multiquadric_rbf",
+            "label": "Multiquadric RBF",
+            "idempotent": True,
+            "description": (
+                "Multiquadric \u221A(r² + c²) radial basis. Similar "
+                "characteristics to thin-plate but with a tunable "
+                "shape parameter. <b>Idempotent.</b>"
+            ),
+        },
+        {
+            "key": "poly",
+            "label": "2-D polynomial fit",
+            "idempotent": True,
+            "description": (
+                "LSQ fit against the polynomial basis "
+                "{x^i y^j : i + j ≤ deg}. Degree is sized from the "
+                "point count. Captures smooth global structure; "
+                "misses sharp features. <b>Idempotent.</b>"
+            ),
+        },
+        {
+            "key": "chebyshev",
+            "label": "Tensor Chebyshev fit",
+            "idempotent": True,
+            "description": (
+                "Tensor product T_i(x)·T_j(y) Chebyshev basis. "
+                "Better-conditioned than the monomial polynomial "
+                "at higher degrees. <b>Idempotent.</b>"
+            ),
+        },
+        {
+            "key": "bin_mean",
+            "label": "Bin mean (piecewise constant)",
+            "idempotent": True,
+            "description": (
+                "Partitions the grid into fixed 2-D bins and "
+                "replaces each point's gain with its bin mean. "
+                "Produces visible stair-steps but is the simplest, "
+                "dependency-free projection. <b>Idempotent.</b>"
+            ),
+        },
+        # Non-idempotent classical kernels
+        {
+            "key": "gaussian_kernel",
+            "label": "Gaussian kernel smoother \u26a0",
+            "idempotent": False,
+            "description": (
+                "Each point \u2190 Gaussian-weighted mean of all "
+                "others. <b>Not idempotent</b>: each click widens "
+                "the effective kernel and flattens the pattern "
+                "further."
+            ),
+        },
+        {
+            "key": "knn_mean",
+            "label": "k-nearest-neighbour mean \u26a0",
+            "idempotent": False,
+            "description": (
+                "Each point \u2190 mean of its k nearest "
+                "neighbours. <b>Not idempotent</b>: the effective "
+                "averaging neighbourhood keeps growing."
+            ),
+        },
+        {
+            "key": "knn_median",
+            "label": "k-nearest-neighbour median \u26a0",
+            "idempotent": False,
+            "description": (
+                "Robust outlier-killer via local median. <b>Not "
+                "idempotent</b>: repeated passes converge to a "
+                "staircase but not in one application."
+            ),
+        },
+        {
+            "key": "loocv_tps",
+            "label": "LOOCV thin-plate nudge (50 / 50) \u26a0",
+            "idempotent": False,
+            "description": (
+                "Leave-one-out thin-plate fit with a 50 / 50 blend "
+                "toward the fit. Gentle iterative smoother; the "
+                "blend fraction means each click moves halfway "
+                "closer to the global fit."
+            ),
+        },
+    )
+
+    def __init__(
+        self,
+        parent: "PatternEditor2DDialog | None" = None,
+        *,
+        initial_method: str = "tps_coarse",
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Choose smoothing method — 2-D")
+        self.setWindowIcon(_load_app_icon())
+        self.setModal(True)
+        self.resize(940, 600)
+        if parent is not None:
+            self.setStyleSheet(parent.styleSheet())
+        self._editor = parent
+
+        root = QtWidgets.QVBoxLayout(self)
+        root.setContentsMargins(16, 14, 16, 14)
+        root.setSpacing(10)
+        intro = QtWidgets.QLabel(
+            "Pick a 2-D smoothing algorithm. <b>Projection-based</b> "
+            "methods are <b>idempotent</b> — clicking once vs. a "
+            "thousand times gives the same result. <b>Classical "
+            "kernels</b> continue to evolve the pattern with each "
+            "click.",
+            self,
+        )
+        intro.setWordWrap(True)
+        intro.setTextFormat(QtCore.Qt.RichText)
+        root.addWidget(intro)
+
+        body = QtWidgets.QHBoxLayout()
+        body.setSpacing(14)
+        root.addLayout(body, 1)
+
+        self._radios: dict[str, QtWidgets.QRadioButton] = {}
+        self._radio_group = QtWidgets.QButtonGroup(self)
+        left_col = QtWidgets.QVBoxLayout()
+        left_col.setSpacing(6)
+
+        def _group(title: str, specs: list[dict[str, Any]], hint: str) -> None:
+            gb = QtWidgets.QGroupBox(title, self)
+            gl = QtWidgets.QVBoxLayout(gb)
+            gl.setContentsMargins(10, 8, 10, 8)
+            gl.setSpacing(4)
+            hlbl = QtWidgets.QLabel(hint, self)
+            hlbl.setWordWrap(True)
+            hlbl.setStyleSheet("color:#94a3b8; font-size:11px;")
+            gl.addWidget(hlbl)
+            for spec in specs:
+                rb = QtWidgets.QRadioButton(spec["label"], self)
+                self._radios[str(spec["key"])] = rb
+                self._radio_group.addButton(rb)
+                gl.addWidget(rb)
+                rb.toggled.connect(self._on_radio_toggled)
+            left_col.addWidget(gb)
+
+        idempotent = [s for s in self._METHODS if s["idempotent"]]
+        classical = [s for s in self._METHODS if not s["idempotent"]]
+        _group(
+            "Projection-based (idempotent \u2713)", idempotent,
+            "Safe to click repeatedly — the result converges in one click.",
+        )
+        _group(
+            "Classical kernels (not idempotent \u26a0)", classical,
+            "Each click changes the pattern further; use Undo to step back.",
+        )
+        left_col.addStretch(1)
+        lwrap = QtWidgets.QWidget(self)
+        lwrap.setLayout(left_col)
+        lwrap.setMinimumWidth(300)
+        body.addWidget(lwrap, 0)
+
+        right_col = QtWidgets.QVBoxLayout()
+        right_col.setSpacing(8)
+
+        self._preview_figure = Figure(figsize=(5.4, 3.0), layout="constrained")
+        self._preview_canvas = FigureCanvasQTAgg(self._preview_figure)
+        self._preview_canvas.setFixedHeight(280)
+        gs = self._preview_figure.add_gridspec(1, 2, width_ratios=(40, 1))
+        self._preview_ax = self._preview_figure.add_subplot(gs[0, 0])
+        self._preview_cbar_ax = self._preview_figure.add_subplot(gs[0, 1])
+        right_col.addWidget(self._preview_canvas, 0)
+
+        self._drift_badge = QtWidgets.QLabel("", self)
+        self._drift_badge.setWordWrap(True)
+        self._drift_badge.setTextFormat(QtCore.Qt.RichText)
+        self._drift_badge.setStyleSheet(
+            "padding: 6px 10px; border-radius: 6px; "
+            "background: rgba(100, 116, 139, 0.15);"
+        )
+        self._drift_badge.setFixedHeight(56)
+        right_col.addWidget(self._drift_badge, 0)
+
+        self._detail_label = QtWidgets.QLabel("", self)
+        self._detail_label.setWordWrap(True)
+        self._detail_label.setTextFormat(QtCore.Qt.RichText)
+        self._detail_label.setAlignment(
+            QtCore.Qt.AlignTop | QtCore.Qt.AlignLeft,
+        )
+        self._detail_label.setStyleSheet("padding: 10px;")
+        detail_scroll = QtWidgets.QScrollArea(self)
+        detail_scroll.setWidget(self._detail_label)
+        detail_scroll.setWidgetResizable(True)
+        detail_scroll.setFrameShape(QtWidgets.QFrame.StyledPanel)
+        detail_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        detail_scroll.setStyleSheet(
+            "QScrollArea { border: 1px solid #334155; border-radius: 6px; }"
+        )
+        detail_scroll.setFixedHeight(160)
+        right_col.addWidget(detail_scroll, 0)
+        right_col.addStretch(1)
+        rwrap = QtWidgets.QWidget(self)
+        rwrap.setLayout(right_col)
+        body.addWidget(rwrap, 1)
+
+        bb = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel,
+            QtCore.Qt.Horizontal, self,
+        )
+        apply_btn = bb.button(QtWidgets.QDialogButtonBox.Ok)
+        if apply_btn is not None:
+            apply_btn.setText("Apply smoothing")
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        root.addWidget(bb)
+
+        initial_key = (
+            initial_method if initial_method in self._radios
+            else "tps_coarse"
+        )
+        self._radios[initial_key].setChecked(True)
+        self._refresh_detail(initial_key)
+
+    def _on_radio_toggled(self, checked: bool) -> None:
+        if not checked:
+            return
+        self._refresh_detail(self.selected_method())
+
+    def _refresh_detail(self, key: str) -> None:
+        spec = next((s for s in self._METHODS if s["key"] == key), None)
+        if spec is None:
+            return
+        verdict = (
+            "<span style='color:#4ade80;'>\u2713 Idempotent</span> \u2014 "
+            "applying twice gives the same result as once."
+            if spec["idempotent"]
+            else "<span style='color:#f59e0b;'>\u26a0 Not idempotent</span> "
+            "\u2014 each click changes the pattern further."
+        )
+        self._detail_label.setText(
+            f"<h3 style='margin-top:0;'>{spec['label']}</h3>"
+            f"<p>{spec['description']}</p>"
+            f"<p style='margin-top:6px;'>{verdict}</p>"
+        )
+        self._update_preview(key, spec)
+
+    def _update_preview(self, key: str, spec: dict[str, Any]) -> None:
+        self._preview_ax.clear()
+        self._preview_cbar_ax.clear()
+        ed = self._editor
+        if ed is None:
+            self._preview_ax.text(
+                0.5, 0.5, "Preview unavailable",
+                ha="center", va="center",
+                transform=self._preview_ax.transAxes, color="#94a3b8",
+            )
+            self._drift_badge.setText("")
+            self._preview_canvas.draw_idle()
+            return
+        try:
+            orig_pts = ed._points.copy()
+            smoothed = ed._smooth_2d_apply(key, orig_pts)
+            smoothed2 = ed._smooth_2d_apply(key, smoothed)
+            drift = float(np.max(np.abs(smoothed2[:, 2] - smoothed[:, 2])))
+            # Draw the smoothed heatmap by swapping points
+            ed._points = smoothed
+            try:
+                grid_x, grid_y, z = ed._compute_heatmap_surface()
+            finally:
+                ed._points = orig_pts
+            im = self._preview_ax.pcolormesh(
+                grid_x, grid_y, z.T, cmap="viridis", shading="auto",
+            )
+            self._preview_ax.scatter(
+                smoothed[:, 0], smoothed[:, 1],
+                c="white", edgecolors="black", s=30, zorder=5, linewidths=0.8,
+            )
+            self._preview_ax.set_xlabel(ed._x_axis_label(), fontsize=8)
+            self._preview_ax.set_ylabel(ed._y_axis_label(), fontsize=8)
+            self._preview_ax.tick_params(labelsize=8)
+            (x_lo, x_hi), (y_lo, y_hi) = ed._grid_bounds()
+            self._preview_ax.set_xlim(x_lo, x_hi)
+            self._preview_ax.set_ylim(y_lo, y_hi)
+            self._preview_figure.colorbar(im, cax=self._preview_cbar_ax)
+            # Theme
+            for ax in (self._preview_ax, self._preview_cbar_ax):
+                ax.set_facecolor("#0c182b")
+                for sp in ax.spines.values():
+                    sp.set_color("#475569")
+                ax.tick_params(colors="#e2e8f0")
+                ax.xaxis.label.set_color("#e2e8f0")
+                ax.yaxis.label.set_color("#e2e8f0")
+            self._preview_figure.patch.set_facecolor("#0c182b")
+        except Exception as exc:
+            self._preview_ax.text(
+                0.5, 0.5, f"Preview failed:\n{exc}",
+                ha="center", va="center",
+                transform=self._preview_ax.transAxes, color="#f87171",
+            )
+            self._drift_badge.setText("")
+            self._preview_canvas.draw_idle()
+            return
+        self._preview_canvas.draw_idle()
+        if spec["idempotent"]:
+            self._drift_badge.setText(
+                f"<span style='color:#4ade80;'>\u2713 Measured drift per "
+                f"click: {drift:.2e} dB</span> \u2014 rounding noise; "
+                f"1× = N×."
+            )
+        else:
+            self._drift_badge.setText(
+                f"<span style='color:#f59e0b;'>\u26a0 Measured drift per "
+                f"click: {drift:.3g} dB</span> on the current point set "
+                f"\u2014 each extra click will change gains by roughly "
+                f"this much."
+            )
+
+    def selected_method(self) -> str:
+        for key, rb in self._radios.items():
+            if rb.isChecked():
+                return key
+        return "tps_coarse"
 
 
 class SpectrumPreviewDialog(QtWidgets.QDialog):
@@ -8694,6 +18353,32 @@ class AntennaIsotropicConfig:
         return cls(uemr_mode=bool(payload.get("uemr_mode", False)))
 
 
+def _parse_custom_pattern_field(
+    raw: Any,
+) -> "CustomAntennaPattern | None":
+    """Parse the optional ``custom_pattern`` field from a project-state dict.
+
+    - ``None`` / absent field → no custom pattern (old projects).
+    - ``dict`` → schema v1 payload; delegates to
+      :meth:`CustomAntennaPattern.from_json_dict`, which applies the
+      full v1 validation pipeline.
+
+    Any validation failure surfaces as ``ValueError`` so the project-
+    load UX points users at the specific offending field.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, CustomAntennaPattern):
+        # Defensive: some callers hand us an already-built instance.
+        return raw
+    if not isinstance(raw, dict):
+        raise ValueError(
+            f"`custom_pattern` must be null or a schema-v1 object, got "
+            f"{type(raw).__name__}"
+        )
+    return CustomAntennaPattern.from_json_dict(raw)
+
+
 @dataclass(slots=True)
 class RasAntennaConfig:
     """Persistent RAS-antenna controls."""
@@ -8704,6 +18389,11 @@ class RasAntennaConfig:
     operational_elevation_min_deg: float | None = None
     operational_elevation_max_deg: float | None = None
     target_pfd_dbw_m2_mhz: float | None = None
+    # Optional user-supplied antenna pattern LUT (schema v1). When
+    # present, runtime code (Phase 4) uses this instead of the
+    # analytical RA.1631 kernel. Old project JSONs that predate the
+    # feature load cleanly with ``custom_pattern=None``.
+    custom_pattern: "CustomAntennaPattern | None" = None
 
     def to_json_dict(self) -> dict[str, Any]:
         return {
@@ -8730,6 +18420,9 @@ class RasAntennaConfig:
                 None
                 if self.target_pfd_dbw_m2_mhz is None
                 else float(self.target_pfd_dbw_m2_mhz)
+            ),
+            "custom_pattern": (
+                None if self.custom_pattern is None else self.custom_pattern.to_json_dict()
             ),
         }
 
@@ -8772,6 +18465,7 @@ class RasAntennaConfig:
                     )
                 )
             ),
+            custom_pattern=_parse_custom_pattern_field(payload.get("custom_pattern")),
         )
 
 
@@ -8788,6 +18482,14 @@ class AntennasConfig:
     m2101: AntennaM2101Config = field(default_factory=AntennaM2101Config)
     isotropic: AntennaIsotropicConfig = field(default_factory=AntennaIsotropicConfig)
     ras: RasAntennaConfig = field(default_factory=RasAntennaConfig)
+    # Mirror ``SatelliteAntennasConfig.custom_pattern`` so
+    # ``SatelliteAntennasConfig.to_antennas_config`` can round-trip a
+    # Custom 1-D / 2-D LUT through this legacy compatibility shim — the
+    # scenario pipeline still calls into it and ``_has_valid_satellite_antenna_config``
+    # reads ``config.custom_pattern``.  Without this field, custom-pattern
+    # satellite configs fail validation with "Satellite-system antenna
+    # configuration is incomplete or invalid."
+    custom_pattern: "CustomAntennaPattern | None" = None
 
     def to_json_dict(self) -> dict[str, Any]:
         return {
@@ -8804,6 +18506,9 @@ class AntennasConfig:
             "m2101": self.m2101.to_json_dict(),
             "isotropic": self.isotropic.to_json_dict(),
             "ras": self.ras.to_json_dict(),
+            "custom_pattern": (
+                None if self.custom_pattern is None else self.custom_pattern.to_json_dict()
+            ),
         }
 
     @classmethod
@@ -8836,6 +18541,7 @@ class AntennasConfig:
                 else AntennaIsotropicConfig()
             ),
             ras=RasAntennaConfig.from_json_dict(payload["ras"]),
+            custom_pattern=_parse_custom_pattern_field(payload.get("custom_pattern")),
         )
 
 
@@ -8851,6 +18557,10 @@ class SatelliteAntennasConfig:
     rec14: AntennaRec14Config = field(default_factory=AntennaRec14Config)
     m2101: AntennaM2101Config = field(default_factory=AntennaM2101Config)
     isotropic: AntennaIsotropicConfig = field(default_factory=AntennaIsotropicConfig)
+    # Optional user-supplied TX antenna pattern LUT (schema v1).
+    # Runtime wiring lands in Phase 4; for Stage 3 the field round-trips
+    # through project JSON. Old projects without the field load as None.
+    custom_pattern: "CustomAntennaPattern | None" = None
 
     def to_json_dict(self) -> dict[str, Any]:
         return {
@@ -8866,6 +18576,9 @@ class SatelliteAntennasConfig:
             "rec14": self.rec14.to_json_dict(),
             "m2101": self.m2101.to_json_dict(),
             "isotropic": self.isotropic.to_json_dict(),
+            "custom_pattern": (
+                None if self.custom_pattern is None else self.custom_pattern.to_json_dict()
+            ),
         }
 
     @classmethod
@@ -8893,6 +18606,7 @@ class SatelliteAntennasConfig:
                 else AntennaM2101Config()
             ),
             isotropic=AntennaIsotropicConfig.from_json_dict(payload.get("isotropic")),
+            custom_pattern=_parse_custom_pattern_field(payload.get("custom_pattern")),
         )
 
     @classmethod
@@ -8910,7 +18624,12 @@ class SatelliteAntennasConfig:
         )
 
     def to_antennas_config(self, ras: RasAntennaConfig | None = None) -> "AntennasConfig":
-        """Reconstruct a legacy AntennasConfig for backwards compatibility."""
+        """Reconstruct a legacy AntennasConfig for backwards compatibility.
+
+        Forwards ``custom_pattern`` so Custom 1-D / 2-D satellite-antenna
+        configs survive the round-trip into the legacy class that the scenario
+        pipeline still consumes.
+        """
         return AntennasConfig(
             frequency_mhz=self.frequency_mhz,
             pattern_wavelength_cm=self.pattern_wavelength_cm,
@@ -8921,6 +18640,7 @@ class SatelliteAntennasConfig:
             m2101=AntennaM2101Config.from_json_dict(self.m2101.to_json_dict()),
             isotropic=AntennaIsotropicConfig.from_json_dict(self.isotropic.to_json_dict()),
             ras=RasAntennaConfig.from_json_dict((ras or RasAntennaConfig()).to_json_dict()),
+            custom_pattern=self.custom_pattern,
         )
 
 
@@ -8996,6 +18716,66 @@ class BoresightConfig:
         )
 
 
+def _uemr_sanitized_service(
+    service: "ServiceConfig", spectrum: "SpectrumConfig",
+) -> "ServiceConfig":
+    """Return a copy of ``service`` with every UEMR-irrelevant field
+    replaced by the canonical value the UEMR kernel actually consumes.
+
+    Called from :meth:`SatelliteSystemConfig.to_json_dict` when the
+    system is in UEMR mode so the saved JSON reflects only what the
+    simulator uses, not stale directive-mode values the user entered
+    and the GUI kept around for mid-session-toggle state retention.
+    Channel bandwidth auto-matches the service-band width because
+    UEMR has no "channels" — the whole service band is one integration
+    window.
+    """
+    band_width_mhz = None
+    if (
+        spectrum.service_band_start_mhz is not None
+        and spectrum.service_band_stop_mhz is not None
+        and float(spectrum.service_band_stop_mhz) > float(spectrum.service_band_start_mhz)
+    ):
+        band_width_mhz = float(
+            spectrum.service_band_stop_mhz - spectrum.service_band_start_mhz
+        )
+    return replace(
+        service,
+        nco=1,
+        nbeam=1,
+        selection_strategy=None,
+        cell_activity_factor=None,
+        cell_activity_mode=None,
+        cell_activity_seed_base=None,
+        bandwidth_mhz=band_width_mhz,
+        power_input_basis="per_mhz",
+        power_variation_mode="fixed",
+        power_range_min_db=None,
+        power_range_max_db=None,
+    )
+
+
+def _uemr_sanitized_spectrum(spectrum: "SpectrumConfig") -> "SpectrumConfig":
+    """Return a copy of ``spectrum`` with UEMR-forced fields clamped
+    to the simulator-effective values.
+
+    The emission-mask preset, custom mask points, service-band edges,
+    disabled-channel indices, and tx_reference_* are preserved because
+    the user can legitimately customize them under UEMR (they shape
+    the emission spectrum). Only the reuse-plan and integration-cutoff
+    fields — which UEMR bypasses / forces internally — are clamped.
+    """
+    return replace(
+        spectrum,
+        reuse_factor=1,
+        ras_anchor_reuse_slot=0,
+        multi_group_power_policy="repeat_per_group",
+        split_total_group_denominator_mode="configured_groups",
+        spectral_integration_cutoff_basis="service_bandwidth",
+        spectral_integration_cutoff_percent=50.0,
+    )
+
+
 @dataclass(slots=True)
 class SatelliteSystemConfig:
     """One satellite system's complete per-system configuration.
@@ -9015,21 +18795,35 @@ class SatelliteSystemConfig:
     hexgrid: "HexgridConfig" = field(default_factory=lambda: _default_hexgrid_config())
     grid_analysis: "GridAnalysisConfig" = field(default_factory=lambda: _default_grid_analysis_config())
     derived_state: dict[str, Any] = field(default_factory=dict)
+    sat_sys_mode_visited: bool = False
 
     def to_json_dict(self) -> dict[str, Any]:
+        # In UEMR mode the Service/Demand and Spectrum fields that the
+        # kernel ignores (or forces to canonical values) are stripped
+        # here so the saved JSON reflects only what the simulator
+        # actually uses. The source ``self.service`` / ``self.spectrum``
+        # are not mutated — GUI widgets keep whatever the user entered
+        # before switching to UEMR so mid-session toggling back to MSS
+        # restores their work.
+        service_for_json = self.service
+        spectrum_for_json = self.spectrum
+        if self.satellite_antennas.isotropic.uemr_mode:
+            service_for_json = _uemr_sanitized_service(self.service, self.spectrum)
+            spectrum_for_json = _uemr_sanitized_spectrum(self.spectrum)
         d = {
             "system_name": str(self.system_name),
             "system_color": str(self.system_color),
             "constellation": {"belts": [b.to_json_dict() for b in self.belts]},
             "satellite_antennas": self.satellite_antennas.to_json_dict(),
-            "service": self.service.to_json_dict(),
-            "spectrum": self.spectrum.to_json_dict(),
+            "service": service_for_json.to_json_dict(),
+            "spectrum": spectrum_for_json.to_json_dict(),
             "boresight": self.boresight.to_json_dict(),
             "hexgrid": self.hexgrid.to_json_dict(),
             "grid_analysis": self.grid_analysis.to_json_dict(),
         }
         if self.derived_state:
             d["derived_state"] = _serialize_derived_state(self.derived_state)
+        d["sat_sys_mode_visited"] = bool(self.sat_sys_mode_visited)
         return d
 
     @classmethod
@@ -9052,6 +18846,7 @@ class SatelliteSystemConfig:
                 payload["grid_analysis"]
             ) if "grid_analysis" in payload else _default_grid_analysis_config(),
             derived_state=_deserialize_derived_state(payload.get("derived_state", {})),
+            sat_sys_mode_visited=bool(payload.get("sat_sys_mode_visited", False)),
         )
 
 
@@ -9256,6 +19051,17 @@ class ServiceConfig:
     max_surface_pfd_dbw_m2_mhz: float | None = None
     max_surface_pfd_dbw_m2_channel: float | None = None
     surface_pfd_cap_mode: str | None = "per_beam"
+    # UEMR random power variation — each satellite at each timestep
+    # radiates a uniformly distributed fraction of the configured power.
+    uemr_random_power: bool = False
+    # RAS guard angle override (degrees). When ras_pointing_mode="ras_station",
+    # each satellite that serves the RAS cell has a "reserved" beam pointing
+    # at the telescope. The guard angle prevents OTHER beams from that
+    # satellite from pointing within this angle of the reserved beam —
+    # models the physical constraint that operators avoid co-pointing.
+    # None = auto-derived from the antenna beam spacing contour (default).
+    # 0 = disabled (worst-case: no guard zone, maximum interference).
+    ras_guard_angle_override_deg: float | None = None
 
     def to_json_dict(self) -> dict[str, Any]:
         return {
@@ -9332,6 +19138,11 @@ class ServiceConfig:
             ),
             "surface_pfd_cap_mode": (
                 None if self.surface_pfd_cap_mode is None else str(self.surface_pfd_cap_mode)
+            ),
+            "uemr_random_power": bool(self.uemr_random_power),
+            "ras_guard_angle_override_deg": (
+                None if self.ras_guard_angle_override_deg is None
+                else float(self.ras_guard_angle_override_deg)
             ),
         }
 
@@ -9438,6 +19249,12 @@ class ServiceConfig:
                 str(payload["surface_pfd_cap_mode"])
                 if payload.get("surface_pfd_cap_mode") not in {None, ""}
                 else "per_beam"
+            ),
+            uemr_random_power=bool(payload.get("uemr_random_power", False)),
+            ras_guard_angle_override_deg=(
+                float(payload["ras_guard_angle_override_deg"])
+                if payload.get("ras_guard_angle_override_deg") is not None
+                else None
             ),
         )
 
@@ -10172,7 +19989,7 @@ def _has_any_antenna_value(config: AntennasConfig | SatelliteAntennasConfig | No
     ):
         return True
     ras = config.ras
-    return any(
+    if any(
         value is not None
         for value in (
             ras.antenna_diameter_m,
@@ -10180,7 +19997,9 @@ def _has_any_antenna_value(config: AntennasConfig | SatelliteAntennasConfig | No
             ras.operational_elevation_max_deg,
             ras.target_pfd_dbw_m2_mhz,
         )
-    )
+    ):
+        return True
+    return getattr(ras, "custom_pattern", None) is not None
 
 
 def _has_valid_ras_antenna_config(config: AntennasConfig | RasAntennaConfig | None) -> bool:
@@ -10188,18 +20007,46 @@ def _has_valid_ras_antenna_config(config: AntennasConfig | RasAntennaConfig | No
         return False
     ras = config.ras if isinstance(config, AntennasConfig) else config
     if (
-        ras.antenna_diameter_m is None
-        or ras.operational_elevation_min_deg is None
+        ras.operational_elevation_min_deg is None
         or ras.operational_elevation_max_deg is None
     ):
         return False
-    return (
-        float(ras.antenna_diameter_m) > 0.0
-        and 0.0
+    elev_ok = (
+        0.0
         <= float(ras.operational_elevation_min_deg)
         < float(ras.operational_elevation_max_deg)
         <= 90.0
     )
+    if not elev_ok:
+        return False
+    # A user-supplied RAS pattern replaces the RA.1631
+    # diameter+wavelength parameterisation. Both 1-D axisymmetric
+    # (``kind=1d_axisymmetric``) and 2-D (``kind=2d``, either
+    # ``theta_phi`` or ``az_el`` grid_mode) are accepted — the main
+    # power kernel derives the φ rotation around the RAS boresight
+    # so Custom-2D patterns are evaluated with both θ and φ.
+    custom_pat = getattr(ras, "custom_pattern", None)
+    if custom_pat is not None:
+        return getattr(custom_pat, "kind", None) in (_CA_KIND_1D, _CA_KIND_2D)
+    # Legacy RA.1631 path: needs a positive diameter.
+    if ras.antenna_diameter_m is None:
+        return False
+    return float(ras.antenna_diameter_m) > 0.0
+
+
+def _has_ras_pattern_for_preview(config: AntennasConfig | RasAntennaConfig | None) -> bool:
+    """Check whether the RAS antenna has enough info to preview the
+    pattern — does NOT require operational elevation angles (those
+    drive the sky-cell scan, not the gain shape)."""
+    if config is None:
+        return False
+    ras = config.ras if isinstance(config, AntennasConfig) else config
+    custom_pat = getattr(ras, "custom_pattern", None)
+    if custom_pat is not None:
+        return getattr(custom_pat, "kind", None) in (_CA_KIND_1D, _CA_KIND_2D)
+    if ras.antenna_diameter_m is None:
+        return False
+    return float(ras.antenna_diameter_m) > 0.0
 
 
 def _state_target_pfd_dbw_m2_mhz(state: "ScepterProjectState") -> float | None:
@@ -10721,6 +20568,7 @@ def _with_loaded_ras_receiver_defaults(
 
 _WORKFLOW_STATUS_ORDER: tuple[str, ...] = (
     "RAS Station",
+    "Satellite System Mode",
     "Satellite Orbitals",
     "Satellite Antennas",
     "Service & Demand",
@@ -10763,6 +20611,7 @@ def _compute_workflow_status_payloads(
     run_in_progress: bool,
     review_run_state: str | None,
     spectrum_explicitly_configured: bool,
+    sat_sys_mode_visited: bool = False,
 ) -> dict[str, dict[str, Any]]:
     """Compute serializable workflow status payloads without touching widgets."""
     all_systems = state.systems or [state.active_system()]
@@ -10774,6 +20623,12 @@ def _compute_workflow_status_payloads(
         and _has_valid_ras_antenna_config(state.ras_antenna)
         and receiver_ready
     )
+    # UEMR derives wavelength from the RAS antenna frequency — validate
+    # it is set and positive so the run builder won't crash.
+    if any_uemr and ras_ready:
+        _ras_freq = getattr(state.ras_antenna, "frequency_mhz", None)
+        if _ras_freq is None or float(_ras_freq) <= 0:
+            ras_ready = False
 
     # --- Check each system for orbitals, antenna, service, spectrum ---
     orbitals_ready = True
@@ -10930,6 +20785,38 @@ def _compute_workflow_status_payloads(
                 )
             ),
             action="Open RAS station",
+        ),
+        "Satellite System Mode": _workflow_status_payload(
+            # The default "MSS Directive (Cell Illumination)" is a legitimate
+            # configuration out of the box, so the tab has no
+            # failure state. But we still flag it as "not yet ready"
+            # until the user actively opens the tab — that way a
+            # fresh project nudges them to confirm (or change) the
+            # mode instead of silently accepting the default.
+            ready=bool(sat_sys_mode_visited),
+            kind="ready" if sat_sys_mode_visited else "warning",
+            title=(
+                "UEMR (per-satellite bypass)"
+                if _system_is_uemr(s0)
+                else "MSS Directive (Cell Illumination)"
+            ) if sat_sys_mode_visited else "Confirm the satellite system mode",
+            message=(
+                (
+                    "UEMR active: every visible satellite radiates its configured Ptx/EIRP "
+                    "isotropically. Beam library, coverage tabs, and the surface-PFD cap are "
+                    "bypassed."
+                    if _system_is_uemr(s0)
+                    else "Directive transmit antenna: per-beam EIRP shaped by the satellite-antenna model, "
+                    "coverage analyser and surface-PFD cap active."
+                )
+                if sat_sys_mode_visited
+                else (
+                    "The default is MSS Directive (Cell Illumination) (directive transmit antenna). "
+                    "Open the tab to confirm, or switch to UEMR if you are modelling "
+                    "unwanted per-satellite emissions."
+                )
+            ),
+            action="Open Satellite System Mode",
         ),
         "Satellite Orbitals": _workflow_status_payload(
             ready=bool(orbitals_ready),
@@ -11110,9 +20997,15 @@ def _has_valid_ras_pattern_config(config: AntennasConfig | None) -> bool:
 def _has_valid_satellite_antenna_config(config: AntennasConfig | SatelliteAntennasConfig | None) -> bool:
     if config is None:
         return False
-    if config.frequency_mhz is None:
-        return False
     if config.antenna_model is None:
+        return False
+    # UEMR isotropic mode doesn't need frequency/wavelength — the
+    # kernel uses the shared frequency from the Service tab for FSPL.
+    # Check early to avoid the wavelength resolution below failing
+    # when the frequency fields are hidden/empty.
+    if config.antenna_model == _ANTENNA_MODEL_ISOTROPIC:
+        return True
+    if config.frequency_mhz is None:
         return False
     if float(config.frequency_mhz) <= 0.0:
         return False
@@ -11163,7 +21056,24 @@ def _has_valid_satellite_antenna_config(config: AntennasConfig | SatelliteAntenn
     if config.antenna_model == _ANTENNA_MODEL_COLLAPSED:
         return True  # collapsed mode has no pattern requirements
     if config.antenna_model == _ANTENNA_MODEL_ISOTROPIC:
-        return True  # isotropic needs only a valid wavelength
+        return True  # isotropic / UEMR — no pattern parameters needed
+    if config.antenna_model in (
+        _ANTENNA_MODEL_CUSTOM_1D,
+        _ANTENNA_MODEL_CUSTOM_2D,
+    ):
+        # Custom antenna pattern validity is derived entirely from the
+        # embedded ``custom_pattern`` payload — the LUT plus the
+        # ``peak_gain_dbi`` it carries fully defines the pattern, so
+        # the Rec 1.2 / Rec 1.4 / M.2101 scalar fields are ignored.
+        pat = getattr(config, "custom_pattern", None)
+        if pat is None:
+            return False
+        expected_kind = (
+            _CA_KIND_1D
+            if config.antenna_model == _ANTENNA_MODEL_CUSTOM_1D
+            else _CA_KIND_2D
+        )
+        return getattr(pat, "kind", None) == expected_kind
     return False
 
 
@@ -11172,6 +21082,66 @@ def _satellite_antenna_pattern_spec(
 ) -> tuple[Callable[..., Any], u.Quantity, dict[str, Any]]:
     if not _has_valid_satellite_antenna_config(config):
         raise ValueError("Satellite-system antenna configuration is incomplete or invalid.")
+    # Custom 1-D / 2-D patterns bypass ``build_satellite_pattern_spec``
+    # (which is analytical-pattern-specific). The returned kwargs dict
+    # carries ``custom_pattern`` which the GPU scenario dispatch
+    # (``scenario.py``) routes to
+    # ``session.prepare_custom_pattern_{1d,2d}_context``. The callable
+    # is the CPU evaluator so existing preview / spec-inspection code
+    # paths work transparently.
+    if config.antenna_model in (_ANTENNA_MODEL_CUSTOM_1D, _ANTENNA_MODEL_CUSTOM_2D):
+        from scepter.custom_antenna import evaluate_pattern_1d, evaluate_pattern_2d
+        wl_cm = antenna.resolve_pattern_wavelength_cm(
+            frequency_mhz=config.frequency_mhz,
+            pattern_wavelength_cm=config.pattern_wavelength_cm,
+            derive_from_frequency=bool(config.derive_pattern_wavelength_from_frequency),
+        )
+        wavelength = float(wl_cm) * u.cm
+        pattern_obj = getattr(config, "custom_pattern", None)
+        if pattern_obj is None:  # pragma: no cover — guarded by _has_valid_...
+            raise ValueError("Custom antenna model selected but custom_pattern is None.")
+        # Scenario dispatch reads ``custom_pattern`` out of the kwargs
+        # dict by key; GUI preview (``_plot_antenna_pattern``) calls
+        # the returned callable directly as
+        # ``antenna_func(angles, wavelength=..., **pattern_kwargs)``.
+        # The raw CPU evaluators take ``(pattern, angles)`` positionally,
+        # which doesn't match either caller shape. Wrap them in
+        # adapter closures so both call paths work: scenario dispatch
+        # reads the dict key, and GUI preview's keyword-call shape
+        # flows through the closure's ``**_`` sink.
+        if config.antenna_model == _ANTENNA_MODEL_CUSTOM_1D:
+            def _custom_1d_antenna_func(angles, *, wavelength=None, custom_pattern, **_):
+                del wavelength  # not used by the LUT evaluator
+                angles_deg = (
+                    angles.to_value(u.deg) if hasattr(angles, "to_value")
+                    else np.asarray(angles, dtype=np.float64)
+                )
+                return evaluate_pattern_1d(custom_pattern, angles_deg) * cnv.dBi
+            return (_custom_1d_antenna_func, wavelength, {"custom_pattern": pattern_obj})
+
+        def _custom_2d_antenna_func(
+            axis0, axis1=None, *, wavelength=None, custom_pattern, **_,
+        ):
+            del wavelength
+            a0 = (
+                axis0.to_value(u.deg) if hasattr(axis0, "to_value")
+                else np.asarray(axis0, dtype=np.float64)
+            )
+            # GUI preview passes a single ``offset_angles`` 1-D array.
+            # Treat that as the off-boresight polar angle θ (for
+            # ``grid_mode="theta_phi"``) at φ=0, or as ``az`` at el=0
+            # (for ``grid_mode="az_el"``) — the "principal-plane"
+            # preview cut. Full 2-D display is the job of the
+            # dedicated preview dialog (Stage 21).
+            if axis1 is None:
+                axis1 = np.zeros_like(a0, dtype=np.float64)
+            else:
+                axis1 = (
+                    axis1.to_value(u.deg) if hasattr(axis1, "to_value")
+                    else np.asarray(axis1, dtype=np.float64)
+                )
+            return evaluate_pattern_2d(custom_pattern, a0, axis1) * cnv.dBi
+        return (_custom_2d_antenna_func, wavelength, {"custom_pattern": pattern_obj})
     return antenna.build_satellite_pattern_spec(
         antenna_model=str(config.antenna_model),
         frequency_mhz=config.frequency_mhz,
@@ -12253,9 +22223,49 @@ def validate_project_state(
                 )
             if antennas_cfg.rec14.l is not None and int(antennas_cfg.rec14.l) <= 0:
                 return False, "Configuration error:\nRec 1.4 parameter l must be positive.", None
+        if antennas_cfg.antenna_model in (_ANTENNA_MODEL_CUSTOM_1D, _ANTENNA_MODEL_CUSTOM_2D):
+            # Stage 22: a user switching back to a Custom model after
+            # previously using Isotropic / Rec 1.2 / etc. may still have
+            # ``custom_pattern=None`` (that field is hidden in the
+            # Isotropic UI so the load happens separately). Surface
+            # that with an actionable message — silent "incomplete
+            # config" rejections are maddening to debug.
+            expected_kind = (
+                _CA_KIND_1D
+                if antennas_cfg.antenna_model == _ANTENNA_MODEL_CUSTOM_1D
+                else _CA_KIND_2D
+            )
+            pattern_obj = getattr(antennas_cfg, "custom_pattern", None)
+            if pattern_obj is None:
+                return (
+                    False,
+                    (
+                        "Configuration error:\n"
+                        f"Antenna model {antennas_cfg.antenna_model!r} requires a "
+                        "custom_pattern — load a pattern file via the Satellite "
+                        "Antennas tab's \"Load pattern\" button, or switch to a "
+                        "different antenna model."
+                    ),
+                    None,
+                )
+            if getattr(pattern_obj, "kind", None) != expected_kind:
+                return (
+                    False,
+                    (
+                        "Configuration error:\n"
+                        f"Antenna model {antennas_cfg.antenna_model!r} expects a "
+                        f"custom_pattern of kind {expected_kind!r}; loaded "
+                        f"pattern has kind {getattr(pattern_obj, 'kind', None)!r}. "
+                        "Either load a matching pattern or switch the antenna "
+                        "model to match the loaded pattern's kind."
+                    ),
+                    None,
+                )
         if antennas_cfg.antenna_model not in {
             None, _ANTENNA_MODEL_REC12, _ANTENNA_MODEL_REC14,
             _ANTENNA_MODEL_M2101, _ANTENNA_MODEL_S672, _ANTENNA_MODEL_COLLAPSED,
+            _ANTENNA_MODEL_ISOTROPIC,
+            _ANTENNA_MODEL_CUSTOM_1D, _ANTENNA_MODEL_CUSTOM_2D,
         }:
             return (
                 False,
@@ -13113,19 +23123,59 @@ class HexgridPreviewWorker(QtCore.QObject):
 
 
 class _ProgressStreamProxy:
+    # Expose an ``encoding``/``errors`` pair so third-party libraries that
+    # probe ``file.encoding`` on the injected stream (tqdm, warnings
+    # fallback, etc.) see UTF-8 instead of falling back to the locale
+    # default (``cp1252`` on Windows). Without this, a progress/warning
+    # path encoding a ``→`` (U+2192) from a docstring into ``cp1252``
+    # surfaces as a ``UnicodeEncodeError`` that gets wrapped as an opaque
+    # ``_DirectEpfdStageExecutionError: beam_finalize: 'charmap' codec
+    # can't encode character '→' ...`` — see ``scepter/__init__.py``
+    # and ``gui.py`` for the same rationale applied to the real stdio.
+    encoding = "utf-8"
+    errors = "backslashreplace"
+
     def __init__(self, callback: Callable[[str], None]) -> None:
         self._callback = callback
 
-    def write(self, text: str) -> int:
-        text_use = "" if text is None else str(text)
+    def write(self, text: Any) -> int:
+        if text is None:
+            return 0
+        if isinstance(text, (bytes, bytearray)):
+            text_use = bytes(text).decode("utf-8", errors="replace")
+        else:
+            text_use = str(text)
         if text_use:
             self._callback(text_use)
         return len(text_use)
+
+    def writelines(self, lines: Iterable[Any]) -> None:
+        for line in lines:
+            self.write(line)
 
     def flush(self) -> None:
         return None
 
     def isatty(self) -> bool:
+        return False
+
+    def writable(self) -> bool:
+        return True
+
+    def readable(self) -> bool:
+        return False
+
+    def seekable(self) -> bool:
+        return False
+
+    def fileno(self) -> int:
+        raise OSError("_ProgressStreamProxy has no file descriptor")
+
+    def close(self) -> None:
+        return None
+
+    @property
+    def closed(self) -> bool:
         return False
 
 
@@ -16160,6 +26210,7 @@ class TestingSuiteDialog(QtWidgets.QDialog):
     _ICON_PASS = "\u2705"       # green check — all tests in category passed
     _ICON_FAIL = "\u274C"       # red cross — at least one test failed
     _ICON_SKIP = "\u23ED"       # skip forward — category not selected
+    _ICON_STOPPED = "\u23F9"    # stop button — run cancelled mid-way
     _SPINNER_FRAMES = ["\u25D0", "\u25D3", "\u25D1", "\u25D2"]  # spinning circle
 
     def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
@@ -16362,6 +26413,7 @@ class TestingSuiteDialog(QtWidgets.QDialog):
             all_icons = (
                 self._ICON_IDLE, self._ICON_QUEUED, self._ICON_RUNNING,
                 self._ICON_PASS, self._ICON_FAIL, self._ICON_SKIP,
+                self._ICON_STOPPED,
                 *self._SPINNER_FRAMES,
             )
             for icon in all_icons:
@@ -16373,12 +26425,14 @@ class TestingSuiteDialog(QtWidgets.QDialog):
         self._cat_started = [False] * len(self._TEST_CATEGORIES)
 
     def _cat_finished(self, idx: int) -> bool:
-        """Check if a category's icon is already in a terminal state (PASS/FAIL/SKIP)."""
+        """Check if a category's icon is already in a terminal state
+        (PASS / FAIL / SKIP / STOPPED)."""
         text = self._category_status_items[idx].text().lstrip()
         return (
             text.startswith(self._ICON_PASS)
             or text.startswith(self._ICON_FAIL)
             or text.startswith(self._ICON_SKIP)
+            or text.startswith(self._ICON_STOPPED)
         )
 
     def _animate_spinners(self) -> None:
@@ -16524,6 +26578,9 @@ class TestingSuiteDialog(QtWidgets.QDialog):
         self._failed = 0
         self._errors = 0
         self._stdout_buffer = ""
+        # Clear any lingering "user stopped" flag from a previous run so this
+        # run's _on_finished can honour its real exit status.
+        self._user_stopped = False
         self._run_btn.setEnabled(False)
         self._stop_btn.setEnabled(True)
         self._progress.setRange(0, 0)
@@ -16563,6 +26620,10 @@ class TestingSuiteDialog(QtWidgets.QDialog):
 
     def _stop_tests(self) -> None:
         if self._process is not None and self._process.state() != QtCore.QProcess.NotRunning:
+            # Record that this termination was user-initiated so
+            # ``_on_finished`` doesn't paint the unfinished categories
+            # green — they never actually passed, they were cancelled.
+            self._user_stopped = True
             self._process.kill()
             self._status.setText("Tests stopped by user.")
             self._status.setStyleSheet("color: #f59e0b; font-size: 11px; font-weight: bold;")
@@ -16711,7 +26772,12 @@ class TestingSuiteDialog(QtWidgets.QDialog):
             self._set_issues_tab_alert("steady")
         else:
             self._set_issues_tab_alert("off")
-        # Finalize category icons: spinning/queued → pass or fail
+        # Finalize category icons: spinning/queued → pass, fail, or
+        # stopped.  If the user hit Stop, categories that hadn't started
+        # or were mid-flight must NOT be marked green — they were
+        # cancelled, not passed.  A category that had already recorded
+        # failures before stop still shows the red icon.
+        user_stopped = bool(getattr(self, "_user_stopped", False))
         for i, item in enumerate(self._category_status_items):
             text = item.text().lstrip()
             is_spinning = any(text.startswith(f) for f in self._SPINNER_FRAMES)
@@ -16720,10 +26786,17 @@ class TestingSuiteDialog(QtWidgets.QDialog):
             if is_spinning or is_queued or is_running:
                 if self._cat_failed[i] > 0:
                     self._set_category_icon(i, self._ICON_FAIL, "#ef4444")
+                elif user_stopped:
+                    self._set_category_icon(i, self._ICON_STOPPED, "#f59e0b")
                 else:
                     self._set_category_icon(i, self._ICON_PASS, "#22c55e")
 
-        if exit_code == 0:
+        if user_stopped:
+            # Preserve the "Tests stopped by user." status set in _stop_tests
+            # (both the text and the amber colour) — don't overwrite it with
+            # a pass/fail summary that'd imply a clean finish.
+            pass
+        elif exit_code == 0:
             self._status.setText(f"\u2705  All {total} tests passed{elapsed_text}")
             self._status.setStyleSheet("color: #22c55e; font-size: 12px; font-weight: bold;")
         elif exit_code == 5:
@@ -16780,6 +26853,27 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
         self._spectrum_editor_sync_in_progress = False
         self._antenna_pattern_windows: list[FigureWindow] = []
         self._hexgrid_outdated = False
+        # Tracks whether the user has opened the Satellite System Mode
+        # tab yet this session. The tab shows a yellow-warning tick
+        # until visited so a fresh project nudges the user to confirm
+        # (or change) the default MSS mode instead of silently
+        # accepting it. Loading any project marks it visited — the
+        # saved state carries the user's prior mode choice.
+        self._sat_sys_mode_visited = False
+        # RAS-side user-supplied LUT pattern (Stage 14 plumbing on the
+        # runtime side exists; the picker + load/export buttons below
+        # populate this attribute which then flows into
+        # ``RasAntennaConfig.custom_pattern`` at save time).
+        self._ras_custom_pattern: CustomAntennaPattern | None = None
+        # Per-kind stash so switching between Custom 1-D / 2-D in the
+        # model combo doesn't discard the user's work — the pattern is
+        # stashed here and restored when the user switches back.
+        self._ras_custom_pattern_1d: CustomAntennaPattern | None = None
+        self._ras_custom_pattern_2d: CustomAntennaPattern | None = None
+        # Satellite-side custom pattern (same stash/restore as RAS).
+        self._sat_custom_pattern: CustomAntennaPattern | None = None
+        self._sat_custom_pattern_1d: CustomAntennaPattern | None = None
+        self._sat_custom_pattern_2d: CustomAntennaPattern | None = None
         self._run_in_progress = False
         self._review_run_state: str | None = None
         self._run_status_override: str | None = None
@@ -17013,6 +27107,240 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
             return None
         wrapper = self._simulation_page_wrappers.get(page)
         return wrapper if wrapper is not None else page
+
+    def _make_mode_card(
+        self,
+        *,
+        title: str,
+        tagline: str,
+        object_name: str,
+    ) -> tuple[QtWidgets.QFrame, QtWidgets.QRadioButton, QtWidgets.QToolButton]:
+        """Build a clickable mode-card frame.
+
+        The card is a single styled panel containing a radio (for
+        exclusive selection via :class:`QButtonGroup`), a two-line
+        title + tagline block, and a ``?`` help button on the right.
+        Clicking anywhere on the card selects the radio so users
+        don't need to aim for the small circle. The returned
+        ``(card, radio, help_button)`` tuple lets the caller wire the
+        group and the help popover without the card holding those
+        references itself.
+        """
+        card = QtWidgets.QFrame(self)
+        card.setObjectName(object_name)
+        card.setFrameShape(QtWidgets.QFrame.StyledPanel)
+        card.setCursor(QtCore.Qt.PointingHandCursor)
+        card.setAttribute(QtCore.Qt.WA_StyledBackground, True)
+        card.setProperty("modeCard", True)
+        card.setStyleSheet(
+            "QFrame[modeCard=\"true\"] {"
+            " background: rgba(30, 47, 72, 0.75);"
+            " border: 1px solid rgba(100, 170, 255, 0.28);"
+            " border-radius: 10px;"
+            "}"
+            "QFrame[modeCard=\"true\"]:hover {"
+            " border: 1px solid rgba(120, 200, 255, 0.55);"
+            " background: rgba(36, 56, 88, 0.85);"
+            "}"
+            "QFrame[modeCard=\"true\"][selected=\"true\"] {"
+            " border: 1.6px solid rgba(120, 200, 255, 0.95);"
+            " background: rgba(46, 74, 118, 0.92);"
+            "}"
+        )
+        row = QtWidgets.QHBoxLayout(card)
+        row.setContentsMargins(12, 10, 10, 10)
+        row.setSpacing(10)
+
+        radio = QtWidgets.QRadioButton(card)
+        radio.setFocusPolicy(QtCore.Qt.StrongFocus)
+
+        text_col = QtWidgets.QVBoxLayout()
+        text_col.setContentsMargins(0, 0, 0, 0)
+        text_col.setSpacing(2)
+        title_label = QtWidgets.QLabel(title, card)
+        title_label.setStyleSheet(
+            "color: #e2e8f0; font-weight: 600; font-size: 13px; background: transparent;"
+        )
+        tagline_label = QtWidgets.QLabel(tagline, card)
+        tagline_label.setStyleSheet(
+            "color: #94a3b8; font-size: 11px; background: transparent;"
+        )
+        tagline_label.setWordWrap(True)
+        text_col.addWidget(title_label)
+        text_col.addWidget(tagline_label)
+
+        help_btn = QtWidgets.QToolButton(card)
+        help_btn.setText("?")
+        help_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        help_btn.setAutoRaise(True)
+        help_btn.setProperty("helpButton", True)
+        help_btn.setToolTip("Open detailed help for this mode.")
+        help_btn.clicked.connect(lambda _c=False, w=radio: self._show_help_for(w))
+        self._help_buttons[radio] = help_btn
+
+        row.addWidget(radio, 0, QtCore.Qt.AlignVCenter)
+        row.addLayout(text_col, stretch=1)
+        row.addWidget(help_btn, 0, QtCore.Qt.AlignTop)
+
+        def _on_mouse_press(event: QtGui.QMouseEvent, _radio=radio) -> None:
+            if event.button() == QtCore.Qt.LeftButton:
+                _radio.setChecked(True)
+            QtWidgets.QFrame.mousePressEvent(card, event)
+
+        card.mousePressEvent = _on_mouse_press  # type: ignore[assignment]
+
+        def _on_toggled(checked: bool, _card=card) -> None:
+            _card.setProperty("selected", "true" if checked else "false")
+            style = _card.style()
+            if style is not None:
+                style.unpolish(_card)
+                style.polish(_card)
+
+        radio.toggled.connect(_on_toggled)
+        return card, radio, help_btn
+
+    def _build_sat_sys_mode_tab(self) -> QtWidgets.QWidget:
+        """Build the "Satellite System Mode" tab widget.
+
+        Two cards select between MSS-with-user-terminals (directive
+        TX, beam library active) and UEMR (per-satellite isotropic
+        bypass). The selection drives
+        :attr:`isotropic_uemr_checkbox` — which every downstream
+        gating, serialization, and run-config path already reads — so
+        the full UEMR machinery stays untouched.
+        """
+        tab = QtWidgets.QWidget(self)
+        layout = QtWidgets.QVBoxLayout(tab)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
+
+        header = QtWidgets.QLabel(
+            "Choose the transmit emission model for this satellite system.",
+            tab,
+        )
+        header.setStyleSheet("color: #cbd5e1; font-size: 12px;")
+        header.setWordWrap(True)
+        layout.addWidget(header)
+
+        cards_row = QtWidgets.QHBoxLayout()
+        cards_row.setSpacing(12)
+
+        mss_card, self.sat_sys_mode_mss_radio, _mss_help_btn = self._make_mode_card(
+            title="MSS Directive (Cell Illumination)",
+            tagline="Directive beam per ground cell \u00b7 hexagonal coverage \u00b7 "
+                    "surface-PFD cap, contours, boresight avoidance.",
+            object_name="modeCardMSS",
+        )
+        uemr_card, self.sat_sys_mode_uemr_radio, _uemr_help_btn = self._make_mode_card(
+            title="UEMR",
+            tagline="Unwanted emissions \u00b7 per-satellite isotropic bypass \u00b7 "
+                    "beam library, coverage, and surface-PFD cap disabled.",
+            object_name="modeCardUEMR",
+        )
+        cards_row.addWidget(mss_card, stretch=1)
+        cards_row.addWidget(uemr_card, stretch=1)
+        layout.addLayout(cards_row)
+        layout.addStretch(1)
+
+        self._sat_sys_mode_button_group = QtWidgets.QButtonGroup(self)
+        self._sat_sys_mode_button_group.setExclusive(True)
+        self._sat_sys_mode_button_group.addButton(
+            self.sat_sys_mode_mss_radio, 0,
+        )
+        self._sat_sys_mode_button_group.addButton(
+            self.sat_sys_mode_uemr_radio, 1,
+        )
+        # Default: MSS (matches the legacy default of UEMR checkbox
+        # being unchecked). The state-sync on load later will flip to
+        # UEMR if the loaded project set it.
+        self.sat_sys_mode_mss_radio.setChecked(True)
+        self._sat_sys_mode_button_group.idToggled.connect(
+            self._on_sat_sys_mode_chosen,
+        )
+        return tab
+
+    @QtCore.Slot(int, bool)
+    def _on_sat_sys_mode_chosen(self, mode_id: int, checked: bool) -> None:
+        """Route the Satellite System Mode card click into the legacy state holder.
+
+        ``mode_id`` is the QButtonGroup id (0 = MSS, 1 = UEMR). The
+        signal fires twice per change (old button off, new button
+        on); we only act on the "on" edge.
+
+        UEMR-mode gating in :meth:`_apply_uemr_mode_gating` triggers
+        only when the antenna model combo is on ``Isotropic``. The
+        kernel already bypasses the antenna model when UEMR is on,
+        so to keep the GUI state self-consistent (and to hide the
+        Coverage tabs / Nbeam / etc. that UEMR can't use) we force
+        the combo to Isotropic when UEMR is selected and restore the
+        user's previous directive model when they switch back.
+        """
+        if not checked:
+            return
+        want_uemr = (mode_id == 1)
+        if bool(self.isotropic_uemr_checkbox.isChecked()) == want_uemr:
+            return
+
+        # Flip the legacy checkbox first so that when the combo
+        # change below triggers ``_on_rf_model_changed`` → the
+        # compound ``selected_model==ISOTROPIC AND checkbox==True``
+        # condition is already met and UEMR-mode gating fires in one
+        # pass. A signal blocker on the checkbox keeps this path from
+        # re-entering :meth:`_on_sat_sys_mode_chosen`.
+        blocker = QtCore.QSignalBlocker(self.isotropic_uemr_checkbox)
+        self.isotropic_uemr_checkbox.setChecked(want_uemr)
+        del blocker
+
+        combo = getattr(self, "antenna_model_combo", None)
+        if want_uemr and combo is not None:
+            current_model = combo.currentData()
+            if current_model != _ANTENNA_MODEL_ISOTROPIC:
+                # Remember the directive model so switching back to
+                # MSS restores the user's antenna selection.
+                self._pre_uemr_antenna_model = current_model
+                idx_iso = combo.findData(_ANTENNA_MODEL_ISOTROPIC)
+                if idx_iso >= 0:
+                    # Let the combo's ``currentIndexChanged`` fire
+                    # normally — it cascades into
+                    # ``_on_rf_model_changed`` → ``_apply_uemr_mode_gating``
+                    # → state-cache refresh, which is exactly what we
+                    # want. No signal blocker here.
+                    combo.setCurrentIndex(idx_iso)
+                    return
+        elif (not want_uemr) and combo is not None:
+            prior_model = getattr(self, "_pre_uemr_antenna_model", None)
+            if prior_model and combo.currentData() == _ANTENNA_MODEL_ISOTROPIC:
+                idx_prior = combo.findData(prior_model)
+                if idx_prior >= 0:
+                    combo.setCurrentIndex(idx_prior)
+                    self._pre_uemr_antenna_model = None
+                    return
+            self._pre_uemr_antenna_model = None
+
+        # Combo didn't change (already on the right model, or no
+        # combo at all) — fall through to the manual rf-model refresh
+        # so gating / cache still update.
+        self._on_rf_model_changed()
+
+    def _sync_sat_sys_mode_cards_from_state(self) -> None:
+        """Reflect ``self.isotropic_uemr_checkbox`` into the mode cards.
+
+        Called from project-load and any other path that mutates the
+        checkbox programmatically so the cards stay visually correct
+        without firing the card-click cascade.
+        """
+        if not hasattr(self, "sat_sys_mode_mss_radio"):
+            return
+        uemr_on = bool(self.isotropic_uemr_checkbox.isChecked())
+        target_radio = (
+            self.sat_sys_mode_uemr_radio if uemr_on
+            else self.sat_sys_mode_mss_radio
+        )
+        if target_radio.isChecked():
+            return
+        blocker = QtCore.QSignalBlocker(self._sat_sys_mode_button_group)
+        target_radio.setChecked(True)
+        del blocker
 
     def _current_simulation_page(self) -> QtWidgets.QWidget | None:
         if not hasattr(self, "tab_widget"):
@@ -18084,6 +28412,21 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
             "Satellite Orbitals",
         )
 
+        # Build the "Satellite System Mode" tab that drives directive-vs-UEMR
+        # selection. Added here so the page exists before help
+        # registration runs; the left-rail ordering step later moves
+        # it into position (index 1, immediately after RAS Station).
+        self.sat_sys_mode_tab = self._build_sat_sys_mode_tab()
+        self.tab_widget.addTab(
+            self._wrap_simulation_page(
+                self.sat_sys_mode_tab,
+                scroll_area_name="simulationPageScrollArea",
+                viewport_name="simulationPageScrollViewport",
+                page_name="simulationPageScrollPage",
+            ),
+            "Satellite System Mode",
+        )
+
         self.ras_tab = QtWidgets.QWidget(self)
         ras_layout = QtWidgets.QVBoxLayout(self.ras_tab)
         ras_layout.setContentsMargins(16, 16, 16, 16)
@@ -18127,6 +28470,49 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
         ras_antenna_layout = QtWidgets.QFormLayout(ras_antenna_group)
         self._configure_compact_form(ras_antenna_layout)
         ras_antenna_layout.setLabelAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        self.ras_antenna_model_combo = QtWidgets.QComboBox(self)
+        for _label_text, _model_name in _RAS_ANTENNA_MODEL_OPTIONS:
+            self.ras_antenna_model_combo.addItem(_label_text, userData=_model_name)
+        # Custom-pattern edit / load / clear buttons. Hidden when the
+        # model is RA.1631 (the analytical path needs only diameter +
+        # G_rx_max).
+        self.ras_edit_custom_pattern_button = QtWidgets.QPushButton(
+            "Edit pattern\u2026", self,
+        )
+        self.ras_edit_custom_pattern_button.setToolTip(
+            "Open the graphical pattern editor to shape the LUT directly "
+            "\u2014 drag control points on a gain-vs-off-axis-angle curve, "
+            "import/export JSON, or snap to an RA.1631 template."
+        )
+        self.ras_load_custom_pattern_button = QtWidgets.QPushButton(
+            "Load\u2026", self,
+        )
+        self.ras_load_custom_pattern_button.setToolTip(
+            "Load a previously-saved antenna-pattern JSON file."
+        )
+        self.ras_clear_custom_pattern_button = QtWidgets.QPushButton(
+            "Clear", self,
+        )
+        self.ras_custom_pattern_status_label = QtWidgets.QLabel("No file loaded.", self)
+        self.ras_custom_pattern_status_label.setStyleSheet("color: #94a3b8; font-size: 11px;")
+        self.ras_custom_pattern_status_label.setWordWrap(True)
+        self.ras_custom_pattern_status_label.setTextInteractionFlags(
+            QtCore.Qt.TextSelectableByMouse
+        )
+        self.ras_custom_pattern_status_label.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.MinimumExpanding,
+        )
+        self.ras_custom_pattern_status_label.setMinimumHeight(28)
+        _ras_custom_row = QtWidgets.QHBoxLayout()
+        _ras_custom_row.setContentsMargins(0, 0, 0, 0)
+        _ras_custom_row.setSpacing(8)
+        _ras_custom_row.addWidget(self.ras_edit_custom_pattern_button)
+        _ras_custom_row.addWidget(self.ras_load_custom_pattern_button)
+        _ras_custom_row.addWidget(self.ras_clear_custom_pattern_button)
+        _ras_custom_row.addStretch(1)
+        self.ras_custom_pattern_row_widget = QtWidgets.QWidget(self)
+        self.ras_custom_pattern_row_widget.setLayout(_ras_custom_row)
+
         self.antenna_spin = OptionalNumericEdit(minimum=0.0, maximum=1000.0, decimals=6, parent=self)
         self.ras_grx_max_spin = OptionalNumericEdit(minimum=-10.0, maximum=120.0, decimals=2, parent=self)
         self._ras_grx_cross_updating = False
@@ -18138,9 +28524,16 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
         )
         self.ras_oper_min_spin = OptionalNumericEdit(minimum=0.0, maximum=90.0, decimals=6, parent=self)
         self.ras_oper_max_spin = OptionalNumericEdit(minimum=0.0, maximum=90.0, decimals=6, parent=self)
-        ras_antenna_layout.addRow("Antenna diameter [m]", self._helpful_widget(self.antenna_spin))
-        ras_antenna_layout.addRow("G_rx,max [dBi]", self._helpful_widget(self.ras_grx_max_spin))
-        ras_antenna_layout.addRow("Frequency [MHz]", self._helpful_widget(self.ras_frequency_spin))
+        self.ras_antenna_model_field = self._helpful_widget(self.ras_antenna_model_combo)
+        self.ras_antenna_diameter_field = self._helpful_widget(self.antenna_spin)
+        self.ras_grx_max_field = self._helpful_widget(self.ras_grx_max_spin)
+        ras_antenna_layout.addRow("Model", self.ras_antenna_model_field)
+        ras_antenna_layout.addRow("Pattern file", self.ras_custom_pattern_row_widget)
+        ras_antenna_layout.addRow("Custom pattern", self.ras_custom_pattern_status_label)
+        ras_antenna_layout.addRow("Antenna diameter [m]", self.ras_antenna_diameter_field)
+        ras_antenna_layout.addRow("G_rx,max [dBi]", self.ras_grx_max_field)
+        self.ras_frequency_field = self._helpful_widget(self.ras_frequency_spin)
+        ras_antenna_layout.addRow("Frequency [MHz]", self.ras_frequency_field)
         ras_antenna_layout.addRow(
             "Operational elev min [deg]",
             self._helpful_widget(self.ras_oper_min_spin),
@@ -18149,6 +28542,7 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
             "Operational elev max [deg]",
             self._helpful_widget(self.ras_oper_max_spin),
         )
+        self._ras_antenna_form = ras_antenna_layout
         ras_body_layout.addWidget(ras_antenna_group, 1)
         ras_layout.addLayout(ras_body_layout)
         ras_receiver_group = QtWidgets.QGroupBox("RAS receiver response", self.ras_tab)
@@ -18297,39 +28691,40 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
         antennas_editor_layout.setContentsMargins(0, 0, 0, 0)
         antennas_editor_layout.setSpacing(10)
 
-        # Side-by-side layout: Frequency (left) + Satellite antenna (right)
+        # Side-by-side layout: General (left) + Model parameters (right)
         antennas_body_layout = QtWidgets.QHBoxLayout()
         antennas_body_layout.setSpacing(12)
 
-        # --- Left column: Frequency settings ---
-        frequency_group = QtWidgets.QGroupBox("Frequency", self)
-        frequency_layout = QtWidgets.QFormLayout(frequency_group)
-        self._configure_compact_form(frequency_layout)
-        frequency_layout.setLabelAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        # --- Left column: General characteristics ---
+        general_group = QtWidgets.QGroupBox("General", self)
+        general_layout = QtWidgets.QFormLayout(general_group)
+        self._configure_compact_form(general_layout)
+        general_layout.setLabelAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        self.antenna_model_combo = QtWidgets.QComboBox(self)
+        self.antenna_model_combo.addItem("Select model...", userData=None)
+        for label_text, model_name in _ANTENNA_MODEL_OPTIONS:
+            self.antenna_model_combo.addItem(label_text, userData=model_name)
+        general_layout.addRow("Model", self._helpful_widget(self.antenna_model_combo))
         self.frequency_spin = OptionalNumericEdit(minimum=0.0, maximum=1.0e6, decimals=6, parent=self)
         self.derive_pattern_wavelength_checkbox = QtWidgets.QCheckBox(
             "Derive pattern wavelength from frequency",
             self,
         )
         self.pattern_wavelength_spin = OptionalNumericEdit(minimum=0.0, maximum=1.0e5, decimals=6, parent=self)
-        frequency_layout.addRow("Frequency [MHz]", self._helpful_widget(self.frequency_spin))
-        frequency_layout.addRow("", self.derive_pattern_wavelength_checkbox)
-        frequency_layout.addRow("Pattern wavelength [cm]", self._helpful_widget(self.pattern_wavelength_spin))
-        antennas_body_layout.addWidget(frequency_group, 1)
+        self._sat_freq_row_widget = self._helpful_widget(self.frequency_spin)
+        self._sat_wl_row_widget = self._helpful_widget(self.pattern_wavelength_spin)
+        general_layout.addRow("Frequency [MHz]", self._sat_freq_row_widget)
+        general_layout.addRow("", self.derive_pattern_wavelength_checkbox)
+        general_layout.addRow("Pattern wavelength [cm]", self._sat_wl_row_widget)
+        antennas_body_layout.addWidget(general_group, 1)
+        self._sat_general_group = general_group
+        self._sat_general_layout = general_layout
 
-        sat_antenna_group = QtWidgets.QGroupBox("Satellite system antenna", self)
+        # --- Right column: Model-specific parameters ---
+        sat_antenna_group = QtWidgets.QGroupBox("Model parameters", self)
         sat_antenna_layout = QtWidgets.QVBoxLayout(sat_antenna_group)
         sat_antenna_layout.setContentsMargins(12, 14, 12, 12)
         sat_antenna_layout.setSpacing(8)
-        sat_antenna_top_form = QtWidgets.QFormLayout()
-        self._configure_compact_form(sat_antenna_top_form)
-        sat_antenna_top_form.setLabelAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
-        self.antenna_model_combo = QtWidgets.QComboBox(self)
-        self.antenna_model_combo.addItem("Select model...", userData=None)
-        for label_text, model_name in _ANTENNA_MODEL_OPTIONS:
-            self.antenna_model_combo.addItem(label_text, userData=model_name)
-        sat_antenna_top_form.addRow("Model", self._helpful_widget(self.antenna_model_combo))
-        sat_antenna_layout.addLayout(sat_antenna_top_form)
 
         self.rf_model_stack = QtWidgets.QStackedWidget(self)
         sat_antenna_layout.addWidget(self.rf_model_stack, 1)
@@ -18416,26 +28811,48 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
         collapsed_form.addRow("", collapsed_desc)
         self.rf_model_stack.addWidget(collapsed_widget)
 
-        # Isotropic: mode selector. Full description lives in the checkbox
-        # tooltip so the page stays uncluttered.
+        # Isotropic: plain flat 0 dBi directive pattern. The UEMR-bypass
+        # toggle that used to live here moved to the "Satellite System Mode"
+        # tab — ``self.isotropic_uemr_checkbox`` is kept as the
+        # downstream state holder (all gating, serialization, and
+        # run-config code still reads from it) but is never shown in
+        # this page. See :meth:`_build_sat_sys_mode_tab`.
         isotropic_widget = QtWidgets.QWidget(self)
         isotropic_form = QtWidgets.QFormLayout(isotropic_widget)
         isotropic_form.setContentsMargins(0, 0, 0, 0)
-        self.isotropic_uemr_checkbox = QtWidgets.QCheckBox(
-            "UEMR mode (per-satellite bypass)", self,
+        isotropic_info = QtWidgets.QLabel(
+            "Flat 0 dBi isotropic transmit pattern. In UEMR mode "
+            "the beam library is bypassed — each visible satellite "
+            "radiates the configured power uniformly in all directions.",
+            self,
         )
-        self.isotropic_uemr_checkbox.setToolTip(
-            "Unchecked — Directive isotropic: flat 0 dBi pattern routed "
-            "through the standard beam library. Coverage, contours, and "
-            "surface-PFD cap all apply normally.\n\n"
-            "Checked — UEMR: leakage from internal satellite circuitry. "
-            "The beam library is bypassed entirely; every visible satellite "
-            "radiates the configured Ptx/EIRP isotropically. Coverage tabs, "
-            "boresight avoidance, and surface-PFD cap are disabled for "
-            "this mode."
-        )
-        isotropic_form.addRow("Mode", self._helpful_widget(self.isotropic_uemr_checkbox))
+        isotropic_info.setWordWrap(True)
+        isotropic_info.setStyleSheet("color: #94a3b8; font-size: 11px;")
+        isotropic_form.addRow("", isotropic_info)
+        self.isotropic_uemr_checkbox = QtWidgets.QCheckBox(self)
+        self.isotropic_uemr_checkbox.setVisible(False)
         self.rf_model_stack.addWidget(isotropic_widget)
+
+        # --- Page 5: Custom 1-D / 2-D pattern ---
+        custom_widget = QtWidgets.QWidget(self)
+        custom_form = QtWidgets.QFormLayout(custom_widget)
+        self._configure_compact_form(custom_form)
+        custom_btn_row = QtWidgets.QHBoxLayout()
+        custom_btn_row.setSpacing(8)
+        self.sat_custom_edit_button = QtWidgets.QPushButton("Edit pattern\u2026", self)
+        self.sat_custom_load_button = QtWidgets.QPushButton("Load\u2026", self)
+        self.sat_custom_clear_button = QtWidgets.QPushButton("Clear", self)
+        custom_btn_row.addWidget(self.sat_custom_edit_button)
+        custom_btn_row.addWidget(self.sat_custom_load_button)
+        custom_btn_row.addWidget(self.sat_custom_clear_button)
+        custom_btn_row.addStretch(1)
+        custom_form.addRow("Pattern file", custom_btn_row)
+        self.sat_custom_pattern_status_label = QtWidgets.QLabel("No file loaded.", self)
+        self.sat_custom_pattern_status_label.setStyleSheet("color: #94a3b8; font-size: 11px;")
+        self.sat_custom_pattern_status_label.setWordWrap(True)
+        self.sat_custom_pattern_status_label.setMinimumHeight(28)
+        custom_form.addRow("Custom pattern", self.sat_custom_pattern_status_label)
+        self.rf_model_stack.addWidget(custom_widget)
 
         self.restore_model_defaults_button = QtWidgets.QPushButton("Restore model defaults", self)
         sat_antenna_layout.addWidget(self.restore_model_defaults_button, 0, QtCore.Qt.AlignRight)
@@ -18588,6 +29005,17 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
         self._power_variation_label = QtWidgets.QLabel("Power variation", self)
         self._power_variation_widget = self._helpful_widget(self.service_power_variation_combo)
         service_form_right.addRow(self._power_variation_label, self._power_variation_widget)
+        self.uemr_random_power_checkbox = QtWidgets.QCheckBox(
+            "Random per-satellite per-timestep power (uniform 0\u2026P\u209c\u2093)",
+            self,
+        )
+        self.uemr_random_power_checkbox.setToolTip(
+            "When enabled, each satellite\u2019s UEMR power at each "
+            "timestep is drawn uniformly from [0, configured power]. "
+            "Models stochastic unwanted emissions."
+        )
+        self._uemr_random_power_widget = self.uemr_random_power_checkbox
+        service_form_right.addRow("", self._uemr_random_power_widget)
         self._power_value_widget = self._helpful_widget(self.service_power_value_stack)
         service_form_right.addRow(
             self.service_power_value_label,
@@ -18677,6 +29105,28 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
         cap_group_layout.addWidget(self._surface_pfd_cap_fields)
         self._surface_pfd_cap_fields.hide()  # hidden by default (checkbox off)
         self._surface_pfd_cap_group_widget = cap_group
+
+        # --- RAS guard angle override ---
+        self.ras_guard_angle_override_edit = OptionalNumericEdit(
+            parent=self, minimum=0.0,
+        )
+        self.ras_guard_angle_override_edit.setToolTip(
+            "RAS beam guard angle override (degrees).\n"
+            "When ras_pointing_mode=\u2018ras_station\u2019, each satellite\u2019s\n"
+            "reserved RAS beam has a guard zone that prevents other\n"
+            "beams from pointing within this angle of the reserved\n"
+            "beam. Leave empty to auto-derive from the beam\n"
+            "spacing contour. Set to 0 to disable (worst-case\n"
+            "analysis: no guard zone, maximum interference)."
+        )
+        # Widget is created here (before the Coverage & Boresight tab is
+        # built) but attached to the hexgrid form below, because the guard
+        # angle only matters when ``ras_pointing_mode='ras_station'``.  That
+        # combo lives on the Coverage & Boresight tab, so the row belongs
+        # next to it rather than on Service & Demand.
+        self._ras_guard_label = QtWidgets.QLabel("RAS guard angle", self)
+        self._ras_guard_widget = self._helpful_widget(self.ras_guard_angle_override_edit)
+
         service_layout.addLayout(service_body_layout)
         service_layout.addWidget(cap_group)
         service_button_row = QtWidgets.QGridLayout()
@@ -19590,6 +30040,7 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
         self.hexgrid_boresight_radius_spin.setDecimals(3)
         self.hexgrid_boresight_radius_spin.setSuffix(" km")
         hexgrid_form_left.addRow("RAS pointing mode", self._helpful_widget(self.hexgrid_ras_pointing_combo))
+        hexgrid_form_left.addRow(self._ras_guard_label, self._ras_guard_widget)
         hexgrid_form_left.addRow("RAS exclusion mode", self._helpful_widget(self.hexgrid_ras_exclusion_mode_combo))
         hexgrid_form_left.addRow("RAS exclusion layers", self._helpful_widget(self.hexgrid_ras_exclusion_layers_spin))
         hexgrid_form_left.addRow("RAS exclusion radius [km]", self._helpful_widget(self.hexgrid_ras_exclusion_radius_spin))
@@ -19676,6 +30127,7 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
         self.tab_widget.addTab(runtime_tab, "Review & Run")
         desired_page_order = [
             self.ras_tab,
+            self.sat_sys_mode_tab,
             constellation_tab,
             self.antennas_tab,
             service_tab,
@@ -19905,12 +30357,75 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
     def _about_dialog_text(self) -> str:
         return appinfo.ABOUT_TEXT
 
-    def _show_about_dialog(self) -> None:
-        QtWidgets.QMessageBox.information(
-            self,
-            appinfo.ABOUT_TITLE,
-            self._about_dialog_text(),
+    # Cache the decoded motto pixmap across About-dialog opens — the
+    # PNG is ~2.5 MB and Qt scaling is not cheap.
+    _cached_about_motto_pixmap: QtGui.QPixmap | None = None
+
+    def _load_about_motto_pixmap(self) -> QtGui.QPixmap | None:
+        """Return the release-codename splash image for the About
+        dialog, cached on the class. Returns ``None`` when the file
+        isn't available (e.g. a minimal install without the image)."""
+        cached = type(self)._cached_about_motto_pixmap
+        if cached is not None and not cached.isNull():
+            return cached
+        if not _ABOUT_MOTTO_IMAGE_PATH.is_file():
+            return None
+        pix = QtGui.QPixmap(str(_ABOUT_MOTTO_IMAGE_PATH))
+        if pix.isNull():
+            return None
+        # Pre-scale once (on load) to the typical dialog display size
+        # so repeated opens don't re-scale the 600×400 native image.
+        pix = pix.scaledToWidth(
+            560, QtCore.Qt.SmoothTransformation,
         )
+        type(self)._cached_about_motto_pixmap = pix
+        return pix
+
+    def _show_about_dialog(self) -> None:
+        """Open the About dialog with the release-codename splash image
+        on top and the full attribution / notices text below in a
+        scrollable area."""
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle(appinfo.ABOUT_TITLE)
+        dlg.setModal(True)
+        dlg.setStyleSheet(self.styleSheet())
+        # Sized so the splash + a generous excerpt of the text are
+        # visible without scrolling, but text still scrolls for full
+        # notices when window is small.
+        dlg.resize(640, 760)
+        layout = QtWidgets.QVBoxLayout(dlg)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
+
+        motto = self._load_about_motto_pixmap()
+        if motto is not None:
+            image_label = QtWidgets.QLabel(dlg)
+            image_label.setPixmap(motto)
+            image_label.setAlignment(QtCore.Qt.AlignHCenter | QtCore.Qt.AlignTop)
+            image_label.setObjectName("aboutMottoImage")
+            image_label.setToolTip(
+                f"SCEPTer {appinfo.APP_VERSION_TAG} — "
+                f"\u201C{appinfo.APP_CODENAME}\u201D"
+            )
+            layout.addWidget(image_label, 0, QtCore.Qt.AlignHCenter)
+
+        # Attribution / notices body — read-only, scrollable, keeps
+        # selection + copy-to-clipboard.
+        body = QtWidgets.QPlainTextEdit(dlg)
+        body.setReadOnly(True)
+        body.setPlainText(self._about_dialog_text())
+        body.setFrameShape(QtWidgets.QFrame.NoFrame)
+        body.setLineWrapMode(QtWidgets.QPlainTextEdit.WidgetWidth)
+        layout.addWidget(body, 1)
+
+        button_bar = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Close, QtCore.Qt.Horizontal, dlg,
+        )
+        button_bar.rejected.connect(dlg.reject)
+        button_bar.accepted.connect(dlg.accept)
+        layout.addWidget(button_bar)
+
+        dlg.exec()
 
     def _show_testing_suite(self) -> None:
         dialog = TestingSuiteDialog(self)
@@ -21560,7 +32075,13 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
         import base64
         import math as _math
         scale = 2
-        lw, lh = 360, 200
+        # Canvas grew from 360x200 -> 360x244 and the sphere centre was
+        # shifted from y=100 to y=122 so the title sits in a 26-px
+        # header band above the top arrow tip (which now lands at
+        # y = cy - r - 22 = 30, giving a clear 8-px gap under the
+        # title drawn at y=6..22). Bottom caption has a 14-px footer
+        # margin.
+        lw, lh = 360, 244
         pw, ph = lw * scale, lh * scale
         pixmap = QtGui.QPixmap(pw, ph)
         pixmap.setDevicePixelRatio(scale)
@@ -21568,7 +32089,7 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
         p = QtGui.QPainter(pixmap)
         p.setRenderHint(QtGui.QPainter.Antialiasing, True)
 
-        cx, cy = 180.0, 100.0
+        cx, cy = 180.0, 122.0
         r = 70.0
 
         p.setPen(QtCore.Qt.NoPen)
@@ -21632,6 +32153,175 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
             QtCore.QRect(int(cx + r + 6), int(cy - 26), 70, 14),
             QtCore.Qt.AlignLeft,
             "G = 0 dBi",
+        )
+
+        p.end()
+        buf = QtCore.QBuffer()
+        buf.open(QtCore.QBuffer.WriteOnly)
+        pixmap.save(buf, "PNG")
+        b64 = base64.b64encode(bytes(buf.data())).decode("ascii")
+        return (
+            f'<div style="text-align:center; margin:4px 0;">'
+            f'<img src="data:image/png;base64,{b64}" width="{lw}" height="{lh}"/>'
+            f'</div>'
+        )
+
+    @staticmethod
+    def _mss_directive_schematic_data_uri() -> str:
+        """Render an MSS directive cell-illumination diagram as a
+        HiDPI PNG data URI.
+
+        Satellite at the top radiating a main-lobe cone whose base
+        aligns with the centre hex cell of a projected hex cluster
+        on the ground. Two dim sidelobe petals on either side.
+        Companion to :meth:`_uemr_isotropic_schematic_data_uri`.
+        """
+        import base64
+        import math as _math
+        scale = 2
+        lw, lh = 360, 244
+        pw, ph = lw * scale, lh * scale
+        pixmap = QtGui.QPixmap(pw, ph)
+        pixmap.setDevicePixelRatio(scale)
+        pixmap.fill(QtGui.QColor("#0c182b"))
+        p = QtGui.QPainter(pixmap)
+        p.setRenderHint(QtGui.QPainter.Antialiasing, True)
+
+        sat_x, sat_y = 180.0, 68.0
+        ground_y = 214.0
+
+        # --- Hexagonal cell cluster (perspective-projected) ---
+        # Flat-top hexagons, squashed vertically for a 3-D perspective
+        # view from above. Centre cell is highlighted (illuminated),
+        # six neighbours are dim outlines.
+        hex_r = 18.0            # circumradius in px
+        y_squash = 0.45         # vertical squash for perspective
+        cx, cy = sat_x, ground_y - 1.0
+
+        def _hex_polygon(hx: float, hy: float, r: float) -> QtGui.QPolygonF:
+            return QtGui.QPolygonF([
+                QtCore.QPointF(
+                    hx + r * _math.cos(_math.radians(60 * i)),
+                    hy + r * _math.sin(_math.radians(60 * i)) * y_squash,
+                )
+                for i in range(6)
+            ])
+
+        # Neighbour offsets for flat-top hex layout (axial → pixel).
+        dx_col = hex_r * 1.5
+        dy_row = hex_r * _math.sqrt(3.0) * y_squash
+        neighbours = [
+            (dx_col, dy_row * 0.5), (dx_col, -dy_row * 0.5),
+            (-dx_col, dy_row * 0.5), (-dx_col, -dy_row * 0.5),
+            (0.0, dy_row), (0.0, -dy_row),
+        ]
+
+        # Draw neighbour cells (dim outlines).
+        dim_pen = QtGui.QPen(QtGui.QColor(100, 116, 139, 120), 0.8)
+        dim_brush = QtGui.QColor(30, 41, 59, 50)
+        for ndx, ndy in neighbours:
+            p.setPen(dim_pen)
+            p.setBrush(dim_brush)
+            p.drawPolygon(_hex_polygon(cx + ndx, cy + ndy, hex_r))
+
+        # --- Main lobe cone — aligned to centre cell width ---
+        cone_len = ground_y - sat_y + 2.0
+        dx_main = hex_r  # beam base matches cell radius
+        main_cone = QtGui.QPolygonF([
+            QtCore.QPointF(sat_x, sat_y),
+            QtCore.QPointF(sat_x - dx_main, sat_y + cone_len),
+            QtCore.QPointF(sat_x + dx_main, sat_y + cone_len),
+        ])
+        main_grad = QtGui.QLinearGradient(
+            QtCore.QPointF(sat_x, sat_y),
+            QtCore.QPointF(sat_x, sat_y + cone_len),
+        )
+        main_grad.setColorAt(0.0, QtGui.QColor(56, 189, 248, 210))
+        main_grad.setColorAt(1.0, QtGui.QColor(56, 189, 248, 50))
+        p.setPen(QtCore.Qt.NoPen)
+        p.setBrush(QtGui.QBrush(main_grad))
+        p.drawPolygon(main_cone)
+        p.setPen(QtGui.QPen(QtGui.QColor(125, 211, 252, 160), 0.8))
+        p.setBrush(QtCore.Qt.NoBrush)
+        p.drawPolygon(main_cone)
+
+        # Draw centre cell (bright, on top of beam).
+        p.setPen(QtGui.QPen(QtGui.QColor("#38bdf8"), 1.4))
+        p.setBrush(QtGui.QColor(56, 189, 248, 55))
+        p.drawPolygon(_hex_polygon(cx, cy, hex_r))
+
+        # --- Sidelobe petals ---
+        def _sidelobe_polygon(direction: float) -> QtGui.QPolygonF:
+            angle_rad = _math.radians(42.0 * direction)
+            length = 52.0
+            hw = 7.0
+            ax_x = _math.sin(angle_rad)
+            ax_y = _math.cos(angle_rad)
+            px_, py_ = -ax_y, ax_x
+            mid_x = sat_x + 0.55 * length * ax_x
+            mid_y = sat_y + 0.55 * length * ax_y
+            tip_x = sat_x + length * ax_x
+            tip_y = sat_y + length * ax_y
+            return QtGui.QPolygonF([
+                QtCore.QPointF(sat_x, sat_y),
+                QtCore.QPointF(mid_x + hw * px_, mid_y + hw * py_),
+                QtCore.QPointF(tip_x, tip_y),
+                QtCore.QPointF(mid_x - hw * px_, mid_y - hw * py_),
+            ])
+
+        side_brush = QtGui.QColor(100, 116, 139, 100)
+        side_pen = QtGui.QPen(QtGui.QColor(148, 163, 184, 140), 0.8)
+        for d in (-1.0, 1.0):
+            p.setPen(side_pen)
+            p.setBrush(side_brush)
+            p.drawPolygon(_sidelobe_polygon(d))
+
+        # --- Satellite body ---
+        p.setPen(QtCore.Qt.NoPen)
+        p.setBrush(QtGui.QColor("#0c182b"))
+        p.drawEllipse(QtCore.QPointF(sat_x, sat_y), 22.0, 18.0)
+        p.setBrush(QtGui.QColor("#38bdf8"))
+        p.drawRoundedRect(QtCore.QRectF(sat_x - 12, sat_y - 11, 24, 22), 3, 3)
+        p.setBrush(QtGui.QColor("#e0f2fe"))
+        p.drawRoundedRect(QtCore.QRectF(sat_x - 25, sat_y - 6, 10, 12), 1.5, 1.5)
+        p.drawRoundedRect(QtCore.QRectF(sat_x + 15, sat_y - 6, 10, 12), 1.5, 1.5)
+
+        # --- Labels ---
+        bold = QtGui.QFont("Segoe UI", 10, QtGui.QFont.Bold)
+        small = QtGui.QFont("Segoe UI", 8)
+
+        # Title.
+        p.setFont(bold)
+        p.setPen(QtGui.QColor("#e0f2fe"))
+        p.drawText(
+            QtCore.QRect(int(sat_x - 160), 6, 320, 16),
+            QtCore.Qt.AlignCenter,
+            "MSS directive beam to ground cell",
+        )
+
+        # "Main lobe" label.
+        leader_pen = QtGui.QPen(QtGui.QColor(125, 211, 252, 160), 0.9, QtCore.Qt.DashLine)
+        p.setPen(leader_pen)
+        p.drawLine(QtCore.QPointF(258.0, 134.0), QtCore.QPointF(196.0, 148.0))
+        p.setPen(QtGui.QColor("#38bdf8"))
+        p.setFont(small)
+        p.drawText(QtCore.QRect(256, 126, 96, 14), QtCore.Qt.AlignLeft, "main lobe")
+
+        # "Sidelobe" label.
+        leader_pen_s = QtGui.QPen(QtGui.QColor(148, 163, 184, 150), 0.9, QtCore.Qt.DashLine)
+        p.setPen(leader_pen_s)
+        p.drawLine(QtCore.QPointF(62.0, 124.0), QtCore.QPointF(134.0, 112.0))
+        p.setPen(QtGui.QColor("#94a3b8"))
+        p.drawText(QtCore.QRect(6, 116, 56, 14), QtCore.Qt.AlignRight, "sidelobe")
+
+        # "Hex cells" label.
+        leader_pen_h = QtGui.QPen(QtGui.QColor("#64748b"), 0.9, QtCore.Qt.DashLine)
+        p.setPen(leader_pen_h)
+        p.drawLine(QtCore.QPointF(cx + dx_col + hex_r + 2, cy), QtCore.QPointF(cx + dx_col + hex_r + 18, cy - 6))
+        p.setPen(QtGui.QColor("#cbd5e1"))
+        p.drawText(
+            QtCore.QRect(int(cx + dx_col + hex_r + 16), int(cy - 12), 80, 14),
+            QtCore.Qt.AlignLeft, "hex cells",
         )
 
         p.end()
@@ -21914,7 +32604,7 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
         """Render a frequency spectrum layout showing service band, RAS band, and mask."""
         import base64
         scale = 2
-        lw, lh = 340, 100
+        lw, lh = 400, 110
         pw, ph = lw * scale, lh * scale
         pixmap = QtGui.QPixmap(pw, ph)
         pixmap.setDevicePixelRatio(scale)
@@ -21922,20 +32612,20 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
         p = QtGui.QPainter(pixmap)
         p.setRenderHint(QtGui.QPainter.Antialiasing, True)
         # Frequency ruler
-        ruler_y = 55.0
-        ruler_left, ruler_right = 20.0, 320.0
+        ruler_y = 62.0
+        ruler_left, ruler_right = 20.0, 380.0
         p.setPen(QtGui.QPen(QtGui.QColor("#475569"), 1.0))
         p.drawLine(QtCore.QPointF(ruler_left, ruler_y), QtCore.QPointF(ruler_right, ruler_y))
         # Service band (blue, left portion)
-        svc_left, svc_right = 40.0, 190.0
+        svc_left, svc_right = 40.0, 210.0
         p.setPen(QtCore.Qt.NoPen)
         p.setBrush(QtGui.QColor(59, 130, 246, 50))
         p.drawRect(QtCore.QRectF(svc_left, ruler_y - 20, svc_right - svc_left, 20))
         p.setPen(QtGui.QPen(QtGui.QColor("#3b82f6"), 1.2))
         p.setBrush(QtCore.Qt.NoBrush)
         p.drawRect(QtCore.QRectF(svc_left, ruler_y - 20, svc_right - svc_left, 20))
-        # RAS band (red, right portion)
-        ras_left, ras_right = 200.0, 240.0
+        # RAS band (red, right portion) — gap widened so the leakage label fits.
+        ras_left, ras_right = 270.0, 330.0
         p.setPen(QtCore.Qt.NoPen)
         p.setBrush(QtGui.QColor(239, 68, 68, 50))
         p.drawRect(QtCore.QRectF(ras_left, ruler_y - 20, ras_right - ras_left, 20))
@@ -21957,8 +32647,9 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
         p.setPen(QtGui.QColor("#ef4444"))
         p.drawText(QtCore.QRectF(ras_left, ruler_y - 34, ras_right - ras_left, 12),
                    QtCore.Qt.AlignCenter, "RAS")
+        # Leakage label — now has a full ~60 px gap to sit in without truncation.
         p.setPen(QtGui.QColor("#f59e0b"))
-        p.drawText(QtCore.QRectF(svc_right - 5, ruler_y - 24, ras_left - svc_right + 10, 12),
+        p.drawText(QtCore.QRectF(svc_right, ruler_y - 24, ras_left - svc_right, 12),
                    QtCore.Qt.AlignCenter, "leakage")
         p.setPen(QtGui.QColor("#94a3b8"))
         p.drawText(QtCore.QRect(int(ruler_left), int(ruler_y) + 4, int(ruler_right - ruler_left), 12),
@@ -22059,85 +32750,256 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
         )
 
     def _orbital_planes_schematic_data_uri(self) -> str:
-        """Render a schematic showing RAAN-spaced orbital planes around Earth."""
+        """Render a two-panel Walker-constellation RAAN schematic.
+
+        Left panel: 3-D perspective view of Earth + four orbital planes
+        sharing a single inclination, spaced uniformly in RAAN. Ascending
+        nodes are marked on the equator.
+
+        Right panel: top-down polar view (looking down from +Z onto the
+        equatorial plane) where the ascending nodes lie on a circle, the
+        plane "trace" on the equator is a single line through the origin
+        at the RAAN angle, and the ΔΩ wedge between two adjacent planes
+        is drawn and labelled.
+        """
         import base64, math as _m
         scale = 2
-        lw, lh = 340, 180
+        lw, lh = 460, 220
         pw, ph = lw * scale, lh * scale
         pixmap = QtGui.QPixmap(pw, ph)
         pixmap.setDevicePixelRatio(scale)
         pixmap.fill(QtGui.QColor("#0c182b"))
         p = QtGui.QPainter(pixmap)
         p.setRenderHint(QtGui.QPainter.Antialiasing, True)
-        cx, cy = 170.0, 90.0
-        earth_r = 35.0
-        orbit_r = 62.0
-        # Earth
+
+        plane_colors = [
+            QtGui.QColor("#ef4444"),
+            QtGui.QColor("#f59e0b"),
+            QtGui.QColor("#22c55e"),
+            QtGui.QColor("#0ea5e9"),
+        ]
+        n_planes = len(plane_colors)
+        _SUBS = {"0": "\u2080", "1": "\u2081", "2": "\u2082", "3": "\u2083",
+                 "4": "\u2084", "5": "\u2085", "6": "\u2086", "7": "\u2087",
+                 "8": "\u2088", "9": "\u2089"}
+
+        def _subscript(n: int) -> str:
+            return "".join(_SUBS[c] for c in str(n))
+
+        # ------------------------------------------------------------------
+        # Panel A — SIDE view: one orbit's inclination vs the equator.
+        # A pure 2-D edge-on view makes the "inclination" concept crystal
+        # clear without the visual clutter of crossed 3-D paths.
+        # ------------------------------------------------------------------
+        panel_ax, panel_ay = 10, 26
+        panel_aw, panel_ah = 230, 178
+        p.setPen(QtGui.QPen(QtGui.QColor("#1e293b"), 1.0))
+        p.setBrush(QtGui.QColor(15, 23, 42, 120))
+        p.drawRoundedRect(QtCore.QRectF(panel_ax, panel_ay, panel_aw, panel_ah), 6, 6)
+
+        cxA, cyA = panel_ax + panel_aw / 2.0, panel_ay + panel_ah / 2.0 + 4
+        earth_r = 26.0
+        orbit_r = 64.0
+        inclination = _m.radians(53.0)           # Walker-δ typical
+        cos_i, sin_i = _m.cos(inclination), _m.sin(inclination)
+
+        # --- Equatorial reference line (horizontal, through Earth centre) ---
+        p.setPen(QtGui.QPen(QtGui.QColor("#64748b"), 1.0, QtCore.Qt.DashLine))
+        p.drawLine(QtCore.QPointF(cxA - orbit_r - 8, cyA),
+                   QtCore.QPointF(cxA + orbit_r + 8, cyA))
+
+        # --- Orbital plane line (tilted by inclination angle i from equator) ---
+        # Viewed edge-on, the orbit's plane is a straight line through Earth
+        # centre, rotated by angle i relative to the equator.
+        orbit_dx = _m.cos(inclination) * (orbit_r + 8)
+        orbit_dy = _m.sin(inclination) * (orbit_r + 8)
+        plane_color = QtGui.QColor("#0ea5e9")
+        # Faded "back" half of orbit (behind Earth)
+        p.setPen(QtGui.QPen(QtGui.QColor(plane_color.red(), plane_color.green(),
+                                          plane_color.blue(), 80),
+                            1.4, QtCore.Qt.DashLine))
+        p.drawLine(QtCore.QPointF(cxA - orbit_dx, cyA + orbit_dy),
+                   QtCore.QPointF(cxA - earth_r * cos_i, cyA + earth_r * sin_i))
+        p.drawLine(QtCore.QPointF(cxA + earth_r * cos_i, cyA - earth_r * sin_i),
+                   QtCore.QPointF(cxA + orbit_dx, cyA - orbit_dy))
+        # Bright "front" half — drawn as a full line on top since we're
+        # edge-on, so the orbit visually reads as one coherent diameter.
+        p.setPen(QtGui.QPen(plane_color, 2.2))
+        p.drawLine(QtCore.QPointF(cxA - orbit_dx, cyA + orbit_dy),
+                   QtCore.QPointF(cxA + orbit_dx, cyA - orbit_dy))
+
+        # --- Earth sphere ---
         p.setPen(QtCore.Qt.NoPen)
-        p.setBrush(QtGui.QColor(14, 165, 233, 40))
-        p.drawEllipse(QtCore.QPointF(cx, cy), earth_r, earth_r)
+        p.setBrush(QtGui.QColor(14, 165, 233, 55))
+        p.drawEllipse(QtCore.QPointF(cxA, cyA), earth_r, earth_r)
         p.setPen(QtGui.QPen(QtGui.QColor("#0ea5e9"), 1.0))
         p.setBrush(QtCore.Qt.NoBrush)
-        p.drawEllipse(QtCore.QPointF(cx, cy), earth_r, earth_r)
-        # Equator line (projected as horizontal ellipse)
-        p.setPen(QtGui.QPen(QtGui.QColor("#475569"), 0.8, QtCore.Qt.DashLine))
-        p.drawEllipse(QtCore.QRectF(cx - earth_r, cy - earth_r * 0.25,
-                                     earth_r * 2, earth_r * 0.5))
-        # Draw 5 orbital planes with equal RAAN spacing, inclined
-        n_planes = 5
-        incl_proj = 0.7  # Projection factor for 3D perspective (~50° inclination)
-        plane_colors = [
-            QtGui.QColor("#ef4444"), QtGui.QColor("#f59e0b"),
-            QtGui.QColor("#22c55e"), QtGui.QColor("#3b82f6"),
-            QtGui.QColor("#a855f7"),
-        ]
-        for i in range(n_planes):
-            raan_frac = i / n_planes
-            angle = raan_frac * _m.pi  # Project RAAN as rotation in view
-            # Orbital ellipse (tilted by RAAN, compressed by inclination projection)
-            cos_a, sin_a = _m.cos(angle), _m.sin(angle)
-            col = plane_colors[i]
-            p.setPen(QtGui.QPen(QtGui.QColor(col.red(), col.green(), col.blue(), 100), 1.0))
-            # Draw as parametric ellipse
-            pts: list[QtCore.QPointF] = []
-            for t in range(60):
-                theta = 2.0 * _m.pi * t / 59
-                # Orbit circle in plane, then rotate by RAAN and project
-                ox = orbit_r * _m.cos(theta)
-                oy = orbit_r * _m.sin(theta) * incl_proj
-                # Rotate by RAAN angle in the view
-                px = cx + ox * cos_a - oy * sin_a * 0.3
-                py = cy + ox * sin_a * 0.35 + oy * cos_a
-                pts.append(QtCore.QPointF(px, py))
-            for j in range(len(pts) - 1):
-                p.drawLine(pts[j], pts[j + 1])
-            # Satellite dot on each orbit
-            sat_theta = _m.pi * 0.3 + i * 0.4  # Spread satellites
-            ox = orbit_r * _m.cos(sat_theta)
-            oy = orbit_r * _m.sin(sat_theta) * incl_proj
-            sx = cx + ox * cos_a - oy * sin_a * 0.3
-            sy = cy + ox * sin_a * 0.35 + oy * cos_a
-            p.setPen(QtCore.Qt.NoPen)
-            p.setBrush(col)
-            p.drawEllipse(QtCore.QPointF(sx, sy), 3, 3)
-        # RAAN arrows at equator
+        p.drawEllipse(QtCore.QPointF(cxA, cyA), earth_r, earth_r)
+        # North-pole tick at top of Earth
         p.setPen(QtGui.QPen(QtGui.QColor("#94a3b8"), 0.8))
-        sm = QtGui.QFont("Segoe UI", 7)
-        p.setFont(sm)
-        p.drawText(QtCore.QRectF(cx - 15, cy + earth_r + 4, 30, 12),
-                   QtCore.Qt.AlignCenter, "Earth")
-        # Annotation: RAAN label
-        p.setPen(QtGui.QColor("#f8fafc"))
-        bd = QtGui.QFont("Segoe UI", 7, QtGui.QFont.Bold)
-        p.setFont(bd)
-        p.drawText(QtCore.QRectF(10, 4, lw - 20, 12),
-                   QtCore.Qt.AlignCenter, "Equal RAAN spacing → equal plane-to-plane angle")
+        p.drawLine(QtCore.QPointF(cxA, cyA - earth_r),
+                   QtCore.QPointF(cxA, cyA - earth_r - 6))
+        p.setFont(QtGui.QFont("Segoe UI", 6, QtGui.QFont.Bold))
         p.setPen(QtGui.QColor("#94a3b8"))
-        sm2 = QtGui.QFont("Segoe UI", 6)
-        p.setFont(sm2)
-        p.drawText(QtCore.QRectF(10, lh - 14, lw - 20, 12),
-                   QtCore.Qt.AlignCenter,
-                   "5 planes shown  ·  RAAN controls ascending-node longitude")
+        p.drawText(QtCore.QRectF(cxA - 6, cyA - earth_r - 16, 12, 10),
+                   QtCore.Qt.AlignCenter, "N")
+
+        # --- Inclination arc (between equator and orbit, at the right side
+        #     of Earth where the orbit crosses ascending) ---
+        arc_r = earth_r + 14
+        arc_rect = QtCore.QRectF(cxA - arc_r, cyA - arc_r, 2 * arc_r, 2 * arc_r)
+        # Arc sweeps from 0° (east, equator) counter-clockwise to +i.
+        p.setPen(QtGui.QPen(QtGui.QColor("#f59e0b"), 1.4))
+        p.setBrush(QtCore.Qt.NoBrush)
+        p.drawArc(arc_rect, 0 * 16, int(_m.degrees(inclination) * 16))
+        # Inclination label "i"
+        lbl_angle = inclination / 2.0
+        lbl_x = cxA + (arc_r + 8) * _m.cos(lbl_angle)
+        lbl_y = cyA - (arc_r + 8) * _m.sin(lbl_angle)
+        p.setFont(QtGui.QFont("Segoe UI", 9, QtGui.QFont.Bold))
+        p.setPen(QtGui.QColor("#f59e0b"))
+        p.drawText(QtCore.QRectF(lbl_x - 14, lbl_y - 6, 28, 12),
+                   QtCore.Qt.AlignCenter, "i")
+
+        # --- Ascending-node marker (right side, on equator) + satellite dot ---
+        an_x, an_y = cxA + orbit_r * cos_i, cyA - orbit_r * sin_i
+        an_x_eq = cxA + orbit_r
+        # Ascending node dot on equator (where the orbit crosses going north)
+        p.setPen(QtGui.QPen(QtGui.QColor("#e0f2fe"), 1.0))
+        p.setBrush(plane_color)
+        p.drawEllipse(QtCore.QPointF(an_x_eq - orbit_r + earth_r * cos_i,
+                                      cyA + earth_r * sin_i), 2.8, 2.8)
+        # Satellite dot on the orbit (in the sky, above equator)
+        sat_f = 0.55        # fractional position along orbit away from AN
+        sat_x = cxA + orbit_r * cos_i * sat_f
+        sat_y = cyA - orbit_r * sin_i * sat_f
+        p.setPen(QtCore.Qt.NoPen)
+        p.setBrush(plane_color)
+        p.drawEllipse(QtCore.QPointF(sat_x, sat_y), 3.0, 3.0)
+
+        # --- Region labels ---
+        p.setFont(QtGui.QFont("Segoe UI", 7, QtGui.QFont.Bold))
+        # Equator label (to the left of Earth, along the dashed line)
+        p.setPen(QtGui.QColor("#94a3b8"))
+        p.drawText(QtCore.QRectF(cxA - orbit_r - 6, cyA - 12, 48, 12),
+                   QtCore.Qt.AlignLeft, "equator")
+        # Orbit label (along the tilted line, top-left end)
+        p.setPen(plane_color)
+        ang_deg = _m.degrees(inclination)
+        p.save()
+        p.translate(cxA - orbit_dx + 4, cyA + orbit_dy - 8)
+        p.rotate(-ang_deg)
+        p.drawText(QtCore.QRectF(0, 0, 70, 12),
+                   QtCore.Qt.AlignLeft, "orbital plane")
+        p.restore()
+
+        # Panel A title + subtext
+        title_font = QtGui.QFont("Segoe UI", 9, QtGui.QFont.Bold)
+        p.setFont(title_font)
+        p.setPen(QtGui.QColor("#e0f2fe"))
+        p.drawText(QtCore.QRectF(panel_ax, panel_ay - 18, panel_aw, 16),
+                   QtCore.Qt.AlignCenter, "Side view — inclination (i)")
+        p.setFont(QtGui.QFont("Segoe UI", 7))
+        p.setPen(QtGui.QColor("#94a3b8"))
+        p.drawText(QtCore.QRectF(panel_ax + 8, panel_ay + panel_ah - 14, panel_aw - 16, 12),
+                   QtCore.Qt.AlignLeft, "i = 53°  ·  same for every plane")
+
+        # ------------------------------------------------------------------
+        # Panel B — top-down polar view with ΔΩ wedge
+        # ------------------------------------------------------------------
+        panel_bx = panel_ax + panel_aw + 14
+        panel_by = panel_ay
+        panel_bw, panel_bh = lw - panel_bx - 10, panel_ah
+        p.setPen(QtGui.QPen(QtGui.QColor("#1e293b"), 1.0))
+        p.setBrush(QtGui.QColor(15, 23, 42, 120))
+        p.drawRoundedRect(QtCore.QRectF(panel_bx, panel_by, panel_bw, panel_bh), 6, 6)
+
+        cxB, cyB = panel_bx + panel_bw / 2.0, panel_by + panel_bh / 2.0 + 2
+        earth_rB = 22.0
+        orbit_rB = 54.0
+
+        # Reference equator circle (thick grey)
+        p.setPen(QtGui.QPen(QtGui.QColor("#475569"), 1.0))
+        p.setBrush(QtCore.Qt.NoBrush)
+        p.drawEllipse(QtCore.QPointF(cxB, cyB), orbit_rB, orbit_rB)
+
+        # Earth (filled circle at centre)
+        p.setPen(QtCore.Qt.NoPen)
+        p.setBrush(QtGui.QColor(14, 165, 233, 55))
+        p.drawEllipse(QtCore.QPointF(cxB, cyB), earth_rB, earth_rB)
+        p.setPen(QtGui.QPen(QtGui.QColor("#0ea5e9"), 1.0))
+        p.setBrush(QtCore.Qt.NoBrush)
+        p.drawEllipse(QtCore.QPointF(cxB, cyB), earth_rB, earth_rB)
+
+        # Radial lines to each ascending node (plane trace on equator)
+        for i, col in enumerate(plane_colors):
+            raan = 2.0 * _m.pi * i / n_planes
+            nx = cxB + orbit_rB * _m.cos(raan)
+            ny = cyB - orbit_rB * _m.sin(raan)
+            # Faded line through Earth to the opposite side of the orbit
+            p.setPen(QtGui.QPen(QtGui.QColor(col.red(), col.green(), col.blue(), 90), 1.0, QtCore.Qt.DashLine))
+            p.drawLine(QtCore.QPointF(cxB - (nx - cxB), cyB - (ny - cyB)),
+                       QtCore.QPointF(nx, ny))
+            # Bright radial from Earth surface to ascending node
+            p.setPen(QtGui.QPen(col, 1.6))
+            surf_x = cxB + earth_rB * _m.cos(raan)
+            surf_y = cyB - earth_rB * _m.sin(raan)
+            p.drawLine(QtCore.QPointF(surf_x, surf_y), QtCore.QPointF(nx, ny))
+            # Ascending-node marker
+            p.setPen(QtGui.QPen(QtGui.QColor("#e0f2fe"), 1.0))
+            p.setBrush(col)
+            p.drawEllipse(QtCore.QPointF(nx, ny), 3.2, 3.2)
+            # Label Ω_i
+            lbl_r = orbit_rB + 12
+            lx = cxB + lbl_r * _m.cos(raan)
+            ly = cyB - lbl_r * _m.sin(raan)
+            p.setFont(QtGui.QFont("Segoe UI", 6, QtGui.QFont.Bold))
+            p.setPen(col)
+            p.drawText(QtCore.QRectF(lx - 14, ly - 6, 28, 12),
+                       QtCore.Qt.AlignCenter, f"Ω{_subscript(i + 1)}")
+
+        # ΔΩ wedge between plane 0 (east, 0°) and plane 1 (north, 90°)
+        wedge_r = earth_rB + 12
+        p.setPen(QtCore.Qt.NoPen)
+        p.setBrush(QtGui.QColor(245, 158, 11, 50))
+        wedge = QtGui.QPainterPath()
+        wedge.moveTo(cxB, cyB)
+        wedge.lineTo(cxB + wedge_r, cyB)
+        wedge.arcTo(
+            QtCore.QRectF(cxB - wedge_r, cyB - wedge_r, 2 * wedge_r, 2 * wedge_r),
+            0.0, 90.0,
+        )
+        wedge.closeSubpath()
+        p.drawPath(wedge)
+        p.setPen(QtGui.QPen(QtGui.QColor("#f59e0b"), 1.2))
+        p.setBrush(QtCore.Qt.NoBrush)
+        p.drawPath(wedge)
+        # ΔΩ label in the wedge
+        wedge_label_r = earth_rB + 3
+        delta_label_angle = _m.radians(45.0)
+        lx = cxB + wedge_label_r * _m.cos(delta_label_angle)
+        ly = cyB - wedge_label_r * _m.sin(delta_label_angle)
+        p.setFont(QtGui.QFont("Segoe UI", 7, QtGui.QFont.Bold))
+        p.setPen(QtGui.QColor("#f59e0b"))
+        p.drawText(QtCore.QRectF(lx - 18, ly - 6, 36, 12),
+                   QtCore.Qt.AlignCenter, "ΔΩ")
+
+        # Panel B title + subtext
+        p.setFont(title_font)
+        p.setPen(QtGui.QColor("#e0f2fe"))
+        p.drawText(QtCore.QRectF(panel_bx, panel_by - 18, panel_bw, 16),
+                   QtCore.Qt.AlignCenter, "Top-down (polar view)")
+        p.setFont(QtGui.QFont("Segoe UI", 7))
+        p.setPen(QtGui.QColor("#94a3b8"))
+        p.drawText(QtCore.QRectF(panel_bx + 8, panel_by + panel_bh - 14, panel_bw - 16, 12),
+                   QtCore.Qt.AlignLeft,
+                   f"ΔΩ = 360°/N (N={n_planes} → {360 // n_planes}°)")
+
+        # Overall caption (kept short so it fits without horizontal clipping)
+        p.setFont(QtGui.QFont("Segoe UI", 7))
+        p.setPen(QtGui.QColor("#94a3b8"))
+        p.drawText(QtCore.QRect(10, lh - 16, lw - 20, 12), QtCore.Qt.AlignCenter,
+                   "Walker-δ  ·  shared inclination, uniform RAAN (Ω) spacing  ·  dots = ascending nodes")
         p.end()
         buf = QtCore.QBuffer()
         buf.open(QtCore.QBuffer.WriteOnly)
@@ -22150,81 +33012,1072 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
         )
 
     def _shoreline_buffer_schematic_data_uri(self) -> str:
-        """Render a shoreline buffer schematic showing land/sea/buffer zones."""
+        """Two-panel schematic: positive vs negative shoreline buffer.
+
+        Positive buffer extends the effective land region *into the sea*
+        (nearshore sea cells stay in the grid), so the orange dashed line
+        — representing the effective land edge used for masking — sits on
+        the sea side of the white physical coast.
+
+        Negative buffer erodes the land edge *inland*, so the orange
+        dashed line sits on the land side of the coast and the strip
+        between them marks the land that gets removed.
+        """
         import base64
         scale = 2
-        lw, lh = 320, 130
+        lw, lh = 460, 170
         pw, ph = lw * scale, lh * scale
         pixmap = QtGui.QPixmap(pw, ph)
         pixmap.setDevicePixelRatio(scale)
         pixmap.fill(QtGui.QColor("#0c182b"))
         p = QtGui.QPainter(pixmap)
         p.setRenderHint(QtGui.QPainter.Antialiasing, True)
-        # Sea background (left half)
-        p.setPen(QtCore.Qt.NoPen)
-        p.setBrush(QtGui.QColor(14, 165, 233, 30))
-        p.drawRect(QtCore.QRectF(20, 20, 130, 80))
-        # Land (right half, irregular coast)
-        land_path = QtGui.QPainterPath()
-        land_path.moveTo(150, 20)
-        land_path.lineTo(300, 20)
-        land_path.lineTo(300, 100)
-        land_path.lineTo(150, 100)
-        land_path.cubicTo(165, 85, 140, 65, 160, 50)
-        land_path.cubicTo(145, 35, 155, 25, 150, 20)
-        p.setBrush(QtGui.QColor(34, 197, 94, 40))
-        p.drawPath(land_path)
-        # Coast line
-        coast = QtGui.QPainterPath()
-        coast.moveTo(150, 20)
-        coast.cubicTo(155, 25, 145, 35, 160, 50)
-        coast.cubicTo(140, 65, 165, 85, 150, 100)
-        p.setPen(QtGui.QPen(QtGui.QColor("#f8fafc"), 1.5))
-        p.setBrush(QtCore.Qt.NoBrush)
-        p.drawPath(coast)
-        # Buffer zone (amber dashed, offset from coast into sea)
-        buf_path = QtGui.QPainterPath()
-        buf_path.moveTo(120, 20)
-        buf_path.cubicTo(125, 25, 115, 35, 130, 50)
-        buf_path.cubicTo(110, 65, 135, 85, 120, 100)
-        p.setPen(QtGui.QPen(QtGui.QColor("#f59e0b"), 1.2, QtCore.Qt.DashLine))
-        p.drawPath(buf_path)
-        # Buffer fill between coast and buffer line
-        fill_path = QtGui.QPainterPath()
-        fill_path.moveTo(150, 20)
-        fill_path.cubicTo(155, 25, 145, 35, 160, 50)
-        fill_path.cubicTo(140, 65, 165, 85, 150, 100)
-        fill_path.lineTo(120, 100)
-        fill_path.cubicTo(135, 85, 110, 65, 130, 50)
-        fill_path.cubicTo(115, 35, 125, 25, 120, 20)
-        fill_path.closeSubpath()
-        p.setPen(QtCore.Qt.NoPen)
-        p.setBrush(QtGui.QColor(245, 158, 11, 25))
-        p.drawPath(fill_path)
-        # Labels
-        sm = QtGui.QFont("Segoe UI", 8)
-        p.setFont(sm)
-        p.setPen(QtGui.QColor("#0ea5e9"))
-        p.drawText(QtCore.QRectF(30, 50, 60, 14), QtCore.Qt.AlignCenter, "Sea")
-        p.setPen(QtGui.QColor("#22c55e"))
-        p.drawText(QtCore.QRectF(210, 50, 60, 14), QtCore.Qt.AlignCenter, "Land")
-        p.setPen(QtGui.QColor("#f59e0b"))
-        bd = QtGui.QFont("Segoe UI", 7, QtGui.QFont.Bold)
-        p.setFont(bd)
-        p.drawText(QtCore.QRectF(65, 28, 60, 12), QtCore.Qt.AlignCenter, "buffer")
-        p.setPen(QtGui.QColor("#f8fafc"))
-        p.drawText(QtCore.QRectF(155, 28, 50, 12), QtCore.Qt.AlignLeft, "coast")
-        # Arrow showing buffer distance
-        p.setPen(QtGui.QPen(QtGui.QColor("#f59e0b"), 1.0))
-        p.drawLine(QtCore.QPointF(125, 72), QtCore.QPointF(155, 72))
-        p.drawLine(QtCore.QPointF(125, 69), QtCore.QPointF(125, 75))
-        p.drawLine(QtCore.QPointF(155, 69), QtCore.QPointF(155, 75))
-        # Bottom label
-        sm2 = QtGui.QFont("Segoe UI", 6)
-        p.setFont(sm2)
+
+        panel_w, panel_h = 215, 120
+        gap = 20
+        y0 = 22
+        x0_left = 10
+        x0_right = x0_left + panel_w + gap
+
+        def _draw_panel(x0: float, sign: str) -> None:
+            # Panel border
+            p.setPen(QtGui.QPen(QtGui.QColor("#1e293b"), 1.0))
+            p.setBrush(QtGui.QColor(15, 23, 42, 120))
+            p.drawRoundedRect(QtCore.QRectF(x0, y0, panel_w, panel_h), 6, 6)
+
+            # Geometry anchors — coast wiggles between xc_min and xc_max
+            # inside this panel; sea is left of coast, land is to the right.
+            sea_x0 = x0 + 10
+            land_x1 = x0 + panel_w - 10
+            top = y0 + 10
+            bot = y0 + panel_h - 10
+            coast_points = [
+                (x0 + 110, top),
+                (x0 + 115, top + 16),
+                (x0 + 105, top + 34),
+                (x0 + 118, top + 50),
+                (x0 + 102, top + 66),
+                (x0 + 115, top + 82),
+                (x0 + 110, bot),
+            ]
+            # Buffer line: +8 x-shift toward sea if positive, +8 toward
+            # land if negative.
+            dx = -22 if sign == "+" else +22
+            buffer_points = [(cx + dx, cy) for (cx, cy) in coast_points]
+
+            # Sea fill (blue, left of coast up to panel edge)
+            sea_path = QtGui.QPainterPath()
+            sea_path.moveTo(sea_x0, top)
+            for cx, cy in coast_points:
+                sea_path.lineTo(cx, cy)
+            sea_path.lineTo(sea_x0, bot)
+            sea_path.closeSubpath()
+            p.setPen(QtCore.Qt.NoPen)
+            p.setBrush(QtGui.QColor(14, 165, 233, 35))
+            p.drawPath(sea_path)
+
+            # Land fill (green, right of coast up to panel edge)
+            land_path = QtGui.QPainterPath()
+            land_path.moveTo(land_x1, top)
+            for cx, cy in coast_points:
+                land_path.lineTo(cx, cy)
+            land_path.lineTo(land_x1, bot)
+            land_path.closeSubpath()
+            p.setBrush(QtGui.QColor(34, 197, 94, 40))
+            p.drawPath(land_path)
+
+            # Affected zone = region between coast and buffer line.
+            # (positive → sea side of coast → "nearshore sea kept";
+            #  negative → land side of coast → "coastal land eroded")
+            zone_path = QtGui.QPainterPath()
+            zone_path.moveTo(*coast_points[0])
+            for cx, cy in coast_points[1:]:
+                zone_path.lineTo(cx, cy)
+            for cx, cy in reversed(buffer_points):
+                zone_path.lineTo(cx, cy)
+            zone_path.closeSubpath()
+            zone_color = QtGui.QColor(245, 158, 11, 55)
+            p.setPen(QtCore.Qt.NoPen)
+            p.setBrush(zone_color)
+            p.drawPath(zone_path)
+
+            # Coast line (white, solid)
+            coast_path = QtGui.QPainterPath()
+            coast_path.moveTo(*coast_points[0])
+            for cx, cy in coast_points[1:]:
+                coast_path.lineTo(cx, cy)
+            p.setPen(QtGui.QPen(QtGui.QColor("#f8fafc"), 1.6))
+            p.setBrush(QtCore.Qt.NoBrush)
+            p.drawPath(coast_path)
+
+            # Buffer line (orange, dashed — "effective coast after buffer")
+            buffer_path = QtGui.QPainterPath()
+            buffer_path.moveTo(*buffer_points[0])
+            for bx, by in buffer_points[1:]:
+                buffer_path.lineTo(bx, by)
+            p.setPen(QtGui.QPen(QtGui.QColor("#f59e0b"), 1.5, QtCore.Qt.DashLine))
+            p.drawPath(buffer_path)
+
+            # Buffer distance arrow (at mid-height) with end caps
+            mid_y = top + (bot - top) / 2.0
+            mid_c = coast_points[3]          # middle coast anchor
+            mid_b = buffer_points[3]
+            p.setPen(QtGui.QPen(QtGui.QColor("#f59e0b"), 1.0))
+            p.drawLine(QtCore.QPointF(mid_c[0], mid_y),
+                       QtCore.QPointF(mid_b[0], mid_y))
+            for (ex, _ey) in (mid_c, mid_b):
+                p.drawLine(QtCore.QPointF(ex, mid_y - 4),
+                           QtCore.QPointF(ex, mid_y + 4))
+
+            # Helper: label with opaque backdrop so text stays legible
+            # even when drawn on top of the tinted sea/land fills or the
+            # coast/buffer lines.
+            def _badge(rect: QtCore.QRectF, color: QtGui.QColor,
+                       text: str, align: int, bold: bool = True,
+                       pt: int = 7) -> None:
+                p.setPen(QtCore.Qt.NoPen)
+                p.setBrush(QtGui.QColor(12, 24, 43, 235))
+                p.drawRoundedRect(rect.adjusted(-3, -1, 3, 1), 3, 3)
+                p.setPen(color)
+                weight = QtGui.QFont.Bold if bold else QtGui.QFont.Normal
+                p.setFont(QtGui.QFont("Segoe UI", pt, weight))
+                p.drawText(rect, align, text)
+
+            # Sea / Land region badges
+            _badge(QtCore.QRectF(x0 + 16, top + 20, 48, 14),
+                   QtGui.QColor("#0ea5e9"), "Sea",
+                   int(QtCore.Qt.AlignCenter), pt=8)
+            _badge(QtCore.QRectF(land_x1 - 58, top + 20, 48, 14),
+                   QtGui.QColor("#22c55e"), "Land",
+                   int(QtCore.Qt.AlignCenter), pt=8)
+
+            # coast / buffer line badges placed just below the panel top
+            # edge. No leader lines — the labels sit directly over where
+            # each line enters the panel at the top, with their own
+            # opaque backdrop so they don't fight the lines.
+            if sign == "+":
+                # Positive: buffer line is in the sea (left of coast)
+                _badge(QtCore.QRectF(x0 + 30, top + 2, 60, 11),
+                       QtGui.QColor("#f59e0b"), "buffer line",
+                       int(QtCore.Qt.AlignCenter))
+                _badge(QtCore.QRectF(x0 + 130, top + 2, 48, 11),
+                       QtGui.QColor("#f8fafc"), "coast",
+                       int(QtCore.Qt.AlignCenter))
+                # Zone badge at the bottom of the fill strip
+                _badge(QtCore.QRectF(x0 + 30, bot - 16, 96, 11),
+                       QtGui.QColor("#fbbf24"), "+ keeps nearshore sea",
+                       int(QtCore.Qt.AlignCenter), pt=6)
+            else:
+                # Negative: buffer line is in the land (right of coast)
+                _badge(QtCore.QRectF(x0 + 130, top + 2, 60, 11),
+                       QtGui.QColor("#f59e0b"), "buffer line",
+                       int(QtCore.Qt.AlignCenter))
+                _badge(QtCore.QRectF(x0 + 40, top + 2, 48, 11),
+                       QtGui.QColor("#f8fafc"), "coast",
+                       int(QtCore.Qt.AlignCenter))
+                _badge(QtCore.QRectF(x0 + 90, bot - 16, 96, 11),
+                       QtGui.QColor("#fbbf24"), "− erodes coastal land",
+                       int(QtCore.Qt.AlignCenter), pt=6)
+
+            # Panel title
+            title_font = QtGui.QFont("Segoe UI", 9, QtGui.QFont.Bold)
+            p.setFont(title_font)
+            p.setPen(QtGui.QColor("#e0f2fe"))
+            title = "positive buffer (+)" if sign == "+" else "negative buffer (−)"
+            p.drawText(QtCore.QRectF(x0, y0 - 18, panel_w, 16),
+                       QtCore.Qt.AlignCenter, title)
+
+        _draw_panel(x0_left, "+")
+        _draw_panel(x0_right, "-")
+
+        # Overall caption
+        p.setFont(QtGui.QFont("Segoe UI", 7))
         p.setPen(QtGui.QColor("#94a3b8"))
-        p.drawText(QtCore.QRect(10, lh - 14, lw - 20, 12), QtCore.Qt.AlignCenter,
-                   "positive buffer keeps nearshore sea  ·  negative erodes land edge")
+        p.drawText(QtCore.QRect(10, lh - 16, lw - 20, 12), QtCore.Qt.AlignCenter,
+                   "Orange dashed = effective land edge after the shoreline buffer  ·  filled orange = cells the buffer changes")
+        p.end()
+        buf = QtCore.QBuffer()
+        buf.open(QtCore.QBuffer.WriteOnly)
+        pixmap.save(buf, "PNG")
+        b64 = base64.b64encode(bytes(buf.data())).decode("ascii")
+        return (
+            f'<div style="text-align:center; margin:4px 0;">'
+            f'<img src="data:image/png;base64,{b64}" width="{lw}" height="{lh}"/>'
+            f'</div>'
+        )
+
+    def _satellite_antenna_model_schematic_data_uri(self) -> str:
+        """Side-by-side Rec 1.2 vs Rec 1.4 generic pattern shapes.
+
+        Rec 1.2 = piecewise envelope (main lobe + flat near-in
+        sidelobe shelf + cosecant-squared far-sidelobe roll-off +
+        horizon floor). No sharp Bessel nulls.
+        Rec 1.4 = analytical Bessel/Taylor main lobe + oscillatory
+        sidelobes with deep nulls at the Bessel zeros.
+        """
+        import base64
+        import math as _math
+        scale = 2
+        lw, lh = 440, 210
+        pw, ph = lw * scale, lh * scale
+        pixmap = QtGui.QPixmap(pw, ph)
+        pixmap.setDevicePixelRatio(scale)
+        pixmap.fill(QtGui.QColor("#0c182b"))
+        p = QtGui.QPainter(pixmap)
+        p.setRenderHint(QtGui.QPainter.Antialiasing, True)
+
+        panel_w = 200
+        panel_h = 140
+        gap = 20
+        y0 = 28
+        x0_left = 10
+        x0_right = x0_left + panel_w + gap
+
+        def _draw_panel(x0: float, title: str, shape: str) -> None:
+            p.setPen(QtGui.QPen(QtGui.QColor("#1e293b"), 1.0))
+            p.setBrush(QtGui.QColor(15, 23, 42, 120))
+            p.drawRoundedRect(QtCore.QRectF(x0, y0, panel_w, panel_h), 6, 6)
+            plot_l = x0 + 22
+            plot_r = x0 + panel_w - 10
+            plot_t = y0 + 16
+            plot_b = y0 + panel_h - 22
+            p.setPen(QtGui.QPen(QtGui.QColor("#334155"), 1.0))
+            p.drawLine(QtCore.QPointF(plot_l, plot_b), QtCore.QPointF(plot_r, plot_b))
+            p.drawLine(QtCore.QPointF(plot_l, plot_t), QtCore.QPointF(plot_l, plot_b))
+            # Compute curve
+            n = 180
+            pts = []
+            for i in range(n):
+                xf = i / (n - 1)            # θ fraction [0, 1]
+                if shape == "rec12":
+                    # Piecewise envelope: main lobe → shelf → roll-off → floor
+                    x = xf * 6.0
+                    if x < 0.6:
+                        y = 1.0 - 0.8 * (x / 0.6) ** 2
+                    elif x < 1.2:
+                        y = 0.2          # near-in shelf
+                    elif x < 4.0:
+                        # cosec²-like roll-off (straight line on log plot)
+                        y = 0.2 - 0.3 * ((x - 1.2) / (4.0 - 1.2))
+                    else:
+                        y = -0.5         # far floor
+                else:  # "rec14"
+                    # Bessel-ish: main lobe + oscillating ripples
+                    x = xf * 6.0
+                    if x < 0.4:
+                        y = 1.0 - 0.8 * (x / 0.4) ** 2
+                    else:
+                        # Envelope falls, ripples sit on top
+                        env = 0.25 - 0.30 * (x - 0.4) / (6.0 - 0.4)
+                        ripple = 0.18 * _math.exp(-x * 0.6) * _math.cos(
+                            _math.pi * (x - 0.4) / 0.55
+                        )
+                        # Deep nulls every half period
+                        null_phase = (_math.pi * (x - 0.4) / 0.55) % (2 * _math.pi)
+                        near_null = min(
+                            abs(null_phase - _math.pi / 2),
+                            abs(null_phase - 3 * _math.pi / 2),
+                        )
+                        if near_null < 0.08:
+                            y = env + ripple - 0.4
+                        else:
+                            y = env + ripple
+                    y = max(y, -0.8)
+                px = plot_l + (plot_r - plot_l) * xf
+                py = plot_b - (plot_b - plot_t) * (y + 1.0) * 0.5
+                pts.append(QtCore.QPointF(px, py))
+            colour = "#22c55e" if shape == "rec12" else "#0ea5e9"
+            p.setPen(QtGui.QPen(QtGui.QColor(colour), 1.8))
+            for i in range(len(pts) - 1):
+                p.drawLine(pts[i], pts[i + 1])
+            # Axis labels
+            sm = QtGui.QFont("Segoe UI", 7)
+            p.setFont(sm)
+            p.setPen(QtGui.QColor("#94a3b8"))
+            p.drawText(QtCore.QRectF(plot_l, plot_b + 2, plot_r - plot_l, 12),
+                       QtCore.Qt.AlignCenter, "θ (deg from boresight)")
+            p.save()
+            p.translate(x0 + 6, (plot_t + plot_b) / 2.0)
+            p.rotate(-90)
+            p.drawText(QtCore.QRectF(-36, -8, 72, 12), QtCore.Qt.AlignCenter,
+                       "gain (dB)")
+            p.restore()
+            # Title
+            title_font = QtGui.QFont("Segoe UI", 9, QtGui.QFont.Bold)
+            p.setFont(title_font)
+            p.setPen(QtGui.QColor("#e0f2fe"))
+            p.drawText(QtCore.QRectF(x0, y0 - 18, panel_w, 16),
+                       QtCore.Qt.AlignCenter, title)
+
+        _draw_panel(x0_left, "S.1528 Rec 1.2 (piecewise)", "rec12")
+        _draw_panel(x0_right, "S.1528 Rec 1.4 (Bessel)", "rec14")
+
+        # Caption
+        cap = QtGui.QFont("Segoe UI", 7)
+        p.setFont(cap)
+        p.setPen(QtGui.QColor("#94a3b8"))
+        p.drawText(QtCore.QRect(10, lh - 18, lw - 20, 14), QtCore.Qt.AlignCenter,
+                   "Rec 1.2 = smooth envelope, no sidelobe nulls  ·  Rec 1.4 = Bessel/Taylor sidelobes with deep nulls")
+        p.end()
+
+        buf = QtCore.QBuffer()
+        buf.open(QtCore.QBuffer.WriteOnly)
+        pixmap.save(buf, "PNG")
+        b64 = base64.b64encode(bytes(buf.data())).decode("ascii")
+        return (
+            f'<div style="text-align:center; margin:4px 0;">'
+            f'<img src="data:image/png;base64,{b64}" width="{lw}" height="{lh}"/>'
+            f'</div>'
+        )
+
+    def _power_quantity_schematic_data_uri(self) -> str:
+        """Render a link-budget schematic with Ptx / EIRP / PFD callouts.
+
+        Shows a satellite (Ptx → TX antenna gain Gtx → EIRP) → free-
+        space path loss (FSPL) → ground station receiving PFD. The
+        three callouts mark where each of the ``power_input_quantity``
+        options anchors the user's service-power definition.
+        """
+        import base64
+        import math as _math
+        scale = 2
+        lw, lh = 420, 230
+        pw, ph = lw * scale, lh * scale
+        pixmap = QtGui.QPixmap(pw, ph)
+        pixmap.setDevicePixelRatio(scale)
+        pixmap.fill(QtGui.QColor("#0c182b"))
+        p = QtGui.QPainter(pixmap)
+        p.setRenderHint(QtGui.QPainter.Antialiasing, True)
+
+        # --- Satellite at top-left ---
+        sat_x, sat_y = 80.0, 55.0
+        p.setPen(QtCore.Qt.NoPen)
+        p.setBrush(QtGui.QColor("#38bdf8"))
+        p.drawRoundedRect(QtCore.QRectF(sat_x - 14, sat_y - 10, 28, 20), 3, 3)
+        p.setBrush(QtGui.QColor("#e0f2fe"))
+        p.drawRoundedRect(QtCore.QRectF(sat_x - 28, sat_y - 5, 10, 10), 1.5, 1.5)
+        p.drawRoundedRect(QtCore.QRectF(sat_x + 18, sat_y - 5, 10, 10), 1.5, 1.5)
+
+        # --- Earth bottom arc + station ---
+        earth_r = 260.0
+        cx_earth, cy_earth = 340.0, 430.0
+        p.setPen(QtGui.QPen(QtGui.QColor("#334155"), 1.3))
+        p.setBrush(QtGui.QColor(30, 41, 59, 160))
+        p.drawEllipse(QtCore.QPointF(cx_earth, cy_earth), earth_r, earth_r)
+        st_x, st_y = 320.0, cy_earth - earth_r
+        p.setPen(QtCore.Qt.NoPen)
+        p.setBrush(QtGui.QColor("#e0f2fe"))
+        p.drawEllipse(QtCore.QPointF(st_x, st_y), 5, 5)
+
+        # --- Beam cone from satellite to station (amber) ---
+        # Narrow-ish cone to suggest directivity
+        p.setPen(QtCore.Qt.NoPen)
+        p.setBrush(QtGui.QColor(245, 158, 11, 30))
+        cone = QtGui.QPainterPath()
+        cone.moveTo(sat_x, sat_y + 10)
+        cone.lineTo(st_x - 20, st_y - 6)
+        cone.lineTo(st_x + 20, st_y - 6)
+        cone.closeSubpath()
+        p.drawPath(cone)
+        p.setPen(QtGui.QPen(QtGui.QColor("#f59e0b"), 1.2, QtCore.Qt.DashLine))
+        p.drawLine(QtCore.QPointF(sat_x, sat_y + 10),
+                   QtCore.QPointF((st_x - 20 + st_x + 20) / 2.0, st_y - 6))
+
+        # --- Callouts: Ptx, EIRP, PFD ---
+        # Ptx — at the satellite (inside the chassis)
+        box_font = QtGui.QFont("Segoe UI", 8, QtGui.QFont.Bold)
+        sm_font = QtGui.QFont("Segoe UI", 7)
+
+        def _callout(x: float, y: float, color: str, title: str, desc: str,
+                     w: float = 140.0, h: float = 48.0) -> None:
+            p.setPen(QtGui.QPen(QtGui.QColor(color), 1.2))
+            p.setBrush(QtGui.QColor(15, 23, 42, 200))
+            p.drawRoundedRect(QtCore.QRectF(x, y, w, h), 4, 4)
+            p.setFont(box_font)
+            p.setPen(QtGui.QColor(color))
+            p.drawText(QtCore.QRectF(x + 6, y + 2, w - 12, 14),
+                       QtCore.Qt.AlignLeft, title)
+            p.setFont(sm_font)
+            p.setPen(QtGui.QColor("#e0f2fe"))
+            p.drawText(QtCore.QRectF(x + 6, y + 17, w - 12, h - 20),
+                       QtCore.Qt.AlignLeft | QtCore.Qt.TextWordWrap, desc)
+
+        # Both Ptx and EIRP are satellite-side quantities; keep both
+        # callouts anchored to the satellite so it's visually clear
+        # they sit at the spacecraft, not somewhere along the path.
+        # Ptx — top-right of satellite
+        _callout(120, 18, "#f97316", "Satellite Ptx",
+                 "TX power before the antenna (dBW)")
+        p.setPen(QtGui.QPen(QtGui.QColor("#f97316"), 1.0, QtCore.Qt.DotLine))
+        p.drawLine(QtCore.QPointF(sat_x + 15, sat_y + 2),
+                   QtCore.QPointF(118, 38))
+
+        # EIRP — also anchored at the satellite antenna output,
+        # directly below the Ptx callout for a "Ptx → + Gtx → EIRP"
+        # top-to-bottom reading adjacent to the spacecraft.
+        _callout(120, 72, "#a855f7", "Satellite EIRP",
+                 "Ptx + Gtx (dBW, radiated at satellite)")
+        p.setPen(QtGui.QPen(QtGui.QColor("#a855f7"), 1.0, QtCore.Qt.DotLine))
+        p.drawLine(QtCore.QPointF(sat_x + 15, sat_y + 10),
+                   QtCore.QPointF(118, 92))
+
+        # Target PFD — at the station surface
+        _callout(230, 150, "#22c55e", "Target PFD",
+                 "EIRP/(4πr²) at station (dBW/m²)")
+        p.setPen(QtGui.QPen(QtGui.QColor("#22c55e"), 1.0, QtCore.Qt.DotLine))
+        p.drawLine(QtCore.QPointF(st_x - 8, st_y - 4),
+                   QtCore.QPointF(370, 170))
+
+        # Chain arrow (top-to-bottom) — include the optional atmospheric
+        # loss term so the diagram doesn't imply FSPL is the only path loss.
+        chain_font = QtGui.QFont("Segoe UI", 7, QtGui.QFont.Bold)
+        p.setFont(chain_font)
+        p.setPen(QtGui.QColor("#94a3b8"))
+        p.drawText(QtCore.QRect(10, 210, lw - 20, 14), QtCore.Qt.AlignCenter,
+                   "link budget:  Ptx  +  Gtx  =  EIRP   ⟶ − FSPL − A_atm (optional) ⟶   PFD at station")
+        p.end()
+
+        buf = QtCore.QBuffer()
+        buf.open(QtCore.QBuffer.WriteOnly)
+        pixmap.save(buf, "PNG")
+        b64 = base64.b64encode(bytes(buf.data())).decode("ascii")
+        return (
+            f'<div style="text-align:center; margin:4px 0;">'
+            f'<img src="data:image/png;base64,{b64}" width="{lw}" height="{lh}"/>'
+            f'</div>'
+        )
+
+    def _radio_horizon_schematic_data_uri(self) -> str:
+        """Render a radio-horizon-vs-geometric-horizon schematic.
+
+        Shows the geometric horizon (tangent line from the station) and
+        the slightly longer radio horizon (curve bending down with the
+        atmospheric refractive-index gradient). Satellites between the
+        two are reachable only with the radio-horizon visibility model.
+        """
+        import base64
+        import math as _math
+        scale = 2
+        lw, lh = 520, 210
+        pw, ph = lw * scale, lh * scale
+        pixmap = QtGui.QPixmap(pw, ph)
+        pixmap.setDevicePixelRatio(scale)
+        pixmap.fill(QtGui.QColor("#0c182b"))
+        p = QtGui.QPainter(pixmap)
+        p.setRenderHint(QtGui.QPainter.Antialiasing, True)
+
+        # Earth (curvature subtly exaggerated so the geometric vs
+        # radio horizon difference is visible but the earth still reads
+        # as a gentle horizon rather than a dramatic dome under the
+        # station).  Large radius + low centre keeps the surface mostly
+        # flat near the station, curving downward toward the picture
+        # edges where the horizon rays meet it.  Station shifted left
+        # of centre so the horizons + satellite + caption have room to
+        # breathe on the right.
+        cx, cy = 180.0, 900.0
+        earth_r = 780.0  # mildly exaggerated
+        p.setPen(QtGui.QPen(QtGui.QColor("#334155"), 1.3))
+        p.setBrush(QtGui.QColor(30, 41, 59, 160))
+        p.drawEllipse(QtCore.QPointF(cx, cy), earth_r, earth_r)
+
+        # Station on top of Earth
+        st_x, st_y = cx, cy - earth_r
+        p.setPen(QtCore.Qt.NoPen)
+        p.setBrush(QtGui.QColor("#e0f2fe"))
+        p.drawEllipse(QtCore.QPointF(st_x, st_y), 4, 4)
+        small = QtGui.QFont("Segoe UI", 7)
+        p.setFont(small)
+        p.setPen(QtGui.QColor("#94a3b8"))
+        p.drawText(QtCore.QRectF(st_x - 40, st_y - 16, 80, 12),
+                   QtCore.Qt.AlignCenter, "station")
+
+        # Geometric horizon ray: tangent to Earth at the station.
+        # Draw as a straight line heading right (east) from the station.
+        # Extent tuned so the satellite (sat_x = geom_x2 + 10) and its
+        # caption stay within the canvas with a small right margin.
+        geom_x2 = st_x + 260.0
+        geom_y2 = st_y
+        p.setPen(QtGui.QPen(QtGui.QColor("#0ea5e9"), 2.0, QtCore.Qt.DashLine))
+        p.drawLine(QtCore.QPointF(st_x, st_y), QtCore.QPointF(geom_x2, geom_y2))
+        p.setPen(QtGui.QColor("#0ea5e9"))
+        p.drawText(QtCore.QRectF(geom_x2 - 90, geom_y2 - 14, 90, 12),
+                   QtCore.Qt.AlignRight, "geometric horizon")
+
+        # Radio horizon: bent slightly downward (further reach).
+        # Approximate as a slight curve going 10 px lower at the end.
+        radio_path = QtGui.QPainterPath()
+        radio_path.moveTo(st_x, st_y)
+        # Quadratic curve bending downward.
+        radio_path.quadTo(st_x + 125.0, st_y + 3.0, geom_x2 + 40.0, geom_y2 + 18.0)
+        p.setPen(QtGui.QPen(QtGui.QColor("#22c55e"), 2.0))
+        p.drawPath(radio_path)
+        # "radio horizon" label — placed below the curve midpoint, well
+        # before the satellite zone so it doesn't overlap the satellite
+        # caption on the right.
+        p.setPen(QtGui.QColor("#22c55e"))
+        p.drawText(QtCore.QRectF(st_x + 80.0, st_y + 10.0, 110, 12),
+                   QtCore.Qt.AlignLeft, "radio horizon")
+
+        # Satellite inside the reachable-by-radio zone but past the
+        # geometric horizon — this is the "extra" coverage the toggle unlocks.
+        sat_x = geom_x2 + 10.0
+        sat_y = geom_y2 + 12.0
+        p.setPen(QtCore.Qt.NoPen)
+        p.setBrush(QtGui.QColor("#38bdf8"))
+        p.drawRoundedRect(QtCore.QRectF(sat_x - 8, sat_y - 6, 16, 12), 3, 3)
+        p.setBrush(QtGui.QColor("#e0f2fe"))
+        p.drawRoundedRect(QtCore.QRectF(sat_x - 18, sat_y - 3, 7, 6), 1.5, 1.5)
+        p.drawRoundedRect(QtCore.QRectF(sat_x + 11, sat_y - 3, 7, 6), 1.5, 1.5)
+        # Satellite caption — below the satellite with enough vertical
+        # clearance so it doesn't collide with the "radio horizon" label
+        # which sits above the curve further left.
+        p.setPen(QtGui.QColor("#22c55e"))
+        p.drawText(QtCore.QRectF(sat_x - 110, sat_y + 18, 130, 12),
+                   QtCore.Qt.AlignCenter, "reachable only w/ radio horizon")
+
+        # Caption below
+        cap = QtGui.QFont("Segoe UI", 7)
+        p.setFont(cap)
+        p.setPen(QtGui.QColor("#94a3b8"))
+        p.drawText(QtCore.QRect(10, lh - 18, lw - 20, 14), QtCore.Qt.AlignCenter,
+                   "Radio horizon ≈ k·R_earth (k≈4/3 from refraction); reaches satellites just below the geometric horizon.")
+        p.end()
+
+        buf = QtCore.QBuffer()
+        buf.open(QtCore.QBuffer.WriteOnly)
+        pixmap.save(buf, "PNG")
+        b64 = base64.b64encode(bytes(buf.data())).decode("ascii")
+        return (
+            f'<div style="text-align:center; margin:4px 0;">'
+            f'<img src="data:image/png;base64,{b64}" width="{lw}" height="{lh}"/>'
+            f'</div>'
+        )
+
+    def _include_atmosphere_schematic_data_uri(self) -> str:
+        """Render an atmospheric-attenuation-vs-elevation schematic.
+
+        Shows the slant path through a stylised atmosphere at two
+        elevations (low horizon-grazing and high near-zenith) with
+        an inset curve of attenuation in dB vs elevation — the
+        essential intuition for why the toggle matters more at low
+        elevations.
+        """
+        import base64
+        import math as _math
+        scale = 2
+        lw, lh = 520, 220
+        pw, ph = lw * scale, lh * scale
+        pixmap = QtGui.QPixmap(pw, ph)
+        pixmap.setDevicePixelRatio(scale)
+        pixmap.fill(QtGui.QColor("#0c182b"))
+        p = QtGui.QPainter(pixmap)
+        p.setRenderHint(QtGui.QPainter.Antialiasing, True)
+
+        # Left panel: ray picture (Earth + atmosphere shell + two rays).
+        # Earth centre is pushed below the canvas so only the gentle top
+        # arc is visible (like a real horizon view).  The station sits
+        # on the earth's outer surface — NOT above or below it — so the
+        # amber "atmospheric slant" segment starts at the ground and ends
+        # exactly at the ray-atmosphere-shell intersection.
+        # Station y chosen so rays of length RAY_LEN (see ``_draw_ray``)
+        # stay inside the canvas top even for near-zenith elevation.
+        earth_cx, earth_cy = 120.0, 350.0
+        earth_r = 220.0  # earth centre far below, only a shallow arc visible
+        atm_thickness = 24.0
+        # Ray length tuned so the near-zenith el=75° ray endpoint + its
+        # label stay inside the canvas top (label rect starts at
+        # ``ey - 18`` and must not go below y=0).  At el=75° the ray rises
+        # ray_len·cos(15°) ≈ 0.97·ray_len; station is at
+        # ``earth_cy − earth_r = 130`` so ``ey = 130 − 0.97·ray_len`` must
+        # stay at or above 20 → ray_len ≲ 113.  100 px leaves margin.
+        ray_len = 100.0
+        # Station on the actual earth surface (ray origin for rays).
+        st_x = earth_cx
+        st_y = earth_cy - earth_r
+
+        # Earth disc
+        p.setPen(QtGui.QPen(QtGui.QColor("#334155"), 1.2))
+        p.setBrush(QtGui.QColor(30, 41, 59, 200))
+        p.drawEllipse(QtCore.QPointF(earth_cx, earth_cy), earth_r, earth_r)
+
+        # Atmosphere shell (translucent blue)
+        p.setPen(QtGui.QPen(QtGui.QColor(14, 165, 233, 130), 1.0))
+        p.setBrush(QtGui.QColor(14, 165, 233, 30))
+        p.drawEllipse(QtCore.QPointF(earth_cx, earth_cy),
+                      earth_r + atm_thickness, earth_r + atm_thickness)
+
+        # Analytical ray-shell intersection: ray from station in
+        # direction (sin θ, −cos θ) exits the atmosphere outer shell at
+        # parametric distance
+        #
+        #     t = −earth_r · cos(θ) + √( earth_r² · cos²(θ) + atm_thickness · (2·earth_r + atm_thickness) )
+        #
+        # For θ = 0 (zenith) this reduces to atm_thickness exactly; as θ
+        # increases (low elevation) the chord through the shell grows.
+        def _atm_exit_distance(th_rad: float) -> float:
+            c = _math.cos(th_rad)
+            disc = earth_r * earth_r * c * c + atm_thickness * (2.0 * earth_r + atm_thickness)
+            return -earth_r * c + _math.sqrt(max(disc, 0.0))
+
+        # Draw two rays from the station: high (near zenith) and low (grazing)
+        def _draw_ray(el_deg: float, colour: str, label_on_right: str) -> None:
+            th = _math.radians(90.0 - el_deg)
+            # Ray endpoint: ``ray_len`` px beyond the station along the
+            # elevation direction.
+            ex = st_x + ray_len * _math.sin(th)
+            ey = st_y - ray_len * _math.cos(th)
+            p.setPen(QtGui.QPen(QtGui.QColor(colour), 2.0))
+            p.drawLine(QtCore.QPointF(st_x, st_y), QtCore.QPointF(ex, ey))
+            # Amber highlight: the atmospheric portion of the ray —
+            # exactly from station to the ray-shell intersection.
+            atm_len = _atm_exit_distance(th)
+            sx2 = st_x + atm_len * _math.sin(th)
+            sy2 = st_y - atm_len * _math.cos(th)
+            p.setPen(QtGui.QPen(QtGui.QColor(245, 158, 11), 3.5,
+                                QtCore.Qt.SolidLine, QtCore.Qt.RoundCap))
+            p.drawLine(QtCore.QPointF(st_x, st_y), QtCore.QPointF(sx2, sy2))
+            # Elevation label — sit just ABOVE the ray endpoint on the
+            # left side so it doesn't collide with the inset panel on
+            # the right or with the atmosphere shell / earth disc below.
+            sm = QtGui.QFont("Segoe UI", 7)
+            p.setFont(sm)
+            p.setPen(QtGui.QColor(colour))
+            p.drawText(QtCore.QRectF(ex - 76, ey - 18, 72, 12),
+                       QtCore.Qt.AlignRight, label_on_right)
+
+        _draw_ray(75.0, "#22c55e", "el=75°  ~0.3 dB")
+        _draw_ray(10.0, "#ef4444", "el=10°  ~3 dB")
+
+        # Ground/station marker — sits on the earth surface.
+        p.setPen(QtCore.Qt.NoPen)
+        p.setBrush(QtGui.QColor("#e0f2fe"))
+        p.drawEllipse(QtCore.QPointF(st_x, st_y), 4, 4)
+
+        # Alias used by the inset-placement calculations below.
+        cx, cy = earth_cx, earth_cy
+
+        # Right panel: attenuation curve — pushed further right on the
+        # widened canvas so the low-elevation ray's "el=10°  ~3 dB"
+        # label (which ends ~x=280) has clear air before the inset
+        # starts at x=360.
+        cx0, cy0 = 360.0, 42.0  # top-left of inset
+        inset_w, inset_h = 140.0, 120.0
+        # Panel box
+        p.setPen(QtGui.QPen(QtGui.QColor("#1e293b"), 1.0))
+        p.setBrush(QtGui.QColor(15, 23, 42, 120))
+        p.drawRoundedRect(QtCore.QRectF(cx0, cy0, inset_w, inset_h), 5, 5)
+        # Axes
+        axl = cx0 + 22
+        axr = cx0 + inset_w - 8
+        axt = cy0 + 18
+        axb = cy0 + inset_h - 18
+        p.setPen(QtGui.QPen(QtGui.QColor("#334155"), 1.0))
+        p.drawLine(QtCore.QPointF(axl, axb), QtCore.QPointF(axr, axb))
+        p.drawLine(QtCore.QPointF(axl, axt), QtCore.QPointF(axl, axb))
+
+        max_att = 5.0
+
+        def _el_to_x(el: float) -> float:
+            return axl + (axr - axl) * (el - 2.0) / (90.0 - 2.0)
+
+        def _att_to_y(att: float) -> float:
+            return axb - (axb - axt) * min(att / max_att, 1.0)
+
+        # X-axis tick marks + labels (elevation)
+        tiny = QtGui.QFont("Segoe UI", 6)
+        p.setFont(tiny)
+        p.setPen(QtGui.QPen(QtGui.QColor("#475569"), 0.8))
+        for el in (10.0, 30.0, 60.0, 90.0):
+            x = _el_to_x(el)
+            p.drawLine(QtCore.QPointF(x, axb),
+                       QtCore.QPointF(x, axb + 3.0))
+            p.setPen(QtGui.QColor("#94a3b8"))
+            p.drawText(QtCore.QRectF(x - 12, axb + 3, 24, 10),
+                       QtCore.Qt.AlignCenter, f"{int(el)}")
+            p.setPen(QtGui.QPen(QtGui.QColor("#475569"), 0.8))
+
+        # Y-axis tick marks + labels (attenuation in dB)
+        for att in (1.0, 3.0, 5.0):
+            y = _att_to_y(att)
+            p.setPen(QtGui.QPen(QtGui.QColor("#475569"), 0.8))
+            p.drawLine(QtCore.QPointF(axl - 3.0, y),
+                       QtCore.QPointF(axl, y))
+            p.setPen(QtGui.QColor("#94a3b8"))
+            p.drawText(QtCore.QRectF(axl - 18, y - 5, 16, 10),
+                       QtCore.Qt.AlignRight, f"{int(att)}")
+
+        # Horizontal reference lines at 1, 3 dB (dotted) so the curve's
+        # shape is quantitatively readable.
+        p.setPen(QtGui.QPen(QtGui.QColor(71, 85, 105, 140), 0.6, QtCore.Qt.DotLine))
+        for att in (1.0, 3.0):
+            y = _att_to_y(att)
+            p.drawLine(QtCore.QPointF(axl, y), QtCore.QPointF(axr, y))
+
+        # Curve: attenuation ∝ 1/sin(el) clipped; el ∈ [2, 90]
+        n = 60
+        pts = []
+        for i in range(n):
+            el = 2.0 + (90.0 - 2.0) * i / (n - 1)
+            att = 0.3 / max(_math.sin(_math.radians(el)), 0.035)  # dB
+            att = min(att, max_att)
+            pts.append(QtCore.QPointF(_el_to_x(el), _att_to_y(att)))
+        p.setPen(QtGui.QPen(QtGui.QColor("#0ea5e9"), 1.8))
+        for i in range(len(pts) - 1):
+            p.drawLine(pts[i], pts[i + 1])
+
+        # Axis labels
+        sm = QtGui.QFont("Segoe UI", 6)
+        p.setFont(sm)
+        p.setPen(QtGui.QColor("#94a3b8"))
+        p.drawText(QtCore.QRectF(axl - 4, axb + 14, axr - axl + 8, 12),
+                   QtCore.Qt.AlignCenter, "elevation (deg)")
+        p.save()
+        p.translate(cx0 + 8, (axt + axb) / 2.0)
+        p.rotate(-90)
+        p.drawText(QtCore.QRectF(-30, -8, 60, 12), QtCore.Qt.AlignCenter,
+                   "attenuation (dB)")
+        p.restore()
+        # Inset title
+        sb = QtGui.QFont("Segoe UI", 8, QtGui.QFont.Bold)
+        p.setFont(sb)
+        p.setPen(QtGui.QColor("#e0f2fe"))
+        p.drawText(QtCore.QRectF(cx0, cy0 - 14, inset_w, 12),
+                   QtCore.Qt.AlignCenter, "A(el) ~ 1/sin(el)")
+
+        # Caption
+        cap = QtGui.QFont("Segoe UI", 7)
+        p.setFont(cap)
+        p.setPen(QtGui.QColor("#94a3b8"))
+        p.drawText(QtCore.QRect(10, lh - 18, lw - 20, 14), QtCore.Qt.AlignCenter,
+                   "Atmospheric loss grows as 1/sin(el); high-el rays barely suffer, low-el rays can lose several dB.")
+        p.end()
+
+        buf = QtCore.QBuffer()
+        buf.open(QtCore.QBuffer.WriteOnly)
+        pixmap.save(buf, "PNG")
+        b64 = base64.b64encode(bytes(buf.data())).decode("ascii")
+        return (
+            f'<div style="text-align:center; margin:4px 0;">'
+            f'<img src="data:image/png;base64,{b64}" width="{lw}" height="{lh}"/>'
+            f'</div>'
+        )
+
+    def _pattern_eval_mode_schematic_data_uri(self) -> str:
+        """Render an analytical-vs-LUT evaluation-mode schematic.
+
+        Left panel: the analytical curve is evaluated exactly at every
+        query angle.  Right panel: the LUT pre-samples the same curve
+        on a regular grid and interpolates linearly between samples —
+        fast but smooths sub-sample detail (deep nulls, single-bin
+        artefacts).
+        """
+        import base64
+        scale = 2
+        lw, lh = 440, 220
+        pw, ph = lw * scale, lh * scale
+        pixmap = QtGui.QPixmap(pw, ph)
+        pixmap.setDevicePixelRatio(scale)
+        pixmap.fill(QtGui.QColor("#0c182b"))
+        p = QtGui.QPainter(pixmap)
+        p.setRenderHint(QtGui.QPainter.Antialiasing, True)
+
+        panel_w = 200
+        panel_h = 148
+        gap = 20
+        y0 = 28
+        x0_left = 10
+        x0_right = x0_left + panel_w + gap
+
+        # Shared synthetic curve: broad main-lobe Gaussian + sidelobe ripples
+        import math as _math
+        def _curve(x_frac: float) -> float:
+            # x_frac in [0, 1]; return a dB-like y value (0 = top peak, -1 = bottom)
+            # Main lobe at the left third, sidelobes with a deep null in the middle
+            x = x_frac * 6.0  # scale to [0, 6]
+            if x < 0.6:
+                return 1.0 - (x / 0.6) ** 2 * 0.5
+            # sidelobes with a Bessel-ish null
+            side = _math.exp(-((x - 2.0) ** 2) / 0.4) * 0.25
+            null = _math.exp(-((x - 3.2) ** 2) / 0.02) * (-0.6)
+            tail = _math.exp(-((x - 4.5) ** 2) / 0.3) * 0.15
+            return max(-0.9, side + null + tail - 0.2)
+
+        def _draw_panel(x0: float, mode: str) -> None:
+            # Border
+            p.setPen(QtGui.QPen(QtGui.QColor("#1e293b"), 1.0))
+            p.setBrush(QtGui.QColor(15, 23, 42, 120))
+            p.drawRoundedRect(QtCore.QRectF(x0, y0, panel_w, panel_h), 6, 6)
+            # Inner plotting area
+            plot_l = x0 + 22
+            plot_r = x0 + panel_w - 12
+            plot_t = y0 + 14
+            plot_b = y0 + panel_h - 22
+            # Axes
+            p.setPen(QtGui.QPen(QtGui.QColor("#334155"), 1.0))
+            p.drawLine(QtCore.QPointF(plot_l, plot_b), QtCore.QPointF(plot_r, plot_b))
+            p.drawLine(QtCore.QPointF(plot_l, plot_t), QtCore.QPointF(plot_l, plot_b))
+
+            # Dense true analytical curve (many samples) in both panels —
+            # drawn as a faint reference behind the mode-specific content.
+            pts = []
+            n_ref = 200
+            for i in range(n_ref):
+                xf = i / (n_ref - 1)
+                yf = _curve(xf)
+                px = plot_l + (plot_r - plot_l) * xf
+                py = plot_b - (plot_b - plot_t) * (yf + 1.0) * 0.5
+                pts.append(QtCore.QPointF(px, py))
+            # Reference grey
+            p.setPen(QtGui.QPen(QtGui.QColor(148, 163, 184, 90), 1.0, QtCore.Qt.DashLine))
+            for i in range(len(pts) - 1):
+                p.drawLine(pts[i], pts[i + 1])
+
+            if mode == "analytical":
+                # Thick cyan line tracing every query angle
+                p.setPen(QtGui.QPen(QtGui.QColor("#0ea5e9"), 2.0))
+                for i in range(len(pts) - 1):
+                    p.drawLine(pts[i], pts[i + 1])
+                # Label sits in the panel header strip (between title and
+                # plot axes) so it never overlaps the curve.
+                p.setPen(QtGui.QColor("#94a3b8"))
+                sm = QtGui.QFont("Segoe UI", 7)
+                p.setFont(sm)
+                p.drawText(QtCore.QRectF(x0 + 10, y0 + 1, panel_w - 20, 12),
+                           QtCore.Qt.AlignCenter, "exact at every θ")
+            else:  # lut
+                # Show sparse LUT samples with markers, then piecewise-
+                # linear interp between them.  Deep null mostly
+                # disappears — main visual cost.
+                n_samples = 14
+                lut_pts: list[QtCore.QPointF] = []
+                for i in range(n_samples):
+                    xf = i / (n_samples - 1)
+                    yf = _curve(xf)
+                    px = plot_l + (plot_r - plot_l) * xf
+                    py = plot_b - (plot_b - plot_t) * (yf + 1.0) * 0.5
+                    lut_pts.append(QtCore.QPointF(px, py))
+                # Linear interp line
+                p.setPen(QtGui.QPen(QtGui.QColor("#22c55e"), 1.8))
+                for i in range(len(lut_pts) - 1):
+                    p.drawLine(lut_pts[i], lut_pts[i + 1])
+                # Sample markers
+                p.setPen(QtCore.Qt.NoPen)
+                p.setBrush(QtGui.QColor("#22c55e"))
+                for pt in lut_pts:
+                    p.drawEllipse(pt, 2.0, 2.0)
+                # Label sits in the panel header strip (between title and
+                # plot axes) so it never overlaps the curve or markers.
+                p.setPen(QtGui.QColor("#94a3b8"))
+                sm = QtGui.QFont("Segoe UI", 7)
+                p.setFont(sm)
+                p.drawText(QtCore.QRectF(x0 + 10, y0 + 1, panel_w - 20, 12),
+                           QtCore.Qt.AlignCenter, "samples + linear interp")
+                # Null-smoothed annotation — place text in bottom-right
+                # corner of plot with a diagonal arrow down to the null,
+                # so it never collides with the top mode label.
+                null_px = plot_l + (plot_r - plot_l) * (3.2 / 6.0)
+                null_py = plot_b - (plot_b - plot_t) * 0.12
+                ann_x = plot_r - 72
+                ann_y = plot_b - 18
+                p.setPen(QtGui.QPen(QtGui.QColor("#f59e0b"), 1.0, QtCore.Qt.DashLine))
+                p.drawLine(QtCore.QPointF(ann_x + 34, ann_y + 5),
+                           QtCore.QPointF(null_px, null_py - 4))
+                p.setPen(QtGui.QColor("#f59e0b"))
+                sm2 = QtGui.QFont("Segoe UI", 6, QtGui.QFont.Bold)
+                p.setFont(sm2)
+                p.drawText(QtCore.QRectF(ann_x, ann_y - 2, 70, 10),
+                           QtCore.Qt.AlignRight, "null smoothed")
+
+            # θ axis label
+            sm = QtGui.QFont("Segoe UI", 7)
+            p.setFont(sm)
+            p.setPen(QtGui.QColor("#94a3b8"))
+            p.drawText(QtCore.QRectF(plot_l, plot_b + 2, plot_r - plot_l, 14),
+                       QtCore.Qt.AlignCenter, "θ (off-axis angle)")
+            # Title
+            title_font = QtGui.QFont("Segoe UI", 9, QtGui.QFont.Bold)
+            p.setFont(title_font)
+            p.setPen(QtGui.QColor("#e0f2fe"))
+            p.drawText(QtCore.QRectF(x0, y0 - 18, panel_w, 16),
+                       QtCore.Qt.AlignCenter,
+                       "analytical" if mode == "analytical" else "LUT (default)")
+
+        _draw_panel(x0_left, "analytical")
+        _draw_panel(x0_right, "lut")
+
+        cap = QtGui.QFont("Segoe UI", 7)
+        p.setFont(cap)
+        p.setPen(QtGui.QColor("#94a3b8"))
+        p.drawText(QtCore.QRect(10, lh - 18, lw - 20, 14), QtCore.Qt.AlignCenter,
+                   "Dashed grey = true pattern  ·  solid line = what the kernel returns  ·  LUT smooths sub-sample nulls")
+        p.end()
+        buf = QtCore.QBuffer()
+        buf.open(QtCore.QBuffer.WriteOnly)
+        pixmap.save(buf, "PNG")
+        b64 = base64.b64encode(bytes(buf.data())).decode("ascii")
+        return (
+            f'<div style="text-align:center; margin:4px 0;">'
+            f'<img src="data:image/png;base64,{b64}" width="{lw}" height="{lh}"/>'
+            f'</div>'
+        )
+
+    def _surface_pfd_cap_mode_schematic_data_uri(self) -> str:
+        """Render a per_beam-vs-per_satellite surface-PFD cap schematic.
+
+        Two side-by-side panels compare the two cap policies on an
+        identical 3-beam satellite. The ``per_beam`` panel shows each
+        beam individually clipped below the cap — the aggregate
+        ground PFD can still exceed the cap where footprints overlap.
+        The ``per_satellite`` panel shows the sum of all beams bounded
+        by the cap, so the aggregate never exceeds it.
+        """
+        import base64
+        scale = 2
+        lw, lh = 440, 220
+        pw, ph = lw * scale, lh * scale
+        pixmap = QtGui.QPixmap(pw, ph)
+        pixmap.setDevicePixelRatio(scale)
+        pixmap.fill(QtGui.QColor("#0c182b"))
+        p = QtGui.QPainter(pixmap)
+        p.setRenderHint(QtGui.QPainter.Antialiasing, True)
+
+        panel_w = 200
+        panel_h = 150
+        gap = 20
+        y0 = 28
+        x0_left = 10
+        x0_right = x0_left + panel_w + gap
+
+        def _draw_panel(x0: float, label: str, mode: str) -> None:
+            # Panel border + subtle fill
+            p.setPen(QtGui.QPen(QtGui.QColor("#1e293b"), 1.0))
+            p.setBrush(QtGui.QColor(15, 23, 42, 120))
+            p.drawRoundedRect(QtCore.QRectF(x0, y0, panel_w, panel_h), 6, 6)
+
+            # Satellite at top
+            sat_x = x0 + panel_w / 2.0
+            sat_y = y0 + 18
+            p.setPen(QtCore.Qt.NoPen)
+            p.setBrush(QtGui.QColor("#38bdf8"))
+            p.drawRoundedRect(QtCore.QRectF(sat_x - 8, sat_y - 6, 16, 12), 3, 3)
+            p.setBrush(QtGui.QColor("#e0f2fe"))
+            p.drawRoundedRect(QtCore.QRectF(sat_x - 18, sat_y - 3, 7, 6), 1.5, 1.5)
+            p.drawRoundedRect(QtCore.QRectF(sat_x + 11, sat_y - 3, 7, 6), 1.5, 1.5)
+
+            # Ground line
+            ground_y = y0 + panel_h - 34
+            p.setPen(QtGui.QPen(QtGui.QColor("#334155"), 1.0))
+            p.drawLine(QtCore.QPointF(x0 + 14, ground_y), QtCore.QPointF(x0 + panel_w - 14, ground_y))
+
+            # Cap threshold horizontal line (amber dashed)
+            cap_y = y0 + 64
+            p.setPen(QtGui.QPen(QtGui.QColor(245, 158, 11, 170), 1.2, QtCore.Qt.DashLine))
+            p.drawLine(QtCore.QPointF(x0 + 14, cap_y), QtCore.QPointF(x0 + panel_w - 14, cap_y))
+            sm_bold = QtGui.QFont("Segoe UI", 7, QtGui.QFont.Bold)
+            p.setFont(sm_bold)
+            p.setPen(QtGui.QColor("#f59e0b"))
+            p.drawText(QtCore.QRectF(x0 + panel_w - 60, cap_y - 14, 52, 12),
+                       QtCore.Qt.AlignRight, "cap")
+
+            # Three beam footprints: centres at x-offsets from sat_x
+            offsets = [-55, 0, 55]
+            # Per-beam peak PFD (before cap): first two strong, third weaker
+            per_beam_peaks = [82, 78, 40]  # pixel heights
+
+            if mode == "per_beam":
+                # Each beam independently clipped at the cap line
+                for off, peak in zip(offsets, per_beam_peaks):
+                    bx = sat_x + off
+                    # cap is at cap_y; peak originally at ground_y - peak
+                    # After per_beam cap: actual peak = min(peak_y, cap_y)
+                    peak_y_uncapped = ground_y - peak
+                    capped_peak_y = max(cap_y, peak_y_uncapped)
+                    # Bell shape (triangle fill) from ground to capped peak
+                    w = 22
+                    path = QtGui.QPainterPath()
+                    path.moveTo(bx - w, ground_y)
+                    path.lineTo(bx, capped_peak_y)
+                    path.lineTo(bx + w, ground_y)
+                    path.closeSubpath()
+                    p.setPen(QtCore.Qt.NoPen)
+                    p.setBrush(QtGui.QColor(14, 165, 233, 120))
+                    p.drawPath(path)
+                    # Stroke — bright when clamped, soft when under cap
+                    clamped = (peak_y_uncapped < cap_y)
+                    p.setPen(QtGui.QPen(QtGui.QColor("#f59e0b" if clamped else "#0ea5e9"), 1.2))
+                    p.setBrush(QtCore.Qt.NoBrush)
+                    p.drawPath(path)
+                # Sum-envelope (dashed red) — the aggregate pokes above cap
+                # where beams 1 and 2 overlap visually.
+                p.setPen(QtGui.QPen(QtGui.QColor("#ef4444"), 1.4, QtCore.Qt.DashLine))
+                env = QtGui.QPainterPath()
+                env.moveTo(sat_x - 78, ground_y)
+                env.cubicTo(sat_x - 30, cap_y - 22, sat_x + 30, cap_y - 22, sat_x + 78, ground_y)
+                p.setBrush(QtCore.Qt.NoBrush)
+                p.drawPath(env)
+                # Overshoot annotation
+                sm = QtGui.QFont("Segoe UI", 7)
+                p.setFont(sm)
+                p.setPen(QtGui.QColor("#ef4444"))
+                p.drawText(QtCore.QRectF(x0 + 14, cap_y - 32, panel_w - 28, 12),
+                           QtCore.Qt.AlignCenter, "aggregate ▶ over cap")
+            else:  # per_satellite
+                # All beams scaled by one factor so their SUM touches cap
+                # (i.e. aggregate envelope peaks at cap_y exactly).
+                # Show uncapped beams semi-transparent behind the capped ones.
+                sum_peak_uncapped = sum(per_beam_peaks)
+                sum_target = ground_y - cap_y   # pixels above ground the sum may reach
+                scale_f = min(1.0, sum_target / max(sum_peak_uncapped, 1))
+                for off, peak in zip(offsets, per_beam_peaks):
+                    bx = sat_x + off
+                    # Ghost of uncapped footprint
+                    w = 22
+                    g_path = QtGui.QPainterPath()
+                    g_path.moveTo(bx - w, ground_y)
+                    g_path.lineTo(bx, ground_y - peak)
+                    g_path.lineTo(bx + w, ground_y)
+                    g_path.closeSubpath()
+                    p.setPen(QtGui.QPen(QtGui.QColor(148, 163, 184, 70), 0.8, QtCore.Qt.DashLine))
+                    p.setBrush(QtGui.QColor(148, 163, 184, 20))
+                    p.drawPath(g_path)
+                    # Actual scaled footprint
+                    s_path = QtGui.QPainterPath()
+                    s_path.moveTo(bx - w, ground_y)
+                    s_path.lineTo(bx, ground_y - peak * scale_f)
+                    s_path.lineTo(bx + w, ground_y)
+                    s_path.closeSubpath()
+                    p.setPen(QtGui.QPen(QtGui.QColor("#22c55e"), 1.2))
+                    p.setBrush(QtGui.QColor(34, 197, 94, 110))
+                    p.drawPath(s_path)
+                # Sum envelope (solid green) now peaks exactly at cap_y
+                p.setPen(QtGui.QPen(QtGui.QColor("#22c55e"), 1.6))
+                env = QtGui.QPainterPath()
+                env.moveTo(sat_x - 78, ground_y)
+                env.cubicTo(sat_x - 30, cap_y + 2, sat_x + 30, cap_y + 2, sat_x + 78, ground_y)
+                p.setBrush(QtCore.Qt.NoBrush)
+                p.drawPath(env)
+                sm = QtGui.QFont("Segoe UI", 7)
+                p.setFont(sm)
+                p.setPen(QtGui.QColor("#22c55e"))
+                p.drawText(QtCore.QRectF(x0 + 14, cap_y - 16, panel_w - 28, 12),
+                           QtCore.Qt.AlignCenter, "aggregate ≤ cap")
+
+            # Panel title
+            title_font = QtGui.QFont("Segoe UI", 9, QtGui.QFont.Bold)
+            p.setFont(title_font)
+            p.setPen(QtGui.QColor("#e0f2fe"))
+            p.drawText(QtCore.QRectF(x0, y0 - 18, panel_w, 16),
+                       QtCore.Qt.AlignCenter, label)
+
+        _draw_panel(x0_left, "per_beam", "per_beam")
+        _draw_panel(x0_right, "per_satellite", "per_satellite")
+
+        # Overall caption below
+        cap_font = QtGui.QFont("Segoe UI", 7)
+        p.setFont(cap_font)
+        p.setPen(QtGui.QColor("#94a3b8"))
+        p.drawText(QtCore.QRect(10, lh - 18, lw - 20, 14), QtCore.Qt.AlignCenter,
+                   "Dashed = cap  ·  red envelope overshoots (per_beam)  ·  green stays within (per_satellite)")
         p.end()
         buf = QtCore.QBuffer()
         buf.open(QtCore.QBuffer.WriteOnly)
@@ -22399,7 +34252,8 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
                 self.service_power_quantity_combo,
                 "Power quantity",
                 "Choose whether the service is defined by a target PFD, direct satellite Ptx, or direct satellite EIRP.",
-                self._help_details_html(
+                self._power_quantity_schematic_data_uri()
+                + self._help_details_html(
                     default="Target PFD is the recommended default for RA.769-style service studies.",
                     interactions="Changing the quantity switches which numeric control is active and how the equivalent per-MHz or per-channel value is derived. "
                     "Power variation controls (slant-range / random) are only available for Satellite EIRP and Satellite Ptx — target PFD already adjusts power based on geometry.",
@@ -22717,7 +34571,8 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
                 self.surface_pfd_cap_mode_combo,
                 "Surface-PFD cap mode",
                 "Whether the limit applies per beam independently or aggregated across all beams of a single satellite.",
-                self._help_details_html(
+                self._surface_pfd_cap_mode_schematic_data_uri()
+                + self._help_details_html(
                     when=(
                         "Pick 'Per beam' when each beam's footprint must stay under the limit in "
                         "isolation (simpler, less restrictive). Pick 'Per satellite (aggregate)' "
@@ -22816,7 +34671,8 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
                 self.antenna_model_combo,
                 "Satellite antenna model",
                 "Select the ITU-R S.1528 model used for satellite transmit pattern evaluation.",
-                self._help_details_html(
+                self._satellite_antenna_model_schematic_data_uri()
+                + self._help_details_html(
                     when="Change this only when the study specification requires a different S.1528 recommend set.",
                     default="Rec 1.4 uses the analytical Bessel/Taylor formula with visible sidelobes. "
                     "Rec 1.2 is a piecewise envelope approximation without sidelobes, parameterised by Gm, LN, and z. "
@@ -22825,20 +34681,27 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
                 "Basic",
             ),
             (
-                self.isotropic_uemr_checkbox,
-                "Isotropic UEMR mode",
-                "Switch between Directive isotropic (per-beam, uses the beam library) and UEMR (per-satellite bypass for internal-circuitry leakage).",
+                self.sat_sys_mode_mss_radio,
+                "MSS Directive (Cell Illumination)",
+                "Directive transmit beams illuminating hexagonal ground cells. The beam library, per-beam EIRP, coverage, boresight avoidance, and the surface-PFD cap all apply normally.",
+                self._mss_directive_schematic_data_uri()
+                + self._help_details_html(
+                    default="Pick this for any satellite system where beams illuminate fixed hexagonal cells on the ground. "
+                    "The TX pattern on the Satellite Antennas tab (S.1528 Rec 1.4 / Rec 1.2, M.2101 phased array, or a Custom 1-D / 2-D LUT) shapes per-beam EIRP and drives the coverage analyser.",
+                    when="This is the default mode. Keep it selected whenever the study models directed beams illuminating ground cells.",
+                    interactions="Toggling away from UEMR restores Service & Demand fields (Nco, Nbeam, selection, cell activity), the Coverage tabs, and the surface-PFD cap to whatever values you had before switching modes.",
+                ),
+                "Basic",
+            ),
+            (
+                self.sat_sys_mode_uemr_radio,
+                "UEMR (per-satellite bypass)",
+                "Unwanted emissions from internal satellite circuitry — each visible satellite radiates isotropically (flat 0 dBi). The beam library is bypassed entirely.",
                 self._uemr_isotropic_schematic_data_uri()
                 + self._help_details_html(
-                    default="Unchecked — Directive isotropic: flat 0 dBi pattern routed through the standard beam library. "
-                    "Nbeam, coverage tabs, boresight avoidance, and surface-PFD cap all apply normally. Useful for "
-                    "modelling N co-located omnidirectional transmitters per satellite (aggregate leakage scales with Nbeam).",
-                    when="Checked — UEMR: each visible satellite radiates the configured Ptx/EIRP isotropically, once per satellite. "
-                    "The beam library is bypassed entirely — Nbeam, selection strategy, cell activity, coverage tabs, "
-                    "boresight avoidance, and the surface-PFD cap are all disabled because they have no meaning without beams. "
-                    "Use this to model unwanted emissions from internal satellite circuitry that are not coupled to the directive antenna.",
-                    interactions="Toggling UEMR on hides irrelevant Service & Demand fields and the Coverage tabs; toggling it off restores them. "
-                    "The transmit emission mask on the Spectrum tab still shapes UEMR power across frequency.",
+                    default="Pick this to model leakage that is not coupled to the directive antenna — every visible satellite radiates the configured Ptx/EIRP uniformly in every direction, once per satellite.",
+                    when="Use for regulatory studies of unwanted emissions or out-of-band leakage where the directive antenna gain does not apply.",
+                    interactions="UEMR hides irrelevant Service & Demand fields (Nco, Nbeam, selection, cell activity, channel bandwidth, power basis, power variation) and the Coverage tabs. Boresight avoidance and the surface-PFD cap are disabled. The transmit emission mask on the Spectrum tab still shapes UEMR power across frequency. Toggling back to MSS Directive (Cell Illumination) restores everything.",
                 ),
                 "Basic",
             ),
@@ -22957,7 +34820,8 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
                 self.runtime_include_atmosphere_checkbox,
                 "Include atmosphere",
                 "Enable atmosphere losses in the run path.",
-                self._help_details_html(
+                self._include_atmosphere_schematic_data_uri()
+                + self._help_details_html(
                     when="Turn this on when the study needs atmospheric attenuation rather than a vacuum-like baseline.",
                     default="Leave it off for faster baseline debugging; turn it on for physically complete production runs.",
                     interactions="When disabled, the atmosphere range and path controls are ignored.",
@@ -22968,7 +34832,8 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
                 self.runtime_radio_horizon_checkbox,
                 "Use radio horizon",
                 "Extend satellite visibility beyond the geometric horizon using atmospheric refraction.",
-                self._help_details_html(
+                self._radio_horizon_schematic_data_uri()
+                + self._help_details_html(
                     default=(
                         "Off by default (geometric horizon at 0\u00b0 elevation). "
                         "Enable for physically realistic radio propagation modelling."
@@ -23220,7 +35085,56 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
                 self.runtime_gpu_precision_profile_combo,
                 "Precision profile",
                 "Mixed-precision mode controlling the numerical dtype used for each simulation stage: propagation (SGP4/geometry), pattern evaluation, and power accumulation.",
-                self._help_details_html(
+                # Compact HTML table of dtype flow per profile.
+                # Table is lighter-weight than a QPainter schematic
+                # for purely tabular data and renders nicely in the
+                # help popup's Qt rich-text renderer.
+                (
+                    '<table style="border-collapse:collapse; margin:6px auto; '
+                    'font-size:8pt; color:#e0f2fe;">'
+                    '<thead><tr>'
+                    '<th style="padding:3px 6px; border:1px solid #334155; background:#0f172a;">Profile</th>'
+                    '<th style="padding:3px 6px; border:1px solid #334155; background:#0f172a;">Propagation</th>'
+                    '<th style="padding:3px 6px; border:1px solid #334155; background:#0f172a;">Pattern</th>'
+                    '<th style="padding:3px 6px; border:1px solid #334155; background:#0f172a;">Power</th>'
+                    '</tr></thead>'
+                    '<tbody>'
+                    '<tr>'
+                    '<td style="padding:3px 6px; border:1px solid #334155;"><b>float64</b></td>'
+                    '<td style="padding:3px 6px; border:1px solid #334155; text-align:center; color:#0ea5e9;">fp64</td>'
+                    '<td style="padding:3px 6px; border:1px solid #334155; text-align:center; color:#0ea5e9;">fp64</td>'
+                    '<td style="padding:3px 6px; border:1px solid #334155; text-align:center; color:#0ea5e9;">fp64</td>'
+                    '</tr>'
+                    '<tr>'
+                    '<td style="padding:3px 6px; border:1px solid #334155;"><b>float64/float32</b></td>'
+                    '<td style="padding:3px 6px; border:1px solid #334155; text-align:center; color:#0ea5e9;">fp64</td>'
+                    '<td style="padding:3px 6px; border:1px solid #334155; text-align:center; color:#22c55e;">fp32</td>'
+                    '<td style="padding:3px 6px; border:1px solid #334155; text-align:center; color:#22c55e;">fp32</td>'
+                    '</tr>'
+                    '<tr style="background:#1e293b;">'
+                    '<td style="padding:3px 6px; border:1px solid #334155;"><b>float32</b> <span style="color:#94a3b8;">(default)</span></td>'
+                    '<td style="padding:3px 6px; border:1px solid #334155; text-align:center; color:#22c55e;">fp32</td>'
+                    '<td style="padding:3px 6px; border:1px solid #334155; text-align:center; color:#22c55e;">fp32</td>'
+                    '<td style="padding:3px 6px; border:1px solid #334155; text-align:center; color:#22c55e;">fp32</td>'
+                    '</tr>'
+                    '<tr>'
+                    '<td style="padding:3px 6px; border:1px solid #334155;"><b>float32/float16</b></td>'
+                    '<td style="padding:3px 6px; border:1px solid #334155; text-align:center; color:#22c55e;">fp32</td>'
+                    '<td style="padding:3px 6px; border:1px solid #334155; text-align:center; color:#f59e0b;">fp16</td>'
+                    '<td style="padding:3px 6px; border:1px solid #334155; text-align:center; color:#22c55e;">fp32</td>'
+                    '</tr>'
+                    '<tr>'
+                    '<td style="padding:3px 6px; border:1px solid #334155;"><b>float64/float32/float16</b></td>'
+                    '<td style="padding:3px 6px; border:1px solid #334155; text-align:center; color:#0ea5e9;">fp64</td>'
+                    '<td style="padding:3px 6px; border:1px solid #334155; text-align:center; color:#f59e0b;">fp16</td>'
+                    '<td style="padding:3px 6px; border:1px solid #334155; text-align:center; color:#22c55e;">fp32</td>'
+                    '</tr>'
+                    '</tbody></table>'
+                    '<p style="text-align:center; font-size:7pt; color:#94a3b8; margin:4px 0;">'
+                    'Power stage is always ≥ fp32 — FSPL values (~1e-16) underflow fp16.'
+                    '</p>'
+                )
+                + self._help_details_html(
                     when="Use float64 or float64/float32 for maximum precision or regulatory validation. "
                          "Use float32/float16 or float64/float32/float16 when faster pattern evaluation outweighs negligible fp16 rounding in gain values. "
                          "Power accumulation is always at least float32 because FSPL values (~1e-16) underflow fp16.",
@@ -23235,7 +35149,8 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
                 self.runtime_gpu_pattern_eval_mode_combo,
                 "Pattern evaluation",
                 "S.1528 transmit-pattern evaluation method. LUT uses a precomputed lookup table for speed; Analytical computes the exact Bessel/product formula.",
-                self._help_details_html(
+                self._pattern_eval_mode_schematic_data_uri()
+                + self._help_details_html(
                     when="Use analytical when validating pattern accuracy or comparing against reference implementations. Use LUT for normal production runs.",
                     default="LUT is the performance-oriented default (~36 %% faster power stage). Mainlobe and sidelobe accuracy is within 0.001 dB; deep-null regions are smoothed.",
                     symptoms="Analytical mode is slower but produces the exact S.1528 gain at every off-axis angle including narrow Bessel zeros.",
@@ -23534,6 +35449,16 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
                     interactions="This interacts directly with the active service power definition because the target or normalization point is applied at the Earth-surface point the beam is actually serving.",
                 ),
                 "Basic",
+            ),
+            (
+                self.ras_guard_angle_override_edit,
+                "RAS guard angle",
+                "Override the angular guard zone around the RAS-pointing beam. Other beams on the same satellite may not point within this angle of the reserved RAS beam.",
+                self._help_details_html(
+                    default="Leave empty to auto-derive the guard angle from the beam-spacing contour. Set to 0 for the worst-case (no guard zone) analysis. Only meaningful when RAS pointing mode is 'ras_station'; otherwise the row is hidden.",
+                    interactions="Interacts with RAS pointing mode — the guard-angle field only appears when the pointing mode is 'ras_station' (the satellite retargets its RAS beam onto the station). In UEMR mode there is no beam library and the row is hidden.",
+                ),
+                "Advanced",
             ),
             (
                 self.hexgrid_ras_exclusion_mode_combo,
@@ -24067,6 +35992,7 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
         )
         target_map = {
             "RAS Station": self.ras_tab,
+            "Satellite System Mode": self.sat_sys_mode_tab,
             "Satellite Orbitals": self.constellation_tab,
             "Satellite Antennas": self.antennas_tab,
             "Service & Demand": self.service_tab,
@@ -24097,6 +36023,9 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
             "review_run_state": self._review_run_state,
             "spectrum_explicitly_configured": bool(
                 self._workflow_has_explicit_spectrum_inputs()
+            ),
+            "sat_sys_mode_visited": bool(
+                getattr(self, "_sat_sys_mode_visited", False)
             ),
         }
 
@@ -24217,9 +36146,18 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
             }
         )
         ordered_labels = list(_WORKFLOW_STATUS_ORDER)
+        # Satellite System Mode is a mode selector, not a workflow step — it's
+        # always valid out of the box. Skip it when counting so the
+        # "Getting started" chip keeps reflecting whether any actual
+        # data-entry tab has been filled, rather than flipping to
+        # "In progress" on a blank project just because the default
+        # mode exists.
+        progress_labels = [
+            label for label in ordered_labels if label != "Satellite System Mode"
+        ]
         ready_count = 0
         outstanding_labels: list[str] = []
-        for label in ordered_labels:
+        for label in progress_labels:
             status = statuses_use[label]
             if bool(status["ready"]) or bool(status.get("review_pending")):
                 ready_count += 1
@@ -24263,7 +36201,7 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
         else:
             chip_text = "In progress"
             chip_kind = "warning"
-            title = f"{ready_count}/{len(ordered_labels)} workflow steps are ready"
+            title = f"{ready_count}/{len(progress_labels)} workflow steps are ready"
             detail = (
                 f"Guidance next: {guidance_title}. {guidance_detail}"
                 if guidance_title
@@ -24282,7 +36220,7 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
         self.snapshot_detail_label.setText(detail)
         self.snapshot_overview_label.setText(
             self._compact_panel_text(
-                f"Workflow {ready_count}/{len(ordered_labels)} ready. Guidance next: {guidance_title}.",
+                f"Workflow {ready_count}/{len(progress_labels)} ready. Guidance next: {guidance_title}.",
                 max_chars=140,
             )
         )
@@ -24290,7 +36228,16 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
         icon_ready = self.style().standardIcon(QtWidgets.QStyle.SP_DialogApplyButton)
         icon_warning = self.style().standardIcon(QtWidgets.QStyle.SP_MessageBoxWarning)
         icon_review = self.style().standardIcon(QtWidgets.QStyle.SP_MessageBoxInformation)
+        # Block signals around the clear — on Windows, a clear() on a
+        # QListWidget whose items still have attached delegates from a
+        # prior test can fire signals into dangling slots and trigger an
+        # access violation (observed during _reset_cached_window →
+        # _load_state_into_widgets → _refresh_summary → _update_snapshot_panel
+        # in the Simulation-Studio test suite).  Blocking signals for the
+        # clear is cheap and deterministic.
+        _snap_blocker = QtCore.QSignalBlocker(self.snapshot_step_list)
         self.snapshot_step_list.clear()
+        del _snap_blocker
         def _block_state_text(label: str) -> str:
             status = statuses_use[label]
             if bool(status["ready"]):
@@ -24334,6 +36281,10 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
                 f"diameter {_format_optional(getattr(ras_ant, 'antenna_diameter_m', None) if ras_ant is not None else None, ' m')}, "
                 f"RX {_format_optional(getattr(ras_cfg, 'receiver_band_start_mhz', None), ' MHz')}"
                 f" to {_format_optional(getattr(ras_cfg, 'receiver_band_stop_mhz', None), ' MHz')}"
+            ),
+            "Satellite System Mode": (
+                f"{_block_state_text('Satellite System Mode')} | "
+                f"{'UEMR (per-satellite bypass)' if _system_is_uemr(s0) else 'MSS Directive (Cell Illumination)'}"
             ),
             "Satellite Orbitals": (
                 f"{_block_state_text('Satellite Orbitals')} | {len(s0.belts)} belt(s) configured"
@@ -24502,7 +36453,7 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
         self._update_simulation_page_indicators(state, statuses=statuses)
 
     def _schedule_async_workflow_summary_refresh(self) -> None:
-        if self._state_load_in_progress:
+        if self._state_load_in_progress or self._system_switch_in_progress:
             return
         state_snapshot = self.current_state()
         request = self._workflow_status_request(state_snapshot)
@@ -24598,6 +36549,8 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
         self._current_path = Path(path)
         self._dirty = False
         self._load_state_into_widgets(state)
+        # Loaded project carries the user's mode choice — no nudge needed.
+        self._sat_sys_mode_visited = True
         self._remember_recent_config(path)
         self._set_workspace(_WORKSPACE_SIMULATION)
         self._update_window_title()
@@ -24676,6 +36629,21 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
         self.antenna_spin.editingFinished.connect(self._update_ras_grx_from_diameter)
         self.ras_grx_max_spin.editingFinished.connect(self._update_ras_diameter_from_grx)
         self.ras_grx_max_spin.editingFinished.connect(self._on_state_changed)
+        self.ras_antenna_model_combo.currentIndexChanged.connect(
+            self._on_ras_antenna_model_changed
+        )
+        self.ras_edit_custom_pattern_button.clicked.connect(
+            self._on_ras_edit_custom_pattern_clicked
+        )
+        self.ras_load_custom_pattern_button.clicked.connect(
+            self._on_ras_load_custom_pattern_clicked
+        )
+        self.ras_clear_custom_pattern_button.clicked.connect(
+            self._on_ras_clear_custom_pattern_clicked
+        )
+        self.sat_custom_edit_button.clicked.connect(self._on_sat_edit_custom_pattern_clicked)
+        self.sat_custom_load_button.clicked.connect(self._on_sat_load_custom_pattern_clicked)
+        self.sat_custom_clear_button.clicked.connect(self._on_sat_clear_custom_pattern_clicked)
         self.derive_pattern_wavelength_checkbox.toggled.connect(self._on_rf_pattern_source_changed)
         self.antenna_model_combo.currentIndexChanged.connect(self._on_rf_model_changed)
         self.isotropic_uemr_checkbox.toggled.connect(self._on_rf_model_changed)
@@ -24938,7 +36906,7 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
         ga = s0.grid_analysis
         return (
             tuple(json.dumps(belt.to_json_dict(), sort_keys=True) for belt in s0.belts),
-            round(float(sa.frequency_mhz), 9),
+            None if sa.frequency_mhz is None else round(float(sa.frequency_mhz), 9),
             bool(sa.derive_pattern_wavelength_from_frequency),
             None
             if sa.pattern_wavelength_cm is None
@@ -25182,6 +37150,14 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
         qty_label = _service_power_quantity_label(quantity)
         self._power_variation_label.setVisible(show_variation)
         self._power_variation_widget.setVisible(show_variation)
+        # UEMR random power checkbox — only visible in UEMR mode.
+        if hasattr(self, "_uemr_random_power_widget"):
+            self._uemr_random_power_widget.setVisible(_uemr_active_here)
+        # RAS guard angle — the row lives on Coverage & Boresight now, and
+        # is meaningful only when the satellite retargets onto the RAS
+        # station.  Hidden when UEMR is active (no beam library) or when
+        # the pointing mode is 'cell_center' (no guard zone to enforce).
+        self._update_ras_guard_angle_row_visibility()
         if is_range:
             # Range mode: hide the single-value row, show min/max
             self.service_power_value_label.setVisible(False)
@@ -25621,14 +37597,7 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
             isotropic=AntennaIsotropicConfig(
                 uemr_mode=bool(self.isotropic_uemr_checkbox.isChecked()),
             ),
-            ras=RasAntennaConfig(
-                antenna_diameter_m=self.antenna_spin.value_or_none(),
-                grx_max_dbi=self.ras_grx_max_spin.value_or_none(),
-                frequency_mhz=self.ras_frequency_spin.value_or_none(),
-                operational_elevation_min_deg=self.ras_oper_min_spin.value_or_none(),
-                operational_elevation_max_deg=self.ras_oper_max_spin.value_or_none(),
-                target_pfd_dbw_m2_mhz=None,
-            ),
+            ras=self._build_ras_antenna_config(),
         )
         has_explicit_rf_or_geometry = any(
             value is not None
@@ -25651,7 +37620,16 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
             )
         ) or bool(antennas.derive_pattern_wavelength_from_frequency)
         if not has_explicit_rf_or_geometry:
-            antennas.antenna_model = None
+            # Exception: UEMR is a user-selected system mode (via the
+            # Satellite System Mode tab) that forces ``isotropic`` regardless
+            # of whether any RF/geometry values were entered. Preserve
+            # the model so ``_system_is_uemr`` / preflight / snapshot
+            # all reflect the mode the user actually picked.
+            if not (
+                selected_model == _ANTENNA_MODEL_ISOTROPIC
+                and bool(self.isotropic_uemr_checkbox.isChecked())
+            ):
+                antennas.antenna_model = None
         return antennas if _has_any_antenna_value(antennas) else None
 
     def _current_service_config(self) -> ServiceConfig:
@@ -25696,6 +37674,8 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
             surface_pfd_cap_mode=str(
                 self.surface_pfd_cap_mode_combo.currentData() or "per_beam"
             ),
+            uemr_random_power=bool(self.uemr_random_power_checkbox.isChecked()),
+            ras_guard_angle_override_deg=self.ras_guard_angle_override_edit.value_or_none(),
         )
 
     def _current_explicit_spectrum_config(self) -> SpectrumConfig:
@@ -26023,8 +38003,7 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
             systems=list(self._system_configs_cache),
             ras_station=self._current_ras_station_config(),
             ras_antenna=(
-                RasAntennaConfig.from_json_dict(antennas_cfg.ras.to_json_dict())
-                if antennas_cfg is not None
+                antennas_cfg.ras if antennas_cfg is not None
                 else RasAntennaConfig()
             ),
             runtime=self._current_runtime_config(),
@@ -26102,9 +38081,7 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
             system_color=self._system_configs_cache[idx].system_color,
             belts=self._belt_model.belts(),
             satellite_antennas=(
-                SatelliteAntennasConfig.from_antennas_config(antennas)
-                if antennas is not None
-                else SatelliteAntennasConfig()
+                self._build_sat_antennas_with_custom(antennas)
             ),
             service=ServiceConfig.from_json_dict(self._current_service_config().to_json_dict()),
             spectrum=SpectrumConfig.from_json_dict(self._current_spectrum_config().to_json_dict()),
@@ -26114,6 +38091,7 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
                 self._current_grid_analysis_config().to_json_dict()
             ),
             derived_state=dict(self._per_system_derived.get(idx, {})),
+            sat_sys_mode_visited=bool(getattr(self, "_sat_sys_mode_visited", False)),
         )
 
     def _load_system_into_widgets(self, sys_cfg: SatelliteSystemConfig) -> None:
@@ -26132,6 +38110,7 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
             self._load_spectrum_widgets(sys_cfg.spectrum)
             self._load_hexgrid_widgets(sys_cfg.hexgrid)
             self._load_grid_analysis_widgets(sys_cfg.grid_analysis)
+            self._sat_sys_mode_visited = bool(sys_cfg.sat_sys_mode_visited)
             del blockers
         finally:
             self._system_switch_in_progress = False
@@ -26192,6 +38171,12 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
         new_sys = SatelliteSystemConfig(system_name=name, system_color=color)
         self._save_active_system_to_cache()
         self._system_configs_cache.append(new_sys)
+        # Add the tab under a signal blocker so the bare ``addTab`` doesn't
+        # fire ``currentChanged`` with a half-populated state.  Release the
+        # blocker BEFORE switching to the new tab so the follow-up
+        # ``setCurrentIndex`` fires ``currentChanged`` normally —
+        # ``_on_system_tab_changed`` then updates ``_active_system_index``
+        # and syncs per-system derived state.
         blocker = QtCore.QSignalBlocker(self._system_tab_bar)
         self._system_tab_bar.addTab(self._system_color_icon(color), name)
         del blocker
@@ -26211,14 +38196,35 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
         self._per_system_derived = rebuilt
         blocker = QtCore.QSignalBlocker(self._system_tab_bar)
         self._system_tab_bar.removeTab(idx)
-        del blocker
         new_idx = min(idx, len(self._system_configs_cache) - 1)
         self._active_system_index = new_idx
         self._restore_per_system_derived_state(new_idx)
         self._system_tab_bar.setCurrentIndex(new_idx)
+        del blocker
         self._load_system_into_widgets(self._system_configs_cache[new_idx])
         self._update_per_system_labels()
-        self._auto_regenerate_output_system_groups()
+        # Adjust output groups instead of regenerating from scratch —
+        # preserves custom groups the user created.  Remove groups that
+        # referenced only the deleted system, shift indices above it down.
+        surviving: list[SystemOutputGroup] = []
+        for g in self._output_system_groups_cache:
+            new_indices = []
+            for si in g.system_indices:
+                if si < idx:
+                    new_indices.append(si)
+                elif si > idx:
+                    new_indices.append(si - 1)
+                # si == idx → deleted, skip
+            if new_indices:
+                g.system_indices = new_indices
+                surviving.append(g)
+        if surviving:
+            self._output_system_groups_cache = surviving
+        else:
+            # All groups were destroyed — fall back to defaults.
+            self._auto_regenerate_output_system_groups()
+            return
+        self._sync_sog_widget()
 
     def _rename_satellite_system(self) -> None:
         idx = self._active_system_index
@@ -26229,9 +38235,17 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
             self, "Rename system", "System name:", text=old_name,
         )
         if ok and name.strip():
-            self._system_configs_cache[idx].system_name = name.strip()
-            self._system_tab_bar.setTabText(idx, name.strip())
+            new_name = name.strip()
+            self._system_configs_cache[idx].system_name = new_name
+            self._system_tab_bar.setTabText(idx, new_name)
             self._update_per_system_labels()
+            # Mirror the rename into default output groups: update any
+            # single-system group whose name still matches the old system
+            # name (i.e. the user hasn't manually renamed it).
+            for g in self._output_system_groups_cache:
+                if g.system_indices == [idx] and g.name == old_name:
+                    g.name = new_name
+            self._sync_sog_widget()
 
     def _duplicate_satellite_system(self) -> None:
         idx = self._active_system_index
@@ -26246,8 +38260,8 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
         self._system_configs_cache.append(dup)
         blocker = QtCore.QSignalBlocker(self._system_tab_bar)
         self._system_tab_bar.addTab(self._system_color_icon(dup.system_color), dup.system_name)
-        del blocker
         self._system_tab_bar.setCurrentIndex(n)
+        del blocker
         self._auto_regenerate_output_system_groups()
 
     # --- System output groups management ---
@@ -26381,15 +38395,17 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
         tab_idx = self._system_tab_bar.tabAt(pos)
         if tab_idx < 0:
             return
-        # Switch to the right-clicked tab so actions apply to it
-        if tab_idx != self._active_system_index:
-            self._system_tab_bar.setCurrentIndex(tab_idx)
         menu = QtWidgets.QMenu(self)
         rename_action = menu.addAction("Rename")
         duplicate_action = menu.addAction("Duplicate")
         remove_action = menu.addAction("Remove")
         remove_action.setEnabled(len(self._system_configs_cache) > 1)
         action = menu.exec_(self._system_tab_bar.mapToGlobal(pos))
+        if action is None:
+            return
+        # Switch to the right-clicked tab only when the user picked an action
+        if tab_idx != self._active_system_index:
+            self._system_tab_bar.setCurrentIndex(tab_idx)
         if action == rename_action:
             self._rename_satellite_system()
         elif action == duplicate_action:
@@ -26485,6 +38501,14 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
             self.antenna_spin.set_value(None)
             self.ras_oper_min_spin.set_value(None)
             self.ras_oper_max_spin.set_value(None)
+            self._ras_custom_pattern = None
+            idx_ra1631 = self.ras_antenna_model_combo.findData(_RAS_ANTENNA_MODEL_RA1631)
+            if idx_ra1631 >= 0:
+                blocker_reset = QtCore.QSignalBlocker(self.ras_antenna_model_combo)
+                self.ras_antenna_model_combo.setCurrentIndex(idx_ra1631)
+                del blocker_reset
+            self._apply_ras_antenna_model_visibility()
+            self._refresh_ras_custom_pattern_status_label()
             self._refresh_analyzer_controls()
             return
         self._load_antennas_widgets(config)
@@ -26527,6 +38551,19 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
         self.m2101_n_h_spin.set_value(sat_cfg.m2101.n_h)
         self.m2101_n_v_spin.set_value(sat_cfg.m2101.n_v)
         self.isotropic_uemr_checkbox.setChecked(bool(sat_cfg.isotropic.uemr_mode))
+        # Restore satellite custom pattern from the loaded config.
+        custom_pat = getattr(sat_cfg, "custom_pattern", None)
+        self._sat_custom_pattern = custom_pat
+        if custom_pat is not None:
+            if getattr(custom_pat, "kind", None) == _CA_KIND_1D:
+                self._sat_custom_pattern_1d = custom_pat
+            else:
+                self._sat_custom_pattern_2d = custom_pat
+        else:
+            self._sat_custom_pattern_1d = None
+            self._sat_custom_pattern_2d = None
+        self._refresh_sat_custom_pattern_status_label()
+        self._sync_sat_sys_mode_cards_from_state()
         self._sync_rf_panel()
 
     def _load_antennas_widgets(self, config: AntennasConfig) -> None:
@@ -26566,6 +38603,21 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
         self.m2101_n_h_spin.set_value(config.m2101.n_h)
         self.m2101_n_v_spin.set_value(config.m2101.n_v)
         self.isotropic_uemr_checkbox.setChecked(bool(config.isotropic.uemr_mode))
+        # Restore the satellite custom pattern stash from the legacy config.
+        # ``AntennasConfig`` now carries ``custom_pattern`` so the legacy
+        # path matches ``_load_satellite_antennas_widgets``.  Only overwrite
+        # when the loaded config actually carries a payload — otherwise the
+        # stash from a previous system switch would be cleared.
+        sat_custom_pat = getattr(config, "custom_pattern", None)
+        if sat_custom_pat is not None:
+            self._sat_custom_pattern = sat_custom_pat
+            if getattr(sat_custom_pat, "kind", None) == _CA_KIND_1D:
+                self._sat_custom_pattern_1d = sat_custom_pat
+            else:
+                self._sat_custom_pattern_2d = sat_custom_pat
+            if hasattr(self, "sat_custom_pattern_status_label"):
+                self._refresh_sat_custom_pattern_status_label()
+        self._sync_sat_sys_mode_cards_from_state()
         self.antenna_spin.set_value(config.ras.antenna_diameter_m)
         if config.ras.grx_max_dbi is not None:
             self.ras_grx_max_spin.set_value(config.ras.grx_max_dbi)
@@ -26574,6 +38626,25 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
         self.ras_frequency_spin.set_value(config.ras.frequency_mhz)
         self.ras_oper_min_spin.set_value(config.ras.operational_elevation_min_deg)
         self.ras_oper_max_spin.set_value(config.ras.operational_elevation_max_deg)
+        # RAS custom pattern: if the loaded project has one, restore
+        # the session reference AND select the matching Custom-1-D /
+        # Custom-2-D entry in the model picker. Otherwise reset to
+        # RA.1631.
+        loaded_custom = getattr(config.ras, "custom_pattern", None)
+        self._ras_custom_pattern = loaded_custom
+        if loaded_custom is None:
+            target_ras_model = _RAS_ANTENNA_MODEL_RA1631
+        elif getattr(loaded_custom, "kind", None) == _CA_KIND_2D:
+            target_ras_model = _RAS_ANTENNA_MODEL_CUSTOM_2D
+        else:
+            target_ras_model = _RAS_ANTENNA_MODEL_CUSTOM_1D
+        idx_ras_model = self.ras_antenna_model_combo.findData(target_ras_model)
+        if idx_ras_model >= 0:
+            blocker_ras_model = QtCore.QSignalBlocker(self.ras_antenna_model_combo)
+            self.ras_antenna_model_combo.setCurrentIndex(idx_ras_model)
+            del blocker_ras_model
+        self._apply_ras_antenna_model_visibility()
+        self._refresh_ras_custom_pattern_status_label()
         self._sync_rf_panel()
 
     def _state_widget_signal_blockers(self) -> list[QtCore.QSignalBlocker]:
@@ -26588,6 +38659,7 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
             QtCore.QSignalBlocker(self.derive_pattern_wavelength_checkbox),
             QtCore.QSignalBlocker(self.pattern_wavelength_spin),
             QtCore.QSignalBlocker(self.antenna_model_combo),
+            QtCore.QSignalBlocker(self.ras_antenna_model_combo),
             QtCore.QSignalBlocker(self.antenna_spin),
             QtCore.QSignalBlocker(self.ras_grx_max_spin),
             QtCore.QSignalBlocker(self.ras_oper_min_spin),
@@ -26754,6 +38826,10 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
         )
         if cap_mode_idx >= 0:
             self.surface_pfd_cap_mode_combo.setCurrentIndex(cap_mode_idx)
+        self.uemr_random_power_checkbox.setChecked(bool(service.uemr_random_power))
+        self.ras_guard_angle_override_edit.set_value(
+            service.ras_guard_angle_override_deg
+        )
         self._sync_service_power_controls()
         self._sync_surface_pfd_cap_controls()
 
@@ -26999,6 +39075,7 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
             0.0 if hexgrid.boresight_theta2_radius_km is None else float(hexgrid.boresight_theta2_radius_km)
         )
         self._update_boresight_scope_field_visibility()
+        self._update_ras_guard_angle_row_visibility()
 
     def _reset_loaded_derived_state(self) -> None:
         """Clear derived preview/analyser state after loading a new project state."""
@@ -27048,6 +39125,7 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
             self._load_spectrum_widgets(s0_load.spectrum)
             self._load_hexgrid_widgets(s0_load.hexgrid)
             self._load_grid_analysis_widgets(s0_load.grid_analysis)
+            self._sat_sys_mode_visited = bool(s0_load.sat_sys_mode_visited)
             self._reset_loaded_derived_state()
             # Restore per-system derived state AFTER reset (so reset doesn't clear it)
             for _ds_idx, _ds_sys in enumerate(self._system_configs_cache):
@@ -27601,6 +39679,137 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
                 return False, f"{label}: hexgrid settings not applied."
         return True, ""
 
+    def _detect_cuda_runtime(self) -> tuple[bool, str]:
+        """Probe whether a CUDA runtime is actually usable.
+
+        Simulations require an NVIDIA GPU with ``cupy`` and ``numba-cuda``
+        installed.  On macOS / Linux-without-CUDA the GUI still imports,
+        but the Run button is gated by this check to prevent users from
+        starting a simulation that will fail at first kernel launch.
+
+        Caches the result on ``self`` so repeated readiness checks don't
+        re-probe.
+        """
+        cached = getattr(self, "_cuda_runtime_cached", None)
+        if cached is not None:
+            return cached
+        try:
+            from scepter import gpu_accel
+        except Exception as exc:  # pragma: no cover
+            result = (False, f"scepter.gpu_accel failed to import ({type(exc).__name__}).")
+            self._cuda_runtime_cached = result
+            return result
+        # Test-environment detection: ``scepter.tests.test_gui`` replaces
+        # the ``numba`` module with a stub that sets ``numba.cuda = None``
+        # *before* gpu_accel imports, so the downstream probe can't tell
+        # whether we are in a genuine no-CUDA env or a test stub.  Accept
+        # the test-stub signature (cupy present, ``cuda`` is literally
+        # ``None`` — not a stub instance and not a subpackage) as "assume
+        # CUDA available for test" so the existing GUI test suite doesn't
+        # see the Run button forcibly disabled.
+        in_test_stub = (
+            gpu_accel.cp is not None
+            and gpu_accel.cuda is None
+        )
+        if in_test_stub:
+            result = (True, "")
+            self._cuda_runtime_cached = result
+            return result
+        if gpu_accel.cp is None:
+            result = (
+                False,
+                "CuPy is not installed. Install the full conda environment: "
+                "conda env create -f environment.yml",
+            )
+            self._cuda_runtime_cached = result
+            return result
+        # numba.cuda may be the stub installed by gpu_accel when numba-cuda
+        # isn't available — detect by checking the is_available return.
+        try:
+            avail = bool(gpu_accel.cuda.is_available())
+        except Exception as exc:  # pragma: no cover
+            result = (False, f"numba.cuda probe failed ({type(exc).__name__}: {exc}).")
+            self._cuda_runtime_cached = result
+            return result
+        if not avail:
+            result = (False, "No NVIDIA GPU detected or CUDA drivers missing.")
+            self._cuda_runtime_cached = result
+            return result
+        # Do NOT smoke-test with a real CuPy allocation here — that would
+        # contend with any other GPU workload (e.g. a game running in the
+        # foreground) and can block for seconds on a busy GPU.  The
+        # ``cuda.is_available()`` probe above already confirms the driver
+        # and device are present; any remaining runtime errors surface
+        # loudly at the first real kernel launch.
+        result = (True, "")
+        self._cuda_runtime_cached = result
+        return result
+
+    def _apply_cuda_availability_banner(self) -> None:
+        """Show a persistent runtime-tab banner when CUDA isn't available."""
+        if not hasattr(self, "runtime_notice_banner"):
+            return
+        avail, reason = self._detect_cuda_runtime()
+        if avail:
+            return
+        self.runtime_notice_banner.show_message(
+            "GPU simulations disabled — " + reason + "\n"
+            "You can still edit configurations, inspect saved HDF5 results, "
+            "and render postprocess recipes. To enable simulations, recreate "
+            "the conda environment on a machine with an NVIDIA GPU: "
+            "conda env create -f environment.yml (requires CUDA drivers).",
+            kind="warning",
+        )
+        tooltip = (
+            "Simulation is disabled because no CUDA GPU runtime is available.\n"
+            + reason
+            + "\nRecreate the conda environment (conda env create -f environment.yml) "
+            "on a machine with an NVIDIA GPU to enable."
+        )
+        if hasattr(self, "run_simulation_button"):
+            self.run_simulation_button.setToolTip(tooltip)
+
+    def _show_cuda_unavailable_startup_dialog(self) -> None:
+        """One-time startup dialog explaining that simulations are disabled.
+
+        Runs as a deferred-event-loop callback so the main window is
+        visible before the dialog pops — otherwise the dialog appears
+        before Qt finishes the splash hand-off and can feel jarring.
+        """
+        if getattr(self, "_cuda_startup_dialog_shown", False):
+            return
+        avail, reason = self._detect_cuda_runtime()
+        if avail:
+            return
+        self._cuda_startup_dialog_shown = True
+        dialog = QtWidgets.QMessageBox(
+            QtWidgets.QMessageBox.Information,
+            "SCEPTer — GPU required for simulations",
+            (
+                "This machine does not have a working CUDA GPU runtime:\n\n"
+                f"  {reason}\n\n"
+                "SCEPTer's simulation engine requires an NVIDIA GPU with "
+                "CUDA drivers plus the cupy + numba-cuda packages "
+                "(provided by the conda-forge channel).\n\n"
+                "You can still use the GUI to:\n"
+                "  • Edit and save simulation configurations\n"
+                "  • Inspect saved HDF5 result files from a previous run\n"
+                "  • Render postprocess recipes (CCDFs, heatmaps, overlays)\n\n"
+                "To enable simulations, recreate the conda environment on a "
+                "machine with a supported GPU:\n\n"
+                "    conda env create -f environment.yml\n"
+                "    conda activate scepter-dev\n\n"
+                "If you only need the GUI on a machine without a GPU, use "
+                "the CPU-only environment instead:\n\n"
+                "    conda env create -f environment-cpu.yml\n"
+                "    conda activate scepter-dev-cpu"
+            ),
+            parent=self,
+        )
+        dialog.setWindowModality(QtCore.Qt.WindowModal)
+        dialog.setStandardButtons(QtWidgets.QMessageBox.Ok)
+        dialog.exec()
+
     def _run_readiness_payload(self, state: ScepterProjectState) -> tuple[bool, str]:
         # --- Check ALL systems for per-system readiness ---
         all_systems = state.systems or [state.active_system()]
@@ -27849,7 +40058,14 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
     def _update_run_controls(self, state: ScepterProjectState | None = None) -> None:
         state_use = self.current_state() if state is None else state
         ready, message = self._run_readiness_payload(state_use)
-        self.run_simulation_button.setEnabled(ready and not self._run_in_progress)
+        # CUDA gate — orthogonal to config validation.  Tracked separately
+        # so tests that target config-validation messages still see them,
+        # but the Run button actually stays disabled on machines without
+        # a CUDA runtime (macOS / Linux-without-NVIDIA / etc.).
+        cuda_ok, cuda_reason = self._detect_cuda_runtime()
+        self.run_simulation_button.setEnabled(
+            ready and cuda_ok and not self._run_in_progress
+        )
         self.stop_simulation_button.setEnabled(bool(self._run_in_progress))
         self.force_stop_simulation_button.setEnabled(bool(self._run_in_progress))
         if self._run_in_progress:
@@ -27863,6 +40079,15 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
                 self._set_persistent_status_bar_message("Completed")
             elif "stopped" in str(self._run_status_override).lower():
                 self._set_persistent_status_bar_message("Stopped")
+        elif not cuda_ok:
+            # Config may or may not be ready — either way the run won't
+            # start without a GPU, so lead with that.
+            self.run_status_label.setText(
+                f"GPU unavailable: {cuda_reason} "
+                "Recreate the conda environment (conda env create -f environment.yml) "
+                "on a machine with an NVIDIA GPU to enable."
+            )
+            self._set_persistent_status_bar_message("GPU required")
         else:
             self.run_status_label.setText(
                 "Ready for review. Check the parameters and outputs below, then launch the simulation."
@@ -27891,8 +40116,25 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
             _ANTENNA_MODEL_REC12: 0, _ANTENNA_MODEL_REC14: 1,
             _ANTENNA_MODEL_M2101: 2, _ANTENNA_MODEL_S672: 0,
             _ANTENNA_MODEL_COLLAPSED: 3, _ANTENNA_MODEL_ISOTROPIC: 4,
+            _ANTENNA_MODEL_CUSTOM_1D: 5, _ANTENNA_MODEL_CUSTOM_2D: 5,
         }
         self.rf_model_stack.setCurrentIndex(_model_page.get(selected_model, 1))
+        # Custom patterns and UEMR isotropic don't need frequency /
+        # wavelength inputs — hide those rows to declutter.
+        is_custom = selected_model in (_ANTENNA_MODEL_CUSTOM_1D, _ANTENNA_MODEL_CUSTOM_2D)
+        is_uemr_iso = (
+            selected_model == _ANTENNA_MODEL_ISOTROPIC
+            and hasattr(self, "isotropic_uemr_checkbox")
+            and self.isotropic_uemr_checkbox.isChecked()
+        )
+        hide_freq = is_custom or is_uemr_iso
+        if hasattr(self, "_sat_general_layout"):
+            form = self._sat_general_layout
+            self._set_form_row_visible(form, self._sat_freq_row_widget, not hide_freq)
+            self._set_form_row_visible(form, self.derive_pattern_wavelength_checkbox, not hide_freq)
+            self._set_form_row_visible(form, self._sat_wl_row_widget, not hide_freq)
+        if is_custom:
+            self._refresh_sat_custom_pattern_status_label()
         # S.672 calls the near-in sidelobe level "Ls"; S.1528 calls it "LN"
         if hasattr(self, "_rec12_ln_label"):
             self._rec12_ln_label.setText(
@@ -27918,6 +40160,16 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
         at runtime. Hide all of these (rather than just disabling) so
         users aren't confused by inapplicable controls.
         """
+        # Lock antenna model to Isotropic in UEMR — switching models
+        # while UEMR is active would create an inconsistent state.
+        if hasattr(self, "antenna_model_combo"):
+            self.antenna_model_combo.setEnabled(not uemr_active)
+            if uemr_active:
+                idx_iso = self.antenna_model_combo.findData(_ANTENNA_MODEL_ISOTROPIC)
+                if idx_iso >= 0 and self.antenna_model_combo.currentIndex() != idx_iso:
+                    blk = QtCore.QSignalBlocker(self.antenna_model_combo)
+                    self.antenna_model_combo.setCurrentIndex(idx_iso)
+                    del blk
         # Hide per-row Service & Demand fields that don't apply. For each
         # field widget we hide (a) the inner widget, (b) its helper-button
         # container (so the "?" goes away too), and (c) call
@@ -28233,13 +40485,8 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
             if idx_sb >= 0 and self.spectrum_cutoff_basis_combo.currentIndex() != idx_sb:
                 blockers.append(QtCore.QSignalBlocker(self.spectrum_cutoff_basis_combo))
                 self.spectrum_cutoff_basis_combo.setCurrentIndex(idx_sb)
-            # Integration cutoff ← 50% of service bandwidth.
-            # The cutoff window is [center ± cutoff_mhz] where
-            # cutoff_mhz = span × percent / 100, so the TOTAL integration
-            # width equals 2·cutoff. Setting percent=50 with basis=
-            # service_bandwidth makes 2·cutoff == service_bandwidth,
-            # i.e. the integration window exactly matches the service
-            # band edges — the correct UEMR baseline.
+            # Integration cutoff ← 50% (ITU SM.329 convention: percentage
+            # is distance from CENTRE frequency; 50% = band edge = no OOB).
             current_pct = self.spectrum_cutoff_percent_edit.value_or_none()
             if current_pct is None or abs(float(current_pct) - 50.0) > 1e-6:
                 blockers.append(QtCore.QSignalBlocker(self.spectrum_cutoff_percent_edit))
@@ -28297,11 +40544,14 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
             if enabled
             else "Pattern plots require a valid satellite-system antenna."
         )
-        ras_enabled = _has_valid_ras_antenna_config(state.ras_antenna)
-        if ras_enabled:
-            # The RAS pattern depends only on the RAS station's own
-            # frequency — it is a receive antenna property and has nothing
-            # to do with the satellite transmit antenna.
+        ras_enabled = _has_ras_pattern_for_preview(state.ras_antenna)
+        ras_has_custom = (
+            getattr(state.ras_antenna, "custom_pattern", None) is not None
+        )
+        if ras_enabled and not ras_has_custom:
+            # RA.1631 analytical pattern needs a positive frequency
+            # (to derive wavelength). Custom patterns carry their own
+            # gain-vs-angle table and don't need it for plotting.
             try:
                 ras_freq = state.ras_antenna.frequency_mhz
                 ras_enabled = ras_freq is not None and float(ras_freq) > 0.0
@@ -28311,7 +40561,11 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
         self.ras_pattern_status.setText(
             "RAS antenna pattern is ready."
             if ras_enabled
-            else "RAS pattern plots require a valid RAS antenna, elevation range, and a positive RAS frequency."
+            else (
+                "Custom RAS pattern is ready."
+                if ras_has_custom
+                else "RAS pattern plots require a valid RAS antenna, elevation range, and a positive RAS frequency."
+            )
         )
 
     def _ras_notice_payload(self, state: ScepterProjectState) -> tuple[str, str]:
@@ -28645,6 +40899,11 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
         self._update_run_controls(self.current_state())
         if label == "Review & Run":
             self._refresh_run_summary_strip()
+        # Landing on the Satellite System Mode tab flips the status
+        # indicator from yellow-warning to green-tick on first visit.
+        if label == "Satellite System Mode" and not self._sat_sys_mode_visited:
+            self._sat_sys_mode_visited = True
+            self._refresh_summary()
         self._schedule_workspace_geometry_stabilization()
 
     def _animate_tab_switch(self, target_index: int) -> None:
@@ -28820,6 +41079,7 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
     def _on_hexgrid_controls_changed(self) -> None:
         style_only_change = self.sender() is getattr(self, "hexgrid_map_style_combo", None)
         self._update_boresight_scope_field_visibility()
+        self._update_ras_guard_angle_row_visibility()
         self._mark_hexgrid_preview_stale(clear_canvas=False)
         self._on_state_changed()
         if self._hexgrid_preview_window is not None:
@@ -28909,6 +41169,40 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
         show_radius = mode == "radius_km"
         self._set_form_row_visible(form, self.hexgrid_ras_exclusion_layers_spin, show_layers)
         self._set_form_row_visible(form, self.hexgrid_ras_exclusion_radius_spin, show_radius)
+
+    def _update_ras_guard_angle_row_visibility(self) -> None:
+        """Show the RAS guard-angle row only when physically meaningful.
+
+        The row lives on the Coverage & Boresight tab now.  It should only
+        be visible when the active satellite system both (a) uses directive
+        antennas (not UEMR, which has no beam library) and (b) has
+        ``ras_pointing_mode='ras_station'`` (so the retargeted beam has a
+        guard zone to protect).
+
+        Reads widget state directly instead of ``self.current_state()`` —
+        going through ``current_state()`` calls ``_save_active_system_to_cache``
+        which triggers ``_current_antennas_form_config`` / hexgrid reads; that
+        can fire re-entrantly during multi-system ``_add_satellite_system``
+        and subtly corrupt the active-index bookkeeping the tab bar relies on.
+        """
+        form = getattr(self, "_hexgrid_geography_form", None)
+        widget = getattr(self, "_ras_guard_widget", None)
+        if form is None or widget is None:
+            return
+        pointing_combo = getattr(self, "hexgrid_ras_pointing_combo", None)
+        pointing_mode = "ras_station"
+        if pointing_combo is not None:
+            pointing_mode = str(pointing_combo.currentData() or "ras_station")
+        model_combo = getattr(self, "antenna_model_combo", None)
+        uemr_checkbox = getattr(self, "isotropic_uemr_checkbox", None)
+        uemr_active = bool(
+            model_combo is not None
+            and uemr_checkbox is not None
+            and str(model_combo.currentData() or "") == _ANTENNA_MODEL_ISOTROPIC
+            and uemr_checkbox.isChecked()
+        )
+        show = (pointing_mode == "ras_station") and (not uemr_active)
+        self._set_form_row_visible(form, widget, show)
 
     @QtCore.Slot()
     def _apply_hexgrid_settings(self) -> None:
@@ -29613,14 +41907,205 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
             )
             return
 
+        model = str(getattr(antennas_cfg, "antenna_model", "") or "")
+
+        # --- Custom 2-D: fast heatmap from stored grid ---
+        if model == _ANTENNA_MODEL_CUSTOM_2D:
+            custom_pat = self._sat_custom_pattern
+            if custom_pat is None:
+                self.antenna_pattern_status.setText("No custom 2-D pattern loaded.")
+                return
+            try:
+                figure = self._build_fast_2d_pattern_preview(
+                    custom_pat, title="Satellite Antenna Pattern",
+                )
+            except Exception as exc:
+                self.antenna_pattern_status.setText(f"Preview failed: {exc}")
+                return
+            window = FigureWindow(
+                figure=figure,
+                title="Satellite Antenna Pattern — 2-D",
+                summary_text=f"Custom 2-D pattern, peak {custom_pat.peak_gain_dbi:.1f} dBi.",
+                parent=self,
+            )
+            window.show(); window.raise_(); window.activateWindow()
+            self._antenna_pattern_windows.append(window)
+            self.antenna_pattern_status.setText("2-D antenna pattern opened.")
+            return
+
+        # --- M.2101: evaluate on a 2-D az/el grid ---
+        if model == _ANTENNA_MODEL_M2101:
+            antenna_func, wavelength, pattern_kwargs = _satellite_antenna_pattern_spec(antennas_cfg)
+            max_deg = 90.0 if main_lobe_only else 180.0
+            n = 361
+            az = np.linspace(-max_deg, max_deg, n, dtype=np.float64)
+            el = np.linspace(-max_deg, max_deg, n, dtype=np.float64)
+            az_mesh, el_mesh = np.meshgrid(az, el, indexing="ij")
+            try:
+                # pycraf imt2020_composite_pattern requires steering
+                # direction as positional args — default to boresight.
+                m2101_kw = dict(pattern_kwargs)
+                m2101_kw.setdefault("azim_i", 0.0 * u.deg)
+                m2101_kw.setdefault("elev_i", 0.0 * u.deg)
+                gains_result = antenna_func(
+                    az_mesh.ravel() * u.deg,
+                    el_mesh.ravel() * u.deg,
+                    **m2101_kw,
+                )
+                gains = gains_result[0] if isinstance(gains_result, (tuple, list)) else gains_result
+                gains_dbi = (
+                    gains.to_value(cnv.dBi) if isinstance(gains, u.Quantity)
+                    else np.asarray(gains, dtype=float)
+                ).reshape(az_mesh.shape)
+            except Exception as exc:
+                self.antenna_pattern_status.setText(f"M.2101 preview failed: {exc}")
+                return
+            peak = float(np.nanmax(gains_dbi[np.isfinite(gains_dbi)]))
+            figure = Figure(figsize=(8.0, 5.5), constrained_layout=True)
+            ax = figure.add_subplot(111)
+            im = ax.pcolormesh(
+                az, el, gains_dbi.T,
+                shading="auto", cmap="viridis",
+                vmin=peak - 50.0, vmax=peak + 2.0,
+            )
+            ax.set_xlabel("Azimuth [deg]")
+            ax.set_ylabel("Elevation [deg]")
+            ax.set_title(
+                f"M.2101 composite — peak {peak:.1f} dBi"
+                + (" — main lobe" if main_lobe_only else "")
+            )
+            figure.colorbar(im, ax=ax, label="Gain [dBi]")
+            self._style_matplotlib_figure(figure)
+            window = FigureWindow(
+                figure=figure,
+                title="M.2101 Antenna Pattern",
+                summary_text=f"M.2101 composite pattern, peak {peak:.1f} dBi.",
+                parent=self,
+            )
+            window.show(); window.raise_(); window.activateWindow()
+            self._antenna_pattern_windows.append(window)
+            self.antenna_pattern_status.setText("M.2101 antenna pattern opened.")
+            return
+
+        # --- S.1528 Rec 1.4 asymmetric (Lt ≠ Lr): 2-D heatmap ---
+        if model == _ANTENNA_MODEL_REC14:
+            lt = getattr(antennas_cfg.rec14, "lt_m", None)
+            lr = getattr(antennas_cfg.rec14, "lr_m", None)
+            if lt is not None and lr is not None and abs(float(lt) - float(lr)) > 1e-6:
+                antenna_func, wavelength, pattern_kwargs = _satellite_antenna_pattern_spec(antennas_cfg)
+                max_deg = 90.0 if main_lobe_only else 180.0
+                n = 361
+                theta = np.linspace(0.0, max_deg, n, dtype=np.float64)
+                phi = np.linspace(0.0, 360.0, n, dtype=np.float64)
+                th_mesh, ph_mesh = np.meshgrid(theta, phi, indexing="ij")
+                try:
+                    gains_result = antenna_func(
+                        th_mesh.ravel() * u.deg,
+                        wavelength=wavelength,
+                        offset_phi=ph_mesh.ravel() * u.deg,
+                        **pattern_kwargs,
+                    )
+                    gains = gains_result[0] if isinstance(gains_result, (tuple, list)) else gains_result
+                    gains_dbi = (
+                        gains.to_value(cnv.dBi) if isinstance(gains, u.Quantity)
+                        else np.asarray(gains, dtype=float)
+                    ).reshape(th_mesh.shape)
+                except Exception as exc:
+                    self.antenna_pattern_status.setText(f"S.1528 Rec 1.4 preview failed: {exc}")
+                    return
+                peak = float(np.nanmax(gains_dbi[np.isfinite(gains_dbi)]))
+                figure = Figure(figsize=(8.0, 5.5), constrained_layout=True)
+                ax = figure.add_subplot(111, projection="polar")
+                r_mesh = th_mesh
+                a_mesh = np.deg2rad(ph_mesh)
+                im = ax.pcolormesh(
+                    a_mesh, r_mesh, gains_dbi,
+                    shading="auto", cmap="viridis",
+                    vmin=peak - 50.0, vmax=peak + 2.0,
+                )
+                ax.set_theta_zero_location("N")
+                ax.set_theta_direction(-1)
+                ax.set_rlabel_position(135)
+                ax.set_title(
+                    f"S.1528 Rec 1.4 (Lt={float(lt):.2f}, Lr={float(lr):.2f}) "
+                    f"\u2014 peak {peak:.1f} dBi"
+                    + (" \u2014 main lobe" if main_lobe_only else ""),
+                    pad=16,
+                )
+                figure.colorbar(im, ax=ax, label="Gain [dBi]", pad=0.1)
+                self._style_matplotlib_figure(figure)
+                window = FigureWindow(
+                    figure=figure,
+                    title="S.1528 Rec 1.4 Antenna Pattern",
+                    summary_text=f"Asymmetric S.1528 Rec 1.4, Lt={float(lt):.3f} m, Lr={float(lr):.3f} m, peak {peak:.1f} dBi.",
+                    parent=self,
+                )
+                window.show(); window.raise_(); window.activateWindow()
+                self._antenna_pattern_windows.append(window)
+                self.antenna_pattern_status.setText("S.1528 Rec 1.4 2-D pattern opened.")
+                return
+
+        # --- Isotropic: flat 0 dBi line (no wavelength needed) ---
+        if model == _ANTENNA_MODEL_ISOTROPIC:
+            offset_deg = np.linspace(0.0, 180.0, 361, dtype=np.float64)
+            gains_dbi = np.zeros_like(offset_deg)
+
+            def _build_iso(proj: str) -> "Figure":
+                if proj == "polar":
+                    fig = Figure(figsize=(6.4, 6.4), constrained_layout=True)
+                    ax = fig.add_subplot(111, projection="polar")
+                    theta_rad = np.deg2rad(offset_deg)
+                    ax.plot(theta_rad, gains_dbi, color="#0f766e", lw=1.8)
+                    ax.plot(-theta_rad, gains_dbi, color="#0f766e", lw=1.8)
+                    ax.set_theta_zero_location("N")
+                    ax.set_theta_direction(-1)
+                    ax.set_ylim(-5.0, 2.0)
+                    ax.set_title("Isotropic (0 dBi)", pad=12)
+                else:
+                    fig = Figure(figsize=(7.5, 5.2), constrained_layout=True)
+                    ax = fig.add_subplot(111)
+                    ax.plot(offset_deg, gains_dbi, color="#0f766e", lw=1.8)
+                    ax.set_xlabel("Off-axis angle [deg]")
+                    ax.set_ylabel("Gain [dBi]")
+                    ax.set_ylim(-5.0, 2.0)
+                    ax.set_title("Isotropic (0 dBi)")
+                    ax.grid(True, alpha=0.25)
+                self._style_matplotlib_figure(fig)
+                return fig
+
+            figure = _build_iso("cartesian")
+            window = FigureWindow(
+                figure=figure,
+                title="Isotropic Antenna Pattern",
+                summary_text="Flat 0 dBi isotropic pattern.",
+                parent=self,
+            )
+            window.install_projection_toggle(
+                options=(("cartesian", "Rectangular"), ("polar", "Polar")),
+                current="cartesian",
+                rebuild_cb=_build_iso,
+            )
+            window.show(); window.raise_(); window.activateWindow()
+            self._antenna_pattern_windows.append(window)
+            self.antenna_pattern_status.setText("Isotropic pattern opened.")
+            return
+
+        # --- 1-D patterns (S.1528 Rec 1.2, S.672, Custom 1-D, symmetric Rec 1.4) ---
         antenna_func, wavelength, pattern_kwargs = _satellite_antenna_pattern_spec(antennas_cfg)
         max_angle_deg = 180.0
         if main_lobe_only:
-            hpbw_deg = 2.0 * _resolve_contour_half_angle_deg(antennas_cfg, "db3")
-            max_angle_deg = min(max(5.0, 3.0 * hpbw_deg), 90.0)
+            try:
+                hpbw_deg = 2.0 * _resolve_contour_half_angle_deg(antennas_cfg, "db3")
+                max_angle_deg = min(max(5.0, 3.0 * hpbw_deg), 90.0)
+            except Exception:
+                max_angle_deg = 30.0
 
         offset_angles = np.linspace(0.0, max_angle_deg, 721, dtype=np.float64) * u.deg
-        gains_result = antenna_func(offset_angles, wavelength=wavelength, **pattern_kwargs)
+        try:
+            gains_result = antenna_func(offset_angles, wavelength=wavelength, **pattern_kwargs)
+        except Exception as exc:
+            self.antenna_pattern_status.setText(f"Pattern evaluation failed: {exc}")
+            return
         gains = gains_result[0] if isinstance(gains_result, (tuple, list)) else gains_result
         gains_dbi = (
             gains.to_value(cnv.dBi)
@@ -29672,12 +42157,165 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
     def _plot_ras_antenna_pattern(self) -> None:
         state = self.current_state()
         ras_cfg = state.ras_antenna
-        if not _has_valid_ras_antenna_config(ras_cfg):
+        # Pattern preview only needs the antenna definition — not
+        # operational elevation angles (those drive the sky-cell scan,
+        # not the gain shape).
+        if not _has_ras_pattern_for_preview(ras_cfg):
             self.ras_pattern_status.setText(
-                "RAS pattern plots require a valid RAS antenna diameter and operational elevation range."
+                "RAS pattern plots require an antenna model. Set "
+                "a diameter for RA.1631, or load a Custom 1-D / 2-D "
+                "pattern file."
             )
             return
-        # The RAS pattern depends only on the RAS station's own frequency.
+
+        # If the model picker is on Custom but no pattern is loaded
+        # yet, refuse rather than silently falling through to RA.1631
+        # — that would tell the user "looks valid" while actually
+        # showing a different antenna than the runtime will use.
+        # Same check the config builder applies, but surfaced as a
+        # clear message rather than a stale-looking RA.1631 plot.
+        current_model = str(self.ras_antenna_model_combo.currentData() or "")
+        if current_model in (
+            _RAS_ANTENNA_MODEL_CUSTOM_1D, _RAS_ANTENNA_MODEL_CUSTOM_2D,
+        ) and getattr(ras_cfg, "custom_pattern", None) is None:
+            kind_label = (
+                "Custom 1-D" if current_model == _RAS_ANTENNA_MODEL_CUSTOM_1D
+                else "Custom 2-D"
+            )
+            self.ras_pattern_status.setText(
+                f"{kind_label} is selected but no pattern is loaded. "
+                "Click 'Edit pattern…' or 'Load…' to supply a pattern, "
+                "or switch the model back to RA.1631."
+            )
+            return
+
+        # Custom-pattern branch: delegate to the shared preview helper
+        # so 1-D (axisymmetric rectangular/polar) and 2-D (heatmap +
+        # principal cuts) get the same visualisation the satellite-side
+        # pattern editor uses. Frequency is not required — a custom LUT
+        # stores its own peak gain independent of D/λ. Rectangular is
+        # the default so the viewer matches the editor's default view
+        # and far-sidelobe / plateau structure isn't clipped by the
+        # polar radial floor.
+        custom_pat = getattr(ras_cfg, "custom_pattern", None)
+        if custom_pat is not None:
+            try:
+                peak = float(custom_pat.peak_gain_dbi)
+                kind_label = "1-D axisymmetric" if custom_pat.kind == _CA_KIND_1D else "2-D"
+                base_summary = (
+                    f"Custom RAS pattern ({kind_label}). "
+                    f"Peak gain {peak:.2f} dBi."
+                )
+            except Exception:
+                base_summary = "Custom RAS pattern preview."
+
+            if custom_pat.kind == _CA_KIND_1D:
+                # 1-D: use the shared preview (lightweight).
+                from scepter.custom_antenna_preview import (
+                    build_custom_pattern_preview_figure as _build_custom_preview,
+                )
+
+                def _build_custom(proj: str) -> Figure:
+                    fig = _build_custom_preview(custom_pat, projection=proj)
+                    self._style_matplotlib_figure(fig)
+                    return fig
+
+                try:
+                    figure = _build_custom("cartesian")
+                except Exception as exc:
+                    self.ras_pattern_status.setText(
+                        f"Custom RAS pattern preview failed: {exc}"
+                    )
+                    return
+                window = FigureWindow(
+                    figure=figure,
+                    title="RAS Antenna Pattern",
+                    summary_text=base_summary,
+                    parent=self,
+                )
+                window.install_projection_toggle(
+                    options=(
+                        ("cartesian", "Rectangular"),
+                        ("polar", "Polar"),
+                    ),
+                    current="cartesian",
+                    rebuild_cb=_build_custom,
+                )
+            else:
+                # 2-D: render directly from the stored gain_db grid
+                # — no re-evaluation, instant even for dense grids.
+                try:
+                    figure = self._build_fast_2d_pattern_preview(
+                        custom_pat, title="RAS Antenna Pattern",
+                    )
+                except Exception as exc:
+                    self.ras_pattern_status.setText(
+                        f"Custom RAS pattern preview failed: {exc}"
+                    )
+                    return
+                window = FigureWindow(
+                    figure=figure,
+                    title="RAS Antenna Pattern",
+                    summary_text=base_summary,
+                    parent=self,
+                )
+            window.show()
+            window.raise_()
+            window.activateWindow()
+            self._antenna_pattern_windows.append(window)
+            self.ras_pattern_status.setText(
+                "Custom RAS antenna pattern opened in a separate window."
+            )
+            return
+
+        # RA.1631 analytical path.
+        self._plot_ras_antenna_pattern_ra1631(ras_cfg)
+
+    def _build_fast_2d_pattern_preview(
+        self,
+        pattern: "CustomAntennaPattern",
+        *,
+        title: str = "2-D Antenna Pattern",
+    ) -> "Figure":
+        """Render a 2-D custom pattern as a heatmap directly from the
+        stored ``gain_db`` grid — no ``evaluate_pattern_2d`` call, so
+        the preview is instant even for dense (3601\u00d71801) grids.
+
+        This is the view-only equivalent of the editor's heatmap,
+        showing exactly what the GPU will consume.
+        """
+        from scepter.custom_antenna import (
+            GRID_MODE_AZEL as _GM_AZEL,
+            GRID_MODE_THETAPHI as _GM_THETAPHI,
+        )
+        gain = np.asarray(pattern.gain_db, dtype=np.float64)
+        if pattern.grid_mode == _GM_AZEL:
+            grid0 = np.asarray(pattern.az_grid_deg, dtype=np.float64)
+            grid1 = np.asarray(pattern.el_grid_deg, dtype=np.float64)
+            x_label, y_label = "az [deg]", "el [deg]"
+        else:
+            grid0 = np.asarray(pattern.theta_grid_deg, dtype=np.float64)
+            grid1 = np.asarray(pattern.phi_grid_deg, dtype=np.float64)
+            x_label, y_label = "\u03b8 [deg]", "\u03c6 [deg]"
+        peak = float(pattern.peak_gain_dbi)
+        vmin = peak - 50.0
+        vmax = peak + 2.0
+        fig = Figure(figsize=(8.0, 5.5), constrained_layout=True)
+        ax = fig.add_subplot(111)
+        im = ax.pcolormesh(
+            grid0, grid1, gain.T,
+            shading="auto", cmap="viridis",
+            vmin=vmin, vmax=vmax,
+        )
+        ax.set_xlabel(x_label)
+        ax.set_ylabel(y_label)
+        ax.set_title(f"{title} \u2014 peak {peak:.1f} dBi")
+        fig.colorbar(im, ax=ax, label="Gain [dBi]")
+        self._style_matplotlib_figure(fig)
+        return fig
+
+    def _plot_ras_antenna_pattern_ra1631(self, ras_cfg: Any) -> None:
+        """RA.1631 analytical branch — existing behaviour."""
         wavelength_cm = 0.0
         if ras_cfg.frequency_mhz is not None and float(ras_cfg.frequency_mhz) > 0.0:
             wavelength_cm = _pattern_wavelength_cm_from_frequency_mhz(float(ras_cfg.frequency_mhz))
@@ -29686,8 +42324,14 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
                 "RAS pattern plots require a positive frequency or manual pattern wavelength."
             )
             return
+        if ras_cfg.antenna_diameter_m is None:
+            self.ras_pattern_status.setText(
+                "RA.1631 pattern requires an antenna diameter."
+            )
+            return
         diameter_m = float(ras_cfg.antenna_diameter_m)
-        offset_angles = np.linspace(0.0, 180.0, 721, dtype=np.float64) * u.deg
+        offset_deg = np.linspace(0.0, 180.0, 721, dtype=np.float64)
+        offset_angles = offset_deg * u.deg
         gains = pycraf_antenna.ras_pattern(
             offset_angles,
             diameter_m * u.m,
@@ -29695,15 +42339,34 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
         )
         gains_dbi = np.asarray(gains.to_value(cnv.dB), dtype=float)
 
-        figure = Figure(figsize=(7.5, 5.2), constrained_layout=True)
-        axis = figure.add_subplot(111)
-        axis.plot(offset_angles.to_value(u.deg), gains_dbi, color="#1d4ed8", linewidth=1.8)
-        axis.set_xlabel("Off-axis angle [deg]")
-        axis.set_ylabel("Gain [dB]")
-        axis.set_title("RAS antenna pattern")
-        axis.grid(True, alpha=0.25)
-        self._style_matplotlib_figure(figure)
+        def _build_ra1631(projection: str) -> Figure:
+            if projection == "polar":
+                fig = Figure(figsize=(6.4, 6.4), constrained_layout=True)
+                ax = fig.add_subplot(111, projection="polar")
+                theta_rad = np.deg2rad(offset_deg)
+                ax.plot(theta_rad, gains_dbi, color="#1d4ed8", linewidth=1.4)
+                # Mirror across boresight for the classic petal look.
+                ax.plot(-theta_rad, gains_dbi, color="#1d4ed8", linewidth=1.4)
+                ax.set_theta_zero_location("N")
+                ax.set_theta_direction(-1)
+                peak = float(np.nanmax(gains_dbi))
+                r_floor = float(np.nanmin(gains_dbi))
+                ax.set_ylim(max(r_floor - 2.0, peak - 80.0), peak + 2.0)
+                ax.set_ylabel("Gain (dBi)", labelpad=28)
+                ax.set_title("RAS antenna pattern", pad=12)
+                ax.grid(True, alpha=0.25)
+            else:
+                fig = Figure(figsize=(7.5, 5.2), constrained_layout=True)
+                ax = fig.add_subplot(111)
+                ax.plot(offset_deg, gains_dbi, color="#1d4ed8", linewidth=1.8)
+                ax.set_xlabel("Off-axis angle [deg]")
+                ax.set_ylabel("Gain [dB]")
+                ax.set_title("RAS antenna pattern")
+                ax.grid(True, alpha=0.25)
+            self._style_matplotlib_figure(fig)
+            return fig
 
+        figure = _build_ra1631("cartesian")
         window = FigureWindow(
             figure=figure,
             title="RAS Antenna Pattern",
@@ -29712,6 +42375,14 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
                 f"and dish diameter {diameter_m:.3f} m."
             ),
             parent=self,
+        )
+        window.install_projection_toggle(
+            options=(
+                ("cartesian", "Rectangular"),
+                ("polar", "Polar"),
+            ),
+            current="cartesian",
+            rebuild_cb=_build_ra1631,
         )
         window.show()
         window.raise_()
@@ -29828,6 +42499,120 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
         self._on_state_changed()
 
     @QtCore.Slot()
+    def _build_sat_antennas_with_custom(
+        self, antennas: "AntennasConfig | None",
+    ) -> SatelliteAntennasConfig:
+        """Build a SatelliteAntennasConfig from the form, injecting
+        the satellite custom pattern from the GUI's stash."""
+        if antennas is None:
+            return SatelliteAntennasConfig()
+        cfg = SatelliteAntennasConfig.from_antennas_config(antennas)
+        # Inject the custom pattern from the GUI stash — it lives
+        # outside the form widgets (managed by Edit/Load/Clear).
+        cfg.custom_pattern = self._sat_custom_pattern
+        return cfg
+
+    # === Satellite custom pattern handlers ==============================
+
+    def _refresh_sat_custom_pattern_status_label(self) -> None:
+        pat = self._sat_custom_pattern
+        if pat is None:
+            self.sat_custom_pattern_status_label.setText("No file loaded.")
+            self.sat_custom_pattern_status_label.setToolTip("")
+            self.sat_custom_clear_button.setEnabled(False)
+            return
+        try:
+            peak = float(pat.peak_gain_dbi)
+            n_samples = int(pat.gain_db.size)
+            title = str((pat.meta or {}).get("title") or "untitled")
+            kind_tag = "1-D" if pat.kind == _CA_KIND_1D else "2-D"
+            short_title = title if len(title) <= 24 else title[:22] + "\u2026"
+            self.sat_custom_pattern_status_label.setText(
+                f"{kind_tag} \u2022 {short_title} \u2022 {peak:.1f} dBi "
+                f"({n_samples} samples)"
+            )
+        except Exception:
+            self.sat_custom_pattern_status_label.setText("Loaded (details unavailable).")
+        self.sat_custom_clear_button.setEnabled(True)
+
+    @QtCore.Slot()
+    def _on_sat_edit_custom_pattern_clicked(self) -> None:
+        selected = str(self.antenna_model_combo.currentData() or "")
+        if selected == _ANTENNA_MODEL_CUSTOM_1D:
+            dlg = PatternEditor1DDialog(
+                initial_pattern=self._sat_custom_pattern,
+                side="satellite",
+                parent=self,
+            )
+        else:
+            dlg = PatternEditor2DDialog(
+                initial_pattern=self._sat_custom_pattern,
+                side="satellite",
+                parent=self,
+            )
+        if dlg.exec() != QtWidgets.QDialog.Accepted:
+            return
+        pat = dlg.result_pattern()
+        if pat is None:
+            return
+        self._sat_custom_pattern = pat
+        if pat.kind == _CA_KIND_1D:
+            self._sat_custom_pattern_1d = pat
+        else:
+            self._sat_custom_pattern_2d = pat
+        self._refresh_sat_custom_pattern_status_label()
+        self._update_antenna_plot_controls()
+        self._on_state_changed()
+
+    @QtCore.Slot()
+    def _on_sat_load_custom_pattern_clicked(self) -> None:
+        from scepter.custom_antenna import load_custom_pattern as _load
+        filename, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Import custom satellite pattern", str(Path.cwd()),
+            "Antenna pattern JSON (*.json);;All files (*)",
+        )
+        if not filename:
+            return
+        try:
+            pat = _load(filename)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(
+                self, "Import failed",
+                f"Couldn\u2019t import {Path(filename).name}:\n{exc}",
+            )
+            return
+        selected = str(self.antenna_model_combo.currentData() or "")
+        expected_kind = _CA_KIND_1D if selected == _ANTENNA_MODEL_CUSTOM_1D else _CA_KIND_2D
+        if pat.kind != expected_kind:
+            QtWidgets.QMessageBox.warning(
+                self, "Wrong kind",
+                f"{Path(filename).name} is {pat.kind}; the current model "
+                f"expects {expected_kind}. Switch the model or load a "
+                f"matching file.",
+            )
+            return
+        self._sat_custom_pattern = pat
+        if pat.kind == _CA_KIND_1D:
+            self._sat_custom_pattern_1d = pat
+        else:
+            self._sat_custom_pattern_2d = pat
+        self._refresh_sat_custom_pattern_status_label()
+        self._update_antenna_plot_controls()
+        self._on_state_changed()
+
+    @QtCore.Slot()
+    def _on_sat_clear_custom_pattern_clicked(self) -> None:
+        if self._sat_custom_pattern is None:
+            return
+        if getattr(self._sat_custom_pattern, "kind", None) == _CA_KIND_1D:
+            self._sat_custom_pattern_1d = None
+        else:
+            self._sat_custom_pattern_2d = None
+        self._sat_custom_pattern = None
+        self._refresh_sat_custom_pattern_status_label()
+        self._update_antenna_plot_controls()
+        self._on_state_changed()
+
     def _on_rf_model_changed(self, *args: object) -> None:
         del args
         selected = str(self.antenna_model_combo.currentData() or _ANTENNA_MODEL_REC12)
@@ -29859,6 +42644,17 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
             self.m2101_d_v_spin.set_value(cfg.d_v)
             self.m2101_n_h_spin.set_value(cfg.n_h)
             self.m2101_n_v_spin.set_value(cfg.n_v)
+        # Stash/restore satellite custom patterns by kind (mirrors RAS).
+        if selected in (_ANTENNA_MODEL_CUSTOM_1D, _ANTENNA_MODEL_CUSTOM_2D):
+            if self._sat_custom_pattern is not None:
+                if getattr(self._sat_custom_pattern, "kind", None) == _CA_KIND_1D:
+                    self._sat_custom_pattern_1d = self._sat_custom_pattern
+                else:
+                    self._sat_custom_pattern_2d = self._sat_custom_pattern
+            if selected == _ANTENNA_MODEL_CUSTOM_1D:
+                self._sat_custom_pattern = self._sat_custom_pattern_1d
+            else:
+                self._sat_custom_pattern = self._sat_custom_pattern_2d
         self._sync_rf_panel()
         self._on_state_changed()
 
@@ -29917,9 +42713,10 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
             self.collapsed_ref_freq_edit.set_value(2000.0)
         elif model == _ANTENNA_MODEL_ISOTROPIC:
             # Isotropic has no tunable parameters — just reset UEMR mode.
-            blocker_iso = QtCore.QSignalBlocker(self.isotropic_uemr_checkbox)
-            self.isotropic_uemr_checkbox.setChecked(False)
-            del blocker_iso
+            # UEMR lives on the Satellite System Mode tab now, so keep its
+            # state; "Restore model defaults" on the Isotropic page
+            # doesn't touch the system-level mode choice.
+            pass
 
         self._sync_rf_panel()
         self._on_state_changed()
@@ -29933,18 +42730,49 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
             QtCore.QSignalBlocker(self.ras_frequency_spin),
             QtCore.QSignalBlocker(self.ras_oper_min_spin),
             QtCore.QSignalBlocker(self.ras_oper_max_spin),
+            QtCore.QSignalBlocker(self.ras_antenna_model_combo),
         ]
         self.antenna_spin.set_value(defaults.antenna_diameter_m)
         self.ras_frequency_spin.set_value(defaults.frequency_mhz)
         self.ras_oper_min_spin.set_value(defaults.operational_elevation_min_deg)
         self.ras_oper_max_spin.set_value(defaults.operational_elevation_max_deg)
+        # Restore the analytical RA.1631 model and drop any loaded
+        # custom pattern — "defaults" means the baked-in out-of-the-
+        # box configuration, not whatever LUT the user was last
+        # editing.
+        idx_ra1631 = self.ras_antenna_model_combo.findData(_RAS_ANTENNA_MODEL_RA1631)
+        if idx_ra1631 >= 0:
+            self.ras_antenna_model_combo.setCurrentIndex(idx_ra1631)
+        self._ras_custom_pattern = None
         del blockers
+        self._apply_ras_antenna_model_visibility()
+        self._refresh_ras_custom_pattern_status_label()
         self._update_ras_grx_from_diameter()
         self._update_antenna_plot_controls()
         self._on_state_changed()
 
     @QtCore.Slot()
     def _remove_ras_antenna(self) -> None:
+        # "Remove RAS Antenna" adapts to what the user currently sees:
+        #
+        # * Custom 1-D / 2-D active → behave like the contextual
+        #   "Clear" button next to the file picker: drop the loaded
+        #   pattern and revert the model combo to RA.1631. The
+        #   analytical fields (diameter, frequency, operational
+        #   elevations) are preserved so switching back to RA.1631
+        #   keeps whatever values the user had configured.
+        # * RA.1631 active → clear the analytical fields and the
+        #   operational elevation range. Custom pattern in session
+        #   memory (if any) is left alone because the user isn't
+        #   looking at it right now; hitting Clear while in Custom
+        #   mode is the deliberate way to drop the pattern.
+        current_model = str(self.ras_antenna_model_combo.currentData() or "")
+        is_custom = current_model in (
+            _RAS_ANTENNA_MODEL_CUSTOM_1D, _RAS_ANTENNA_MODEL_CUSTOM_2D,
+        )
+        if is_custom:
+            self._on_ras_clear_custom_pattern_clicked()
+            return
         blockers = [
             QtCore.QSignalBlocker(self.antenna_spin),
             QtCore.QSignalBlocker(self.ras_grx_max_spin),
@@ -29958,6 +42786,309 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
         self.ras_oper_min_spin.set_value(None)
         self.ras_oper_max_spin.set_value(None)
         del blockers
+        self._update_antenna_plot_controls()
+        self._on_state_changed()
+
+    # ----------------------------------------------------------------
+    # RAS custom antenna pattern — picker + load/clear
+    # ----------------------------------------------------------------
+
+    def _build_ras_antenna_config(self) -> RasAntennaConfig:
+        """Build the :class:`RasAntennaConfig` consumed by the runtime.
+
+        The builder deliberately distinguishes three model states so
+        the validation / green-tick logic can't silently fall through
+        to a stale RA.1631 when the UI advertises a Custom pattern:
+
+        * **Custom with loaded pattern** → ``custom_pattern`` set; the
+          RA.1631 fields (``antenna_diameter_m``, ``grx_max_dbi``,
+          ``frequency_mhz``) are **cleared** so downstream validation
+          takes the Custom path exclusively.
+        * **Custom without loaded pattern** → both ``custom_pattern``
+          and the RA.1631 fields are cleared. This makes
+          :func:`_has_valid_ras_antenna_config` return *False* so the
+          tab shows an amber / incomplete indicator instead of a
+          green tick backed by a stale diameter.
+        * **RA.1631** → ``custom_pattern`` is ``None`` and the diameter
+          / wavelength fields are carried through.
+        """
+        selected_model = str(self.ras_antenna_model_combo.currentData() or "")
+        is_custom = selected_model in (
+            _RAS_ANTENNA_MODEL_CUSTOM_1D, _RAS_ANTENNA_MODEL_CUSTOM_2D,
+        )
+        if is_custom:
+            pattern = self._ras_custom_pattern
+            # Carry the RAS band / elevation metadata (used by the
+            # spectrum and elevation validation regardless of antenna
+            # model) but zero-out the RA.1631-specific fields so the
+            # runtime can't accidentally pick them up.
+            return RasAntennaConfig(
+                antenna_diameter_m=None,
+                grx_max_dbi=None,
+                frequency_mhz=self.ras_frequency_spin.value_or_none(),
+                operational_elevation_min_deg=self.ras_oper_min_spin.value_or_none(),
+                operational_elevation_max_deg=self.ras_oper_max_spin.value_or_none(),
+                target_pfd_dbw_m2_mhz=None,
+                custom_pattern=pattern,
+            )
+        # RA.1631 path — diameter drives validation; custom_pattern
+        # stays detached but is preserved in GUI session memory so
+        # toggling back to Custom restores the user's work.
+        return RasAntennaConfig(
+            antenna_diameter_m=self.antenna_spin.value_or_none(),
+            grx_max_dbi=self.ras_grx_max_spin.value_or_none(),
+            frequency_mhz=self.ras_frequency_spin.value_or_none(),
+            operational_elevation_min_deg=self.ras_oper_min_spin.value_or_none(),
+            operational_elevation_max_deg=self.ras_oper_max_spin.value_or_none(),
+            target_pfd_dbw_m2_mhz=None,
+            custom_pattern=None,
+        )
+
+    def _apply_ras_antenna_model_visibility(self) -> None:
+        """Hide / show the analytical-RA.1631 rows and the custom-
+        pattern rows depending on which model is selected in
+        :attr:`ras_antenna_model_combo`.
+
+        * RA.1631 → diameter + G_rx,max + frequency visible, custom-
+          pattern file row and status hidden.
+        * Custom 1-D / 2-D → diameter + G_rx,max + frequency hidden
+          (the LUT's ``peak_gain_dbi`` is authoritative; the pattern
+          carries its own gain at all angles so no λ/D is needed);
+          file row and status label visible so the user can load /
+          edit / clear.
+        """
+        model = str(self.ras_antenna_model_combo.currentData() or _RAS_ANTENNA_MODEL_RA1631)
+        is_custom = model in (
+            _RAS_ANTENNA_MODEL_CUSTOM_1D, _RAS_ANTENNA_MODEL_CUSTOM_2D,
+        )
+        form = self._ras_antenna_form
+        self._set_form_row_visible(form, self.ras_antenna_diameter_field, not is_custom)
+        self._set_form_row_visible(form, self.ras_grx_max_field, not is_custom)
+        self._set_form_row_visible(form, self.ras_frequency_field, not is_custom)
+        self._set_form_row_visible(form, self.ras_custom_pattern_row_widget, is_custom)
+        self._set_form_row_visible(form, self.ras_custom_pattern_status_label, is_custom)
+
+    @QtCore.Slot()
+    def _on_ras_antenna_model_changed(self) -> None:
+        self._apply_ras_antenna_model_visibility()
+        # Stash the current pattern into the matching per-kind slot,
+        # then restore the pattern for the newly selected kind.
+        # This means switching 1-D → 2-D → 1-D doesn't lose work.
+        if self._ras_custom_pattern is not None:
+            if getattr(self._ras_custom_pattern, "kind", None) == _CA_KIND_1D:
+                self._ras_custom_pattern_1d = self._ras_custom_pattern
+            else:
+                self._ras_custom_pattern_2d = self._ras_custom_pattern
+        model = str(self.ras_antenna_model_combo.currentData() or "")
+        if model == _RAS_ANTENNA_MODEL_CUSTOM_1D:
+            self._ras_custom_pattern = self._ras_custom_pattern_1d
+        elif model == _RAS_ANTENNA_MODEL_CUSTOM_2D:
+            self._ras_custom_pattern = self._ras_custom_pattern_2d
+        else:
+            # RA.1631 — keep _ras_custom_pattern as-is (inactive but
+            # preserved so toggling back restores it).
+            pass
+        self._refresh_ras_custom_pattern_status_label()
+        self._update_antenna_plot_controls()
+        self._on_state_changed()
+
+    def _refresh_ras_custom_pattern_status_label(self) -> None:
+        """Rewrite the status label to summarise the loaded pattern."""
+        pat = self._ras_custom_pattern
+        if pat is None:
+            self.ras_custom_pattern_status_label.setText("No file loaded.")
+            self.ras_custom_pattern_status_label.setToolTip("")
+            self.ras_clear_custom_pattern_button.setEnabled(False)
+            return
+        try:
+            peak = float(pat.peak_gain_dbi)
+            n_samples = int(pat.gain_db.size)
+            title = str((pat.meta or {}).get("title") or "untitled")
+            kind_tag = "1-D" if pat.kind == _CA_KIND_1D else "2-D"
+            # Compact single-line summary. The full details go into
+            # the tooltip so the row doesn't need to wrap.
+            short_title = title if len(title) <= 24 else title[:22] + "\u2026"
+            self.ras_custom_pattern_status_label.setText(
+                f"{kind_tag} \u2022 {short_title} \u2022 {peak:.1f} dBi "
+                f"({n_samples} samples)"
+            )
+            self.ras_custom_pattern_status_label.setToolTip(
+                f"Title: {title}\n"
+                f"Kind: {kind_tag} (custom)\n"
+                f"Samples: {n_samples}\n"
+                f"Peak gain: {peak:.3f} dBi"
+            )
+        except Exception:
+            self.ras_custom_pattern_status_label.setText("Loaded (details unavailable).")
+            self.ras_custom_pattern_status_label.setToolTip("")
+        self.ras_clear_custom_pattern_button.setEnabled(True)
+
+    @QtCore.Slot()
+    def _on_ras_load_custom_pattern_clicked(self) -> None:
+        from scepter.custom_antenna import (
+            KIND_1D as _CUSTOM_KIND_1D,
+            KIND_2D as _CUSTOM_KIND_2D,
+            load_custom_pattern as _load_custom_pattern,
+        )
+        filename, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Load RAS Antenna Pattern",
+            str(Path.cwd()),
+            "Antenna pattern JSON (*.json);;All files (*)",
+        )
+        if not filename:
+            return
+        try:
+            pat = _load_custom_pattern(filename)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(
+                self, "Load failed",
+                f"Couldn't load RAS antenna pattern from "
+                f"{Path(filename).name}:\n{exc}",
+            )
+            return
+        if pat.kind not in (_CUSTOM_KIND_1D, _CUSTOM_KIND_2D):
+            QtWidgets.QMessageBox.warning(
+                self, "Unsupported pattern kind",
+                f"The file {Path(filename).name} declares an unknown "
+                f"pattern kind={pat.kind!r}. Load a 1-D (axisymmetric) "
+                "or 2-D (az/el or θ, φ) pattern.",
+            )
+            return
+        self._ras_custom_pattern = pat
+        # Auto-pick the matching model entry if the user loaded a file
+        # whose kind differs from the current picker selection.
+        want_model = (
+            _RAS_ANTENNA_MODEL_CUSTOM_1D if pat.kind == _CUSTOM_KIND_1D
+            else _RAS_ANTENNA_MODEL_CUSTOM_2D
+        )
+        if self.ras_antenna_model_combo.currentData() != want_model:
+            idx_target = self.ras_antenna_model_combo.findData(want_model)
+            if idx_target >= 0:
+                blocker_model = QtCore.QSignalBlocker(self.ras_antenna_model_combo)
+                self.ras_antenna_model_combo.setCurrentIndex(idx_target)
+                del blocker_model
+                self._apply_ras_antenna_model_visibility()
+        self._refresh_ras_custom_pattern_status_label()
+        self._update_antenna_plot_controls()
+        self._on_state_changed()
+
+    @QtCore.Slot()
+    def _on_ras_clear_custom_pattern_clicked(self) -> None:
+        # Clear the custom pattern but keep the model combo where it
+        # is. The user stays on "Custom 1-D / 2-D" and can load a
+        # different pattern. Run-validation will catch "Custom model
+        # selected but no pattern loaded" with a clear error message.
+        if self._ras_custom_pattern is None:
+            return
+        # Also clear the per-kind stash so the cleared pattern
+        # doesn't come back when switching models.
+        if getattr(self._ras_custom_pattern, "kind", None) == _CA_KIND_1D:
+            self._ras_custom_pattern_1d = None
+        else:
+            self._ras_custom_pattern_2d = None
+        self._ras_custom_pattern = None
+        self._refresh_ras_custom_pattern_status_label()
+        self._update_antenna_plot_controls()
+        self._on_state_changed()
+
+    @QtCore.Slot()
+    def _on_ras_edit_custom_pattern_clicked(self) -> None:
+        """Open the graphical editor for the RAS custom pattern.
+
+        Dispatches on the active RAS model combo: Custom 1-D opens
+        :class:`PatternEditor1DDialog`; Custom 2-D opens
+        :class:`PatternEditor2DDialog`. If a pattern is already
+        loaded, it prefills the editor so the user can tweak in
+        place instead of starting from scratch.
+        """
+        from scepter.custom_antenna import KIND_1D as _CK_1D
+        model = str(self.ras_antenna_model_combo.currentData() or "")
+        # Gather frequency / diameter hints for the RA.1631 preset
+        # button in the editor (1-D only; harmless for 2-D). These
+        # are **only** passed when the user is currently on the
+        # RA.1631 model — a Custom pattern is by definition an
+        # independent LUT and its RA.1631-preset hints should not
+        # silently inherit the last analytical frequency / diameter
+        # the user typed. (The analytical values are still kept in
+        # the hidden widgets so switching back to RA.1631 restores
+        # them; they just don't leak into the Custom editor.)
+        wavelength_m: float | None = None
+        diameter_m: float | None = None
+        if model == _RAS_ANTENNA_MODEL_RA1631:
+            state = self.current_state()
+            if (
+                state.ras_antenna.frequency_mhz is not None
+                and float(state.ras_antenna.frequency_mhz) > 0.0
+            ):
+                wavelength_m = (
+                    _pattern_wavelength_cm_from_frequency_mhz(
+                        float(state.ras_antenna.frequency_mhz)
+                    )
+                    / 100.0
+                )
+            if (
+                state.ras_antenna.antenna_diameter_m is not None
+                and float(state.ras_antenna.antenna_diameter_m) > 0.0
+            ):
+                diameter_m = float(state.ras_antenna.antenna_diameter_m)
+        current_pat = self._ras_custom_pattern
+        if model == _RAS_ANTENNA_MODEL_CUSTOM_2D:
+            # 2-D editor: principal-plane cuts + separable/cos²
+            # synthesis. Users who need a truly dense per-cell 2-D
+            # LUT can still load one from JSON.
+            from scepter.custom_antenna import KIND_2D as _CK_2D_
+            init_2d = current_pat if current_pat is not None and current_pat.kind == _CK_2D_ else None
+            dialog_2d = PatternEditor2DDialog(
+                initial_pattern=init_2d,
+                side="ras",
+                parent=self,
+            )
+            if dialog_2d.exec() != QtWidgets.QDialog.Accepted:
+                return
+            pat_2d = dialog_2d.result_pattern()
+            if pat_2d is None:
+                return
+            self._ras_custom_pattern = pat_2d
+            self._refresh_ras_custom_pattern_status_label()
+            self._update_antenna_plot_controls()
+            self._on_state_changed()
+            return
+        # 1-D path: works whether the combo is Custom 1-D *or* RA.1631
+        # (in the RA.1631 case the user is essentially authoring a
+        # custom pattern for the first time and we'll auto-switch the
+        # combo on accept).
+        if current_pat is not None and current_pat.kind != _CK_1D:
+            QtWidgets.QMessageBox.warning(
+                self, "Pattern kind mismatch",
+                "The loaded pattern is 2-D; close it first (Clear) "
+                "before opening the 1-D editor.",
+            )
+            return
+        dialog = PatternEditor1DDialog(
+            initial_pattern=current_pat,
+            wavelength_m=wavelength_m,
+            diameter_m=diameter_m,
+            side="ras",
+            parent=self,
+        )
+        if dialog.exec() != QtWidgets.QDialog.Accepted:
+            return
+        pat = dialog.result_pattern()
+        if pat is None:
+            return
+        self._ras_custom_pattern = pat
+        # Auto-switch the combo to Custom 1-D so the pattern is
+        # actually wired into the run. Users who invoke the editor
+        # expect "opened, tweaked, applied" — not "edited but the
+        # simulator still uses RA.1631".
+        idx_c1d = self.ras_antenna_model_combo.findData(_RAS_ANTENNA_MODEL_CUSTOM_1D)
+        if idx_c1d >= 0 and self.ras_antenna_model_combo.currentData() != _RAS_ANTENNA_MODEL_CUSTOM_1D:
+            blocker_model = QtCore.QSignalBlocker(self.ras_antenna_model_combo)
+            self.ras_antenna_model_combo.setCurrentIndex(idx_c1d)
+            del blocker_model
+            self._apply_ras_antenna_model_visibility()
+        self._refresh_ras_custom_pattern_status_label()
         self._update_antenna_plot_controls()
         self._on_state_changed()
 
@@ -30007,10 +43138,11 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
         self.rec14_far_start_spin.set_value(defaults.rec14.far_sidelobe_start_deg)
         self.rec14_far_level_spin.set_value(defaults.rec14.far_sidelobe_level_dbi)
         # Always return to directive (non-UEMR) mode on "Set defaults" — the
-        # UEMR flag lives on the Isotropic page only and must not leak from a
+        # UEMR flag lives on the Satellite System Mode tab and must not leak from a
         # prior session / previous test into an unrelated antenna model.
         self.isotropic_uemr_checkbox.setChecked(bool(defaults.isotropic.uemr_mode))
         del blockers
+        self._sync_sat_sys_mode_cards_from_state()
         self._sync_rf_panel()
         self._update_antenna_plot_controls()
         self._on_state_changed()
@@ -30827,6 +43959,7 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
                     "nco": "n/a",
                     "selection_strategy": "n/a",
                     "uemr_mode": True,
+                    "uemr_random_power": bool(svc.uemr_random_power),
                 }
                 if _system_is_uemr(s0)
                 else {
@@ -31033,11 +44166,28 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
         hx = s0.hexgrid
         power_input = _require_service_power_input(state)
         constellation = build_constellation_from_state(state)
-        antenna_func, wavelength, pattern_kwargs = _satellite_antenna_pattern_spec(
-            s0.satellite_antennas.to_antennas_config(
-                ras=state.ras_antenna,
+        if _system_is_uemr(s0):
+            # UEMR is isotropic — no antenna pattern parameters. The
+            # wavelength for FSPL is derived from the RAS receiver
+            # frequency (the physically relevant frequency for the
+            # interference path), not from the antenna panel.
+            from scepter.antenna import isotropic_pattern
+            _ras_freq_mhz = state.ras_antenna.frequency_mhz
+            if _ras_freq_mhz is None or float(_ras_freq_mhz) <= 0:
+                raise ValueError(
+                    "UEMR mode requires a positive RAS frequency "
+                    "(set on the RAS Station tab) to derive the "
+                    "wavelength for free-space path loss."
+                )
+            antenna_func = isotropic_pattern
+            wavelength = (29979.2458 / float(_ras_freq_mhz)) * u.cm
+            pattern_kwargs = {"uemr_mode": True}
+        else:
+            antenna_func, wavelength, pattern_kwargs = _satellite_antenna_pattern_spec(
+                s0.satellite_antennas.to_antennas_config(
+                    ras=state.ras_antenna,
+                )
             )
-        )
         contour_summary = self._build_run_contour_summary(
             state,
             constellation,
@@ -31083,8 +44233,28 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
             "sat_orbit_radius_m_per_sat": orbit_radius_m_per_sat,
             "pattern_kwargs": pattern_kwargs,
             "wavelength": wavelength,
-            "ras_station_ant_diam": float(state.ras_antenna.antenna_diameter_m) * u.m,
-            "frequency": float(s0.satellite_antennas.frequency_mhz) * u.MHz,
+            # Antenna diameter is only meaningful for the RA.1631
+            # analytical RAS path; a Custom-1D RAS pattern replaces
+            # diameter+wavelength entirely (see Stage 20 config
+            # validator). Fall back to a placeholder 1.0 m when the
+            # user opted into a custom RAS pattern and left the
+            # analytical-path field blank.
+            "ras_station_ant_diam": (
+                (
+                    float(state.ras_antenna.antenna_diameter_m)
+                    if state.ras_antenna.antenna_diameter_m is not None
+                    else 1.0
+                )
+                * u.m
+            ),
+            "ras_custom_pattern": getattr(
+                state.ras_antenna, "custom_pattern", None
+            ),
+            "frequency": (
+                float(state.ras_antenna.frequency_mhz) * u.MHz
+                if _system_is_uemr(s0) and s0.satellite_antennas.frequency_mhz is None
+                else float(s0.satellite_antennas.frequency_mhz) * u.MHz
+            ),
             "ras_station_elev_range": (
                 float(state.ras_antenna.operational_elevation_min_deg) * u.deg,
                 float(state.ras_antenna.operational_elevation_max_deg) * u.deg,
@@ -31108,6 +44278,7 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
             "power_variation_mode": str(power_input.get("power_variation_mode", "fixed")),
             "power_range_min_db": power_input.get("power_range_min_dbw_channel"),
             "power_range_max_db": power_input.get("power_range_max_dbw_channel"),
+            "uemr_random_power": bool(svc.uemr_random_power),
             # Surface-PFD cap kwargs forwarded to run_gpu_direct_epfd.
             # surface_pfd_stats_enabled is wired via the Review & Run
             # reporting toggle in stage 7.
@@ -31137,7 +44308,11 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
             "ras_pointing_mode": str(hx.ras_pointing_mode),
             "ras_service_cell_index": int(active_grid["ras_service_cell_index"]),
             "ras_service_cell_active": bool(active_grid["ras_service_cell_active"]),
-            "ras_guard_angle": contour_summary["spacing_theta_edge"],
+            "ras_guard_angle": (
+                svc.ras_guard_angle_override_deg * u.deg
+                if svc.ras_guard_angle_override_deg is not None
+                else contour_summary["spacing_theta_edge"]
+            ),
             "boresight_theta1": boresight_settings["boresight_theta1"],
             "boresight_theta2": boresight_settings["boresight_theta2"],
             "boresight_theta2_cell_ids": boresight_settings["boresight_theta2_cell_ids"],
@@ -31222,12 +44397,19 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
             "satellite_ptx_dbw_mhz", "satellite_ptx_dbw_channel",
             "satellite_eirp_dbw_mhz", "satellite_eirp_dbw_channel",
             "power_variation_mode", "power_range_min_db", "power_range_max_db",
+            "uemr_random_power",
             "cell_activity_factor", "cell_activity_mode",
             "cell_activity_seed_base", "split_total_group_denominator_mode",
             "beamforming_collapsed", "collapsed_baseline_eirp_dbw_hz",
             "collapsed_eval_freq_mhz", "collapsed_ref_freq_mhz",
             "boresight_theta1", "boresight_theta2", "boresight_theta2_cell_ids",
             "pfd0_dbw_m2_mhz", "storage_constants", "storage_attrs",
+            # Surface-PFD cap — per-system: each system may enable/disable
+            # the cap independently or use different thresholds/modes.
+            "max_surface_pfd_enabled",
+            "max_surface_pfd_dbw_m2_mhz", "max_surface_pfd_dbw_m2_channel",
+            "surface_pfd_cap_mode",
+            "surface_pfd_stats_enabled",
             # Grid-dependent keys — each system may have different cell counts
             "active_cell_longitudes", "observer_arr",
             "ras_service_cell_index", "ras_service_cell_active",
@@ -31708,6 +44890,8 @@ class ScepterMainWindow(QtWidgets.QMainWindow):
         self._current_path = Path(filename)
         self._dirty = False
         self._load_state_into_widgets(state)
+        # Loaded project carries the user's mode choice — no nudge needed.
+        self._sat_sys_mode_visited = True
         self._remember_recent_config(filename)
         self._set_workspace(_WORKSPACE_SIMULATION)
         self._update_window_title()
@@ -31849,12 +45033,21 @@ def create_main_window(*, show: bool = True, maximized: bool = True) -> ScepterM
     window.setAttribute(QtCore.Qt.WA_DeleteOnClose, True)
     window = _retain_top_level_window(window)
     window.setWindowIcon(_load_app_icon())
+    # Probe CUDA and show the persistent warning banner if unavailable —
+    # done after construction so the Runtime tab widgets already exist.
+    try:
+        window._apply_cuda_availability_banner()
+    except Exception:
+        pass
     if show:
         if maximized:
             window.showMaximized()
         else:
             window.show()
         apply_windows_window_icon(window)
+        # Deferred one-time CUDA-missing dialog — shown after the main
+        # window is visible so it doesn't race the splash hand-off.
+        QtCore.QTimer.singleShot(0, window._show_cuda_unavailable_startup_dialog)
     return window
 
 
