@@ -1796,7 +1796,36 @@ class obs_sim():
         self.grid_az=tel_az[np.newaxis,:,:,np.newaxis,np.newaxis,np.newaxis]
         self.grid_el=tel_el[np.newaxis,:,:,np.newaxis,np.newaxis,np.newaxis]
 
-    def azel_track(self,az,el):
+    def _tracking_reference_observer(self, observer_index: int = 0):
+        """
+        Return the observer used to define the tracking AltAz frame.
+
+        Parameters
+        ----------
+        observer_index : int, optional
+            Flat observer index into the receiver location array. The default
+            is 0, matching the historical behaviour of ``sky_track`` and
+            ``azel_track``.
+
+        Returns
+        -------
+        cysgp4.PyObserver
+            The selected observer.
+
+        Raises
+        ------
+        IndexError
+            If *observer_index* does not refer to an available observer.
+        """
+        observers = self.location.flatten()
+        index = int(observer_index)
+        if index < 0 or index >= len(observers):
+            raise IndexError(
+                f"observer_index {index} is out of range for {len(observers)} observers."
+            )
+        return observers[index]
+
+    def azel_track(self,az,el,observer_index: int = 0):
         """
         Set fixed azimuth-elevation tracking for the telescope.
         
@@ -1819,6 +1848,10 @@ class obs_sim():
         el : float
             Fixed elevation angle (degrees)
             Range: 0-90°, where 0° = horizon, 90° = zenith
+        observer_index : int, optional
+            Observer index used to define the local AltAz frame. Default 0,
+            which preserves the legacy behaviour of anchoring the tracking
+            frame to the first antenna in the array.
         
         Returns
         -------
@@ -1856,14 +1889,14 @@ class obs_sim():
         - Useful for non-sidereal tracking or fixed monitoring
         
         The Alt-Az frame is tied to:
-        - Observer location (first antenna in the array)
+        - Observer location (selected by ``observer_index``)
         - Observation time (from mjds)
         
         See Also
         --------
         sky_track : Celestial coordinate tracking (RA/Dec)
         """
-        ant1 = self.location.flatten()[0]
+        ant1 = self._tracking_reference_observer(observer_index=observer_index)
         time_2d = Time(self.mjds, format='mjd', scale='utc')
         loc1 = EarthLocation(lat=ant1.loc.lat, lon=ant1.loc.lon, height=ant1.loc.alt)
         altaz = AltAz( obstime=time_2d, location=loc1)
@@ -1871,9 +1904,10 @@ class obs_sim():
         self.pnt_coord=tel1_pnt
         self.pnt_az, self.pnt_el = tel1_pnt.az, tel1_pnt.alt
         self.altaz_frame=altaz
+        self.tracking_observer_index = int(observer_index)
         return self.pnt_coord
 
-    def sky_track(self,ra,dec,frame='icrs'):
+    def sky_track(self,ra,dec,frame='icrs',observer_index: int = 0):
         """
         Set telescope tracking to follow a celestial source.
         
@@ -1897,6 +1931,10 @@ class obs_sim():
             Celestial coordinate frame (default: 'icrs')
             Options: 'icrs', 'fk5', 'galactic', or astropy frame object
             Note: Can also pass astropy AltAz object for direct Az/El tracking
+        observer_index : int, optional
+            Observer index used to define the local AltAz frame. Default 0,
+            which preserves the legacy behaviour of anchoring the tracking
+            frame to the first antenna in the array.
         
         Returns
         -------
@@ -1948,7 +1986,7 @@ class obs_sim():
         """
         # self.pnt_ra = ra
         # self.pnt_dec = dec
-        ant1 = self.location.flatten()[0]
+        ant1 = self._tracking_reference_observer(observer_index=observer_index)
         time_2d = Time(self.mjds, format='mjd', scale='utc')
         loc1 = EarthLocation(lat=ant1.loc.lat, lon=ant1.loc.lon, height=ant1.loc.alt)
         altaz = AltAz( obstime=time_2d, location=loc1)
@@ -1957,6 +1995,7 @@ class obs_sim():
         self.altaz_frame=altaz
         tel1_pnt=skycoord_track.transform_to(altaz)
         self.pnt_az, self.pnt_el = tel1_pnt.az, tel1_pnt.alt
+        self.tracking_observer_index = int(observer_index)
         return tel1_pnt
 
     def load_propagation(self,nparray):

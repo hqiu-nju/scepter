@@ -11,6 +11,16 @@ Observation simulation
 Use this workflow when you want a sky-based RFI or EPFD analysis at one or more
 radio telescope locations.
 
+For a repository-local step-by-step walkthrough that starts from an external
+array file and covers both ``obs.py`` and ``uvw.py``, see
+``docs/obs-uvw-simulation-guide.md``.  That guide includes:
+
+- ASCII TLE input via ``scepter.obs.tle_ascii_to_pytles``
+- SKAO archive ``.npz`` input via ``scepter.tlefinder.readtlenpz``
+- tracked ``obs_sim`` runs
+- UVW generation with ``scepter.uvw.build_tracking_uvw`` and
+  ``scepter.uvw.compute_uvw``
+
 1. Create telescope observers with ``cysgp4.PyObserver``.
 2. Build a sky grid with ``scepter.skynet.pointgen_S_1586_1`` or
    ``scepter.skynet.pointgen``.

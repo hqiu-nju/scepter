@@ -168,6 +168,9 @@ spread across all workers.
 
 ## API examples
 
+Step-by-step observation and UVW walkthrough:
+[docs/obs-uvw-simulation-guide.md](docs/obs-uvw-simulation-guide.md)
+
 ### Belt definition and TLE generation
 
 ```python
