@@ -212,11 +212,13 @@ conda env create -f environment-cpu.yml
 conda activate scepter-dev-cpu
 conda develop .
 ```
+</details>
 
 The standard and full environments include GPU acceleration, the desktop GUI,
 and the postprocessing studio.  The full environment additionally provides
 Cartopy for geographic map projections and Trame for notebook-embedded 3D
 viewers.  All packages are sourced from `conda-forge`.
+
 
 ### Running the desktop GUI
 
