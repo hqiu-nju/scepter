@@ -100,14 +100,5 @@ import matplotlib.pyplot as plt
 # Import the submodule here
 
 # Optionally, add the submodule to the __all__ list
-__all__ = [
-    'skynet', 'obs', 'tlefinder', 'tleforger',
-    'antenna', 'earthgrid', 'satsim', 'scenario',
-    'visualise', 'gpu_accel',
-    # Custom-antenna-pattern surface (schema v1) —
-    # loader/validator, analytical-to-LUT fixture helpers, and
-    # the matplotlib preview factory. See the ``scepter.custom_antenna``
-    # module docstring for the authoritative format.
-    'custom_antenna', 'analytical_fixtures', 'custom_antenna_preview',
-]
+__all__ = ['skynet','obs','tlefinder','tleforger','antenna','earthgrid','satsim','scenario','visualise','gpu_accel','vis','custom_antenna', 'analytical_fixtures', 'custom_antenna_preview']
 

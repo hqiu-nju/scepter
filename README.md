@@ -165,8 +165,18 @@ flowchart TB
 
 ### Installation — three conda environments
 
-All packages come from `conda-forge`. Pick the environment that matches
-your use case:
+SCEPTer uses Conda environments.  Three configurations are provided:
+
+**CPU-only** (no NVIDIA GPU or CUDA drivers required):
+
+```bash
+conda env create -f environment-nogpu.yml
+conda activate scepter-nogpu
+pip install -e .
+```
+
+Includes the core simulation (CPU paths), desktop GUI, and postprocessing
+workflows.  GPU-accelerated paths in `gpu_accel.py` are unavailable.
 
 | Use case | File | Env name | GPU required? |
 |:---|:---|:---|:---:|
@@ -203,12 +213,10 @@ conda activate scepter-dev-cpu
 conda develop .
 ```
 
-> [!NOTE]
-> In the CPU-only environment the desktop GUI still opens and stays
-> fully functional for editing configurations, inspecting saved HDF5
-> results, and rendering postprocess recipes — only the **Run
-> Simulation** button is disabled, and a one-shot dialog explains why.
-</details>
+The standard and full environments include GPU acceleration, the desktop GUI,
+and the postprocessing studio.  The full environment additionally provides
+Cartopy for geographic map projections and Trame for notebook-embedded 3D
+viewers.  All packages are sourced from `conda-forge`.
 
 ### Running the desktop GUI
 
@@ -1213,6 +1221,8 @@ When making dependency changes, keep `environment.yml`,
 
 ## License and attributions
 
+When making dependency changes, keep `environment-nogpu.yml`, `environment.yml`,
+`environment-full.yml`, `requirements.txt`, and `setup.py` aligned.
 SCEPTer is distributed under the **GNU General Public License v3.0 or
 later** (GPLv3+). See [`LICENSE`](LICENSE) for the full text.
 
