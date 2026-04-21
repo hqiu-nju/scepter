@@ -107,11 +107,28 @@ def build_satellite_pattern_spec(
     wavelength = float(wavelength_cm) * u.cm
 
     if antenna_model in {"s1528_rec1_2", "s672"}:
-        # S.672 Annex 1, Section 1.1 (A1-1.1) uses the same piecewise
-        # envelope as S.1528 Rec 1.2.  S.672 calls the near-in sidelobe
-        # level "Ls" while S.1528 calls it "LN" — same parameter.
+        # ITU-R S.672-4 Sec. 1 and ITU-R S.1528-0 Rec. 1.2 share the
+        # same piecewise structure (power-law main lobe + near-in
+        # plateau + 25·log far-sidelobe roll-off + back floor). For
+        # **circular** beams (z = 1) the two recommendations are
+        # numerically identical. For elliptical beams they diverge:
+        # S.1528-0 uses ``a = 2.58·√(1 − k·log z)`` while S.672-4
+        # uses ``a = 2.58·(1 − k·log z)`` (linear, no square-root).
+        # SCEPTer currently only implements the S.1528 form, so we
+        # reject non-circular z on the S.672 path rather than
+        # silently returning the wrong ellipse (the "narrow
+        # assumption behind a general-sounding name" anti-pattern
+        # CLAUDE.md warns about).
         if rec12_gm_dbi is None or rec12_ln_db is None or rec12_z is None:
             raise ValueError("Pattern inputs (Gm, LN, z) are incomplete.")
+        if antenna_model == "s672" and abs(float(rec12_z) - 1.0) > 1.0e-9:
+            raise ValueError(
+                "S.672-4 with an elliptical beam (z \u2260 1) is not yet "
+                "implemented. For circular beams (z = 1) S.672 and "
+                "S.1528 Rec 1.2 are numerically identical, so pick "
+                "\"s1528_rec1_2\" with z = 1. For true elliptical "
+                "S.672 please author the pattern as a Custom-2D LUT."
+            )
         return (
             s_1528_rec1_2_pattern,
             wavelength,
@@ -215,7 +232,7 @@ def isotropic_pattern(offset_angles, wavelength=None, **_kwargs):
                        strip_input_units=True,
                        allow_none=True)
 
-def s_1528_rec1_2_pattern(offset_angles,
+def _s_1528_rec1_2_pattern_full(offset_angles,
                           axis: str = 'major',
                           Gm: float | None = None,
                           LN: float =-15*cnv.dB,
@@ -224,7 +241,6 @@ def s_1528_rec1_2_pattern(offset_angles,
                           D: float | None = None,
                           wavelength: float = (10.7*u.GHz).to(u.m, equivalencies=u.spectral()),
                           z: float = 1.0,
-                          return_extras: bool = False,
                           use_numba: bool | None = None):
     """
     Calculate the antenna radiation pattern for ITU-R Recommendation S.1528-0 recommends 1.2.
@@ -324,7 +340,12 @@ def s_1528_rec1_2_pattern(offset_angles,
     else:
         raise ValueError("Axis must be 'major' or 'minor'")   
 
-    # Constants for LN levels (from Table 1 in the recommendation)
+    # Constants for LN levels (from Table 1 in the recommendation).
+    # DELIBERATE DEVIATION from the literal ITU-R S.1528-0 text:
+    # ``alpha`` and the ``a`` expansion here carry SCEPTer's
+    # correction of known errors in the recommendation. Do NOT
+    # "fix" these against the raw ITU-R S.1528-0 Table 1 — mirror
+    # of the ``_amend`` convention used for Rec 1.4.
     LN_levels = {
         -15: {"a": 2.58 * np.sqrt(1 - 1.4 * np.log10(z)), "b": 6.32, "alpha": 1.5},
         -20: {"a": 2.58 * np.sqrt(1 - 1.0 * np.log10(z)), "b": 6.32, "alpha": 1.5},
@@ -412,7 +433,33 @@ def s_1528_rec1_2_pattern(offset_angles,
         gains[mask5] = LF
         gains[mask6] = LB
 
+    # The @ranged_quantity_input decorator above declares
+    # ``output_unit=(cnv.dBi, cnv.dBi, u.deg)`` so pycraf forcibly
+    # attaches units to a 3-tuple return. We must always return the
+    # full 3-tuple here; the outward-facing ``return_extras`` flag is
+    # honoured by the wrapper below.
     return gains, Gm, psi_b
+
+
+def s_1528_rec1_2_pattern(
+    *args,
+    return_extras: bool = False,
+    **kwargs,
+):
+    """Public S.1528 Rec 1.2 pattern entry point.
+
+    Wraps :func:`_s_1528_rec1_2_pattern_full` (which always returns
+    ``(gains, Gm, psi_b)`` because its ``@ranged_quantity_input``
+    decorator declares three output units). Honors the
+    ``return_extras`` flag outside the decorator so callers that only
+    want the gain array get a bare :class:`~astropy.units.Quantity`,
+    not a 3-tuple of scalars.
+    """
+    result = _s_1528_rec1_2_pattern_full(*args, **kwargs)
+    if return_extras:
+        return result
+    return result[0]
+
 
 def calculate_beamwidth_1d(antenna_gain_func: callable = s_1528_rec1_2_pattern,
                            level_drop: float | u.Quantity = 3.0 * cnv.dB, 
@@ -639,14 +686,24 @@ def calculate_beamwidth_2d(
     """
     import inspect
 
-    # Check if the pattern function has an 'elev' parameter
+    # Detect whether the pattern is 2-D by checking for a second
+    # angular parameter. Different patterns use different names:
+    #   M.2101 (pycraf): ``elev``
+    #   Custom 2-D wrapper: ``axis1``
+    #   S.1528 Rec 1.4: ``offset_phi``
+    _2D_PARAM_NAMES = {"elev", "axis1", "offset_phi"}
     try:
         sig = inspect.signature(antenna_gain_func)
-        has_elev = "elev" in sig.parameters
+        has_2d = bool(_2D_PARAM_NAMES & set(sig.parameters.keys()))
+        second_param_name = next(
+            (n for n in _2D_PARAM_NAMES if n in sig.parameters),
+            None,
+        )
     except (TypeError, ValueError):
-        has_elev = False
+        has_2d = False
+        second_param_name = None
 
-    if not has_elev:
+    if not has_2d:
         # 1-D pattern — fall back to the standard calculator
         return calculate_beamwidth_1d(
             antenna_gain_func,
@@ -655,24 +712,34 @@ def calculate_beamwidth_2d(
             **antenna_pattern_kwargs,
         )
 
-    # --- 2-D pattern (e.g. pycraf imt2020_composite_pattern) ---
-    # Signature: func(azim, elev, azim_i, elev_i, ...)
-    # azim_i/elev_i are beam steering angles — set to 0 for boresight.
+    # --- 2-D pattern (M.2101, Custom 2-D, asymmetric S.1528 Rec 1.4) ---
     if not isinstance(level_drop, u.Quantity):
         level_drop = np.abs(level_drop) * cnv.dB
     level_drop = np.abs(level_drop.value) * level_drop.unit
 
-    # Build kwargs with boresight steering, filtering out unsupported keys
+    # Build kwargs — pass through all antenna_pattern_kwargs (custom
+    # wrappers accept **_ sinks; analytical functions use named params).
+    # For M.2101-style patterns, inject boresight steering defaults.
     accepted_params = set(sig.parameters.keys())
-    kw = {k: v for k, v in antenna_pattern_kwargs.items() if k in accepted_params}
+    has_var_keyword = any(
+        p.kind == inspect.Parameter.VAR_KEYWORD
+        for p in sig.parameters.values()
+    )
+    if has_var_keyword:
+        kw = dict(antenna_pattern_kwargs)
+    else:
+        kw = {k: v for k, v in antenna_pattern_kwargs.items() if k in accepted_params}
     if "azim_i" not in kw and "azim_i" in accepted_params:
         kw["azim_i"] = 0.0 * u.deg
     if "elev_i" not in kw and "elev_i" in accepted_params:
         kw["elev_i"] = 0.0 * u.deg
 
-    # Get boresight gain
+    # Get boresight gain — pass 0 for both axes using the detected
+    # parameter name.
     try:
-        g0 = antenna_gain_func(0 * u.deg, elev=0 * u.deg, **kw)
+        boresight_kw = dict(kw)
+        boresight_kw[second_param_name] = 0 * u.deg
+        g0 = antenna_gain_func(0 * u.deg, **boresight_kw)
         if isinstance(g0, (tuple, list)):
             g0 = g0[0]
         if not isinstance(g0, u.Quantity):
@@ -683,8 +750,12 @@ def calculate_beamwidth_2d(
 
     target_dBi = Gmax_dBi - float(level_drop.to_value(cnv.dB))
 
-    def _find_crossing(scan_func, max_deg=90.0, step_deg=0.1):
-        """Find first angle where gain drops below target along one plane."""
+    def _find_crossing(scan_func, max_deg=90.0, step_deg=0.01):
+        """Find first angle where gain drops below target along one plane.
+
+        Uses a 0.01° coarse grid (matching ``calculate_beamwidth_1d``)
+        followed by bisection refinement to sub-0.001° accuracy.
+        """
         angles = np.arange(0.0, max_deg + step_deg, step_deg)
         try:
             gains = scan_func(angles)
@@ -706,18 +777,64 @@ def calculate_beamwidth_2d(
         crossings = np.where(np.isfinite(diff) & (diff < 0))[0]
         if len(crossings) == 0:
             return max_deg
-        return float(angles[crossings[0]])
+        # Bisection refinement between the last above-threshold and
+        # first below-threshold sample for sub-step accuracy.
+        idx_below = int(crossings[0])
+        if idx_below == 0:
+            return float(angles[0])
+        lo, hi = float(angles[idx_below - 1]), float(angles[idx_below])
+        for _ in range(20):  # ~1e-6 deg precision
+            mid = 0.5 * (lo + hi)
+            try:
+                g = scan_func(np.array([mid]))
+                if isinstance(g, (tuple, list)):
+                    g = g[0]
+                if hasattr(g, "to_value"):
+                    g_val = g.to_value(cnv.dBi)
+                else:
+                    g_val = g
+                g_db = float(np.asarray(g_val).flat[0])
+            except Exception:
+                break
+            if np.isfinite(g_db) and g_db >= target_dBi:
+                lo = mid
+            else:
+                hi = mid
+        return 0.5 * (lo + hi)
 
-    # Scan along azimuth plane (elev=0)
-    def _az_scan(az_deg):
-        return antenna_gain_func(az_deg * u.deg, elev=0 * u.deg, **kw)
+    # For patterns with ``(theta, phi)``-style parameterisation
+    # (Custom 2-D theta_phi, S.1528 Rec 1.4), sweep theta in two
+    # orthogonal phi cuts. For ``(azim, elev)``-style (M.2101,
+    # Custom 2-D az_el), sweep azim at elev=0 then elev at azim=0.
+    if second_param_name == "offset_phi":
+        # S.1528 Rec 1.4 (theta, phi) — sweep theta in two phi cuts.
+        # Scan 1: theta at phi=0 (Lr-dominated plane)
+        def _scan_a(deg):
+            scan_kw = dict(kw)
+            scan_kw[second_param_name] = 0 * u.deg
+            return antenna_gain_func(deg * u.deg, **scan_kw)
 
-    # Scan along elevation plane (az=0)
-    def _el_scan(el_deg):
-        return antenna_gain_func(0 * u.deg, elev=el_deg * u.deg, **kw)
+        # Scan 2: theta at phi=90° (Lt-dominated plane)
+        def _scan_b(deg):
+            scan_kw = dict(kw)
+            scan_kw[second_param_name] = 90.0 * u.deg
+            return antenna_gain_func(deg * u.deg, **scan_kw)
+    else:
+        # az/el style (M.2101, Custom 2-D az_el, Custom 2-D
+        # theta_phi via wrapper) — sweep axis0 at axis1=0 and
+        # axis1 at axis0=0.
+        def _scan_a(deg):
+            scan_kw = dict(kw)
+            scan_kw[second_param_name] = 0 * u.deg
+            return antenna_gain_func(deg * u.deg, **scan_kw)
 
-    theta_az = _find_crossing(_az_scan)
-    theta_el = _find_crossing(_el_scan)
+        def _scan_b(deg):
+            scan_kw = dict(kw)
+            scan_kw[second_param_name] = deg * u.deg
+            return antenna_gain_func(0 * u.deg, **scan_kw)
+
+    theta_az = _find_crossing(_scan_a)
+    theta_el = _find_crossing(_scan_b)
 
     # Geometric mean of the two half-power half-angles, doubled to full beamwidth
     effective_half_angle = np.sqrt(theta_az * theta_el)

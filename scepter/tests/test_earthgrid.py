@@ -44,6 +44,7 @@ from scepter import earthgrid
 from scepter.antenna import (
     build_satellite_pattern_spec,
     calculate_beamwidth_1d,
+    calculate_beamwidth_2d,
     pattern_wavelength_cm_from_frequency_mhz,
     resolve_pattern_wavelength_cm,
     s_1528_rec1_4_pattern_amend,
@@ -1026,7 +1027,11 @@ class TestStep1ContourHelpers:
             contour_drop="db7",
             **pattern_kwargs,
         )
-        beamwidth = calculate_beamwidth_1d(
+        # resolve_contour_half_angle_deg dispatches through
+        # calculate_beamwidth_2d which scans both principal planes with
+        # 0.1° step and returns the geometric-mean beamwidth. Compare
+        # against the same 2-D path to match scan resolution.
+        beamwidth = calculate_beamwidth_2d(
             antenna_func,
             level_drop=7.0 * cnv.dB,
             wavelength=wavelength,

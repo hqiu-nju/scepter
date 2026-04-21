@@ -9,7 +9,7 @@ include requirements.txt
 include pytest.ini
 
 # Bundled data files
-recursive-include scepter/data *.geojson *.svg *.ico *.jpg
+recursive-include scepter/data *.geojson *.svg *.ico *.jpg *.png *.json
 
 # Exclude test fixtures, notebooks, and development-only files
 prune scepter/tests

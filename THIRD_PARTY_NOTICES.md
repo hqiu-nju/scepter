@@ -202,3 +202,27 @@ The `LICENSES/` directory includes reference copies of the main licence texts:
 
 An ITU-specific licence text is not bundled.  Handle any ITU-derived data
 notices separately, based on the exact data you redistribute.
+
+
+
+## User-supplied custom antenna patterns
+
+Starting with the custom-antenna-pattern feature (schema
+scepter_antenna_pattern_format=v1), SCEPTer accepts user-supplied
+antenna pattern LUTs loaded from JSON files.  These files are user
+data; no licence obligations attach to SCEPTer from the act of loading
+them.
+
+*However*, **users are responsible for the provenance of LUTs they
+load**.  Regulatory masks and vendor datasheets are frequently
+redistribution-restricted — check the source's own terms before
+embedding a pattern in a project JSON you publish or share.  ITU-R
+reference patterns that SCEPTer samples internally (via
+scepter.analytical_fixtures) come from pycraf and SCEPTer's own
+scepter.antenna module and inherit those upstream terms.
+
+Example pattern files bundled under scepter/data/custom_patterns/
+are synthetic fixtures generated on the fly from the analytical ITU
+formulations; they are distributed under the SCEPTer project licence
+(GPL-3.0-or-later) as fixture data, not as a redistribution of any
+protected regulatory dataset.

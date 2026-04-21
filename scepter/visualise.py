@@ -4641,6 +4641,8 @@ def _save_animation_mp4_ffmpeg(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         bufsize=1,
     )
 
@@ -4760,7 +4762,13 @@ def _save_animation_gif(
             "0",
             str(output_path),
         ]
-        proc = subprocess.run(cmd, capture_output=True, text=True)
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
         if proc.returncode == 0:
             return True
         err = (proc.stderr or "").strip()

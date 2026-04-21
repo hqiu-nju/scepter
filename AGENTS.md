@@ -24,7 +24,10 @@ post-processing/visualisation.
 | Module | Responsibility |
 |---|---|
 | `angle_sampler.py` | Sky-grid angle sampling (S.1586) |
-| `antenna.py` | Satellite & RAS antenna patterns (S.1528), optional Numba |
+| `antenna.py` | Satellite & RAS antenna patterns (S.1528 Rec 1.2 / Rec 1.4, M.2101, S.672, RA.1631), optional Numba |
+| `custom_antenna.py` | User-supplied LUT patterns, schema v1 (authoritative format in the module docstring) — loader, CPU evaluators, dump/inspect CLI |
+| `analytical_fixtures.py` | Helpers that sample any analytical pattern onto a user-chosen grid and produce a `CustomAntennaPattern` — used by tests and by users who want an LUT from an ITU formula |
+| `custom_antenna_preview.py` | Pure-matplotlib figure factory for loaded custom patterns (polar 1-D, heatmap + principal-plane cuts 2-D) |
 | `earthgrid.py` | Hex-grid generation, footprint geometry, optional Numba |
 | `gpu_accel.py` | GPU-accelerated SGP4, angular distance, CuPy kernels |
 | `nbeam.py` | Beam-cap sizing with visibility-aware pooling policies |
@@ -199,8 +202,8 @@ Dominant stages (non-boresight): **power** (~36%), **export_copy** (~33%),
 | `_compute_gpu_direct_epfd_batch_device` | `scenario.py:~6843` | Batch orchestration |
 | `run_gpu_direct_epfd` | `scenario.py:~7881` | Top-level iteration driver |
 | `GpuScepterSession` | `gpu_accel.py:~11432` | Session lifecycle, caches, activation |
-| `prepare_peak_pfd_lut_context` | `gpu_accel.py` | Builds the `K(β, shell)` (S.1528) or `K(α, β, shell)` (M.2101) per-beam LUT for the Service & Demand surface-PFD cap |
-| `_compute_aggregate_surface_pfd_cap_cp` | `gpu_accel.py` | Loop-free GPU-native per-satellite aggregate cap helper (supports the 3-D and 4-D paths, and S.1528/M.2101 patterns) |
+| `prepare_peak_pfd_lut_context` | `gpu_accel.py` | Builds the surface-PFD cap per-beam LUT. 1-D `K(β, shell)` for every pattern whose asymmetry rotates with the beam (S.1528 Rec 1.2, S.1528 Rec 1.4 both symmetric and asymmetric, Custom-1D, Custom-2D, isotropic); 2-D `K(α, β, shell)` for M.2101 whose element pattern is fixed in the sat body frame. |
+| `_compute_aggregate_surface_pfd_cap_cp` | `gpu_accel.py` | Loop-free GPU-native per-satellite aggregate cap helper; supports the 3-D and 4-D paths and every TX-pattern family (S.1528 / M.2101 / Custom-1D / Custom-2D). |
 
 ### Surface-PFD cap (Service & Demand "Max PFD on Earth surface")
 
@@ -226,8 +229,18 @@ aggregate) can deposit on Earth's surface.  Enabled from the GUI
 - The cap path is **GPU-native with no Python loops**.  Any refactor that
   reintroduces a per-group Python loop is a regression even if the test
   suite passes.
-- S.1528 / S.1528 Rec 1.2 patterns use a 1-D `K(β)` LUT; M.2101
-  phased-array patterns use a 2-D `K(α, β)` LUT selected by
-  `GpuPeakPfdLutContext.is_2d`.  All three pattern families and both
-  cap modes are supported in the 3-D and 4-D boresight-avoidance paths
-  as of 2026-Q2.
+- **1-D `K(β)` LUT** (``GpuPeakPfdLutContext.is_2d == False``) is used
+  for every transmit pattern whose asymmetry rotates *with* the beam
+  boresight — the full-360° observation sweep of the builder then
+  renders the result α-invariant. This covers S.1528 Rec 1.2,
+  S.1528 Rec 1.4 (both symmetric and asymmetric), Custom-1D,
+  Custom-2D, and isotropic. The asymmetric S.1528 and Custom-2D
+  builders use a 2-D `(ψ, φ)` observation sweep so the φ-dependent
+  main-lobe peak is captured correctly; the output is still 1-D.
+- **2-D `K(α, β)` LUT** (``is_2d == True``) is only used for M.2101 —
+  its element pattern is fixed in the sat body frame, so K genuinely
+  depends on the beam's steering azimuth.
+- All five transmit-pattern families (S.1528 Rec 1.2, S.1528 Rec 1.4
+  sym and asym, M.2101, Custom-1D, Custom-2D) and both cap modes
+  (per-beam / per-satellite aggregate) are supported in the 3-D and
+  4-D boresight-avoidance paths.
