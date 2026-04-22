@@ -44,6 +44,8 @@ notebooks/*.npz
 notebooks/*.png
 scripts/*.npz
 scripts/*.png
+scripts/uv_plots
+
 # Simulation outputs
 *.h5
 !scepter/tests/*.h5
@@ -62,3 +64,4 @@ CLAUDE.md
 # Agent scratchpad (interim benchmarks, verification scripts, saved
 # project fixtures used during development — not part of the public repo)
 .claude/
+scripts/uv_plots/uv_plane_combined.png
