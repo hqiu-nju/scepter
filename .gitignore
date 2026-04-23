@@ -44,6 +44,8 @@ notebooks/*.npz
 notebooks/*.png
 scripts/*.npz
 scripts/*.png
+scripts/uv_plots
+
 # Simulation outputs
 *.h5
 !scepter/tests/*.h5
@@ -63,6 +65,7 @@ CLAUDE.md
 # project fixtures, scratch GUI project configs) — not part of the
 # public repo.
 .claude/
+scripts/uv_plots/uv_plane_combined.png
 
 # One-shot dev helper for re-rendering the README schematic PNGs.
 .render_schematics.py

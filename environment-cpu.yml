@@ -8,15 +8,16 @@
 # environment.  CPU-based workflows, postprocessing, and the desktop GUI work
 # fully.
 #
-# Create:   conda env create -f environment-nogpu.yml
-# Activate: conda activate scepter-nogpu
-# Update:   conda env update -n scepter-nogpu -f environment-nogpu.yml
+# Create:   conda env create -f environment-cpu.yml
+# Activate: conda activate scepter-cpu
+# Update:   conda env update -n scepter-cpu -f environment-cpu.yml
 #
 # All packages are sourced from conda-forge.
 
-name: scepter-nogpu
+name: scepter-cpu
 channels:
   - conda-forge
+  - numba
 dependencies:
   - python=3.10
   - "setuptools<81"
@@ -48,6 +49,10 @@ dependencies:
   # --- Development & testing ---
   - pytest
   - pytest-timeout
+
+  # --- numba (no GPU/CUDA) ---
+  - numba
+  - llvmlite
 
   # --- Notebook support ---
   - ipykernel

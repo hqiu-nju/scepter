@@ -150,6 +150,13 @@ Date Created: 2026-02-06
 Version: 0.1
 """
 
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+import re
+from typing import Sequence
+
 import numpy as np
 
 # Optional imports - these are used by high-level convenience functions
@@ -169,7 +176,7 @@ except ImportError:
 try:
     from astropy import units as u
     from astropy.time import Time
-    from astropy.coordinates import EarthLocation
+    from astropy.coordinates import AltAz, EarthLocation, ICRS, SkyCoord
     ASTROPY_AVAILABLE = True
 except ImportError:
     ASTROPY_AVAILABLE = False
@@ -533,14 +540,78 @@ def enu_to_uvw(hour_angle, declination, baseline_enu):
         elif baseline_uvw.ndim == 1:
             # This shouldn't happen, but safeguard
             baseline_uvw = baseline_uvw.reshape(-1, 3)
-    
+
     return baseline_uvw
+
+
+def _broadcast_source_tracks(
+    ra_deg: float | np.ndarray,
+    dec_deg: float | np.ndarray,
+    obs_times,
+    ref_lon_qty,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Broadcast source coordinates against the observation-time axis.
+
+    Parameters
+    ----------
+    ra_deg : float or array-like
+        Right ascension in degrees. Scalars denote a fixed phase centre; array-
+        like inputs must broadcast with *dec_deg*. When *obs_times* is non-
+        scalar, the leading axis of any array input must match the number of
+        time samples.
+    dec_deg : float or array-like
+        Declination in degrees. Scalars or arrays broadcastable with *ra_deg*.
+    obs_times : astropy.time.Time
+        Observation time(s) used to derive local sidereal time.
+    ref_lon_qty : astropy.units.Quantity
+        Reference longitude passed to ``Time.sidereal_time``.
+
+    Returns
+    -------
+    ra_arr : numpy.ndarray
+        Broadcast right-ascension array in degrees.
+    dec_arr : numpy.ndarray
+        Broadcast declination array in degrees.
+    lst_arr : numpy.ndarray
+        Apparent local sidereal time in radians, reshaped so the leading time
+        axis broadcasts against ``ra_arr`` / ``dec_arr``.
+
+    Raises
+    ------
+    ValueError
+        If the source-track arrays do not share a compatible leading time axis
+        with *obs_times*.
+    """
+    ra_arr, dec_arr = np.broadcast_arrays(
+        np.asarray(ra_deg, dtype=np.float64),
+        np.asarray(dec_deg, dtype=np.float64),
+    )
+    lst = np.asarray(
+        obs_times.sidereal_time("apparent", longitude=ref_lon_qty).radian,
+        dtype=np.float64,
+    )
+
+    if obs_times.isscalar or ra_arr.ndim == 0:
+        return ra_arr, dec_arr, lst
+
+    time_size = int(lst.shape[0])
+    if ra_arr.shape[0] != time_size:
+        raise ValueError(
+            "Array-valued ra_deg/dec_deg must use the observation-time axis "
+            "as their leading dimension. "
+            f"Received leading dimension {ra_arr.shape[0]} for {time_size} "
+            "time samples."
+        )
+
+    lst_arr = lst.reshape((time_size,) + (1,) * (ra_arr.ndim - 1))
+    return ra_arr, dec_arr, lst_arr
 
 
 def compute_uvw(
     antennas,
-    ra_deg: float,
-    dec_deg: float,
+    ra_deg: float | np.ndarray,
+    dec_deg: float | np.ndarray,
     obs_times,
     ref_index: int = 0,
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -573,10 +644,20 @@ def compute_uvw(
 
         *EarthLocation* attributes used: ``.x``, ``.y``, ``.z`` (geocentric
         Cartesian, converted to metres internally).
-    ra_deg : float
+    ra_deg : float or array-like
         Right ascension of the target source (degrees, range [0, 360)).
-    dec_deg : float
-        Declination of the target source (degrees, range [−90, 90]).
+
+        Scalars describe a fixed phase centre for the full observation.
+        Array-valued inputs allow time-varying or multi-source tracks, provided
+        they broadcast with *dec_deg*. When *obs_times* is non-scalar, any
+        array input must use the observation-time axis as its leading
+        dimension. For example:
+
+        - ``(T,)`` for one time-varying phase centre,
+        - ``(T, N_sat)`` for per-time satellite tracks.
+    dec_deg : float or array-like
+        Declination of the target source (degrees, range [−90, 90]). Must be
+        scalar or broadcastable with *ra_deg*.
     obs_times : astropy.time.Time
         Observation times.  May be scalar or 1-D array.  Used to derive the
         local sidereal time (LST) and hence the hour angle.
@@ -586,17 +667,21 @@ def compute_uvw(
 
     Returns
     -------
-    uvw_all : numpy.ndarray, shape (N, 3) or (N, T, 3)
+    uvw_all : numpy.ndarray
         UVW coordinates (metres) for all N antennas (baselines relative to
-        ``antennas[ref_index]``).  Shape is ``(N, 3)`` when *obs_times* is a
-        scalar ``Time`` and ``(N, T, 3)`` for a length-T time array.
+        ``antennas[ref_index]``). The output shape is
+        ``(N,) + source_shape + (3,)`` where ``source_shape`` is:
+
+        - empty for scalar *obs_times* and scalar coordinates,
+        - ``(T,)`` for one phase centre sampled over T times,
+        - ``(T, N_sat)`` for T samples of N_sat satellite tracks.
 
         - Axis 0 — antenna index; ``uvw_all[ref_index]`` is always zero.
-        - Axis 1 (array case) — time index.
+        - Intermediate axes — time followed by any extra source axes.
         - Last axis — UVW components ``[u, v, w]``.
-    hour_angles : float or numpy.ndarray, shape (T,)
-        Hour angle of the phase centre at each time (radians).  Scalar when
-        *obs_times* is scalar, shape ``(T,)`` otherwise.
+    hour_angles : float or numpy.ndarray
+        Hour angle of the phase centre at each time/source sample (radians).
+        Shape matches the broadcast source-coordinate shape described above.
 
     Raises
     ------
@@ -604,8 +689,9 @@ def compute_uvw(
         If astropy is not installed (always required), or if pycraf is not
         installed when PyObserver inputs are used.
     ValueError
-        If *antennas* is empty, contains mixed types, or contains objects of
-        an unrecognised type.
+        If *antennas* is empty, contains mixed types, contains objects of an
+        unrecognised type, or if array-valued source coordinates do not use the
+        observation-time axis as their leading dimension.
 
     Notes
     -----
@@ -624,6 +710,9 @@ def compute_uvw(
        - Scalar time → input ``(N, 3)``, output ``(N, 3)``.
        - Array time (T samples) → baselines expanded to ``(N, 1, 3)``,
          hour angle to ``(1, T)``, output ``(N, T, 3)``.
+       - Array time plus extra source axes → baselines expanded to
+         ``(N, 1, ..., 1, 3)`` and broadcast against the full
+         source-coordinate tensor.
 
     Examples
     --------
@@ -734,23 +823,709 @@ def compute_uvw(
     # ------------------------------------------------------------------
     # Step 4: compute apparent LST and hour angle once for all times
     # ------------------------------------------------------------------
-    lst = obs_times.sidereal_time('apparent', longitude=ref_lon_qty)
-    ha = hour_angle(np.radians(ra_deg), lst.radian)
+    ra_arr, dec_arr, lst_radian = _broadcast_source_tracks(
+        ra_deg,
+        dec_deg,
+        obs_times,
+        ref_lon_qty,
+    )
+    ha = hour_angle(np.radians(ra_arr), lst_radian)
 
     # ------------------------------------------------------------------
     # Step 5: one ENU → UVW rotation, broadcast over all baselines × times
     # ------------------------------------------------------------------
-    dec_rad = np.radians(dec_deg)
-    if obs_times.isscalar:
+    dec_rad = np.radians(dec_arr)
+    if np.ndim(ha) == 0:
         # ha is scalar; baselines_enu is (N, 3) → output (N, 3)
         uvw_all = enu_to_uvw(ha, dec_rad, baselines_enu)
     else:
-        # ha has shape (T,); expand dims for broadcasting
-        # baselines_enu: (N, 1, 3) × ha: (1, T) → output (N, T, 3)
+        # Expand the baseline matrix with one singleton source axis per
+        # dimension in the source-coordinate tensor, then broadcast all
+        # UVW rotations in a single vectorised call.
+        baseline_expanded = baselines_enu[
+            (slice(None),) + (np.newaxis,) * np.ndim(ha) + (slice(None),)
+        ]
         uvw_all = enu_to_uvw(
-            ha[np.newaxis, :],
+            ha[np.newaxis, ...],
             dec_rad,
-            baselines_enu[:, np.newaxis, :],
+            baseline_expanded,
         )
 
     return uvw_all, ha
+
+
+@dataclass(frozen=True, slots=True)
+class AntennaArrayGeometry:
+    """
+    Parsed telescope-array geometry from an external coordinate file.
+
+    Parameters
+    ----------
+    antenna_names : tuple of str
+        Stable antenna identifiers in file order.
+    longitudes_deg : numpy.ndarray, shape (N_ant,)
+        Antenna geodetic longitudes in degrees, east-positive.
+    latitudes_deg : numpy.ndarray, shape (N_ant,)
+        Antenna geodetic latitudes in degrees, north-positive.
+    altitudes_m : numpy.ndarray, shape (N_ant,)
+        Antenna heights above the reference ellipsoid in metres.
+    earth_locations : tuple of astropy.coordinates.EarthLocation
+        Per-antenna EarthLocation objects used for UVW calculations.
+    pyobservers : numpy.ndarray, shape (N_ant,), dtype object
+        Matching ``cysgp4.PyObserver`` objects used for satellite propagation.
+
+    Notes
+    -----
+    The parsed altitude is always stored in metres. ``pyobservers`` are created
+    from the same file by converting altitude to kilometres for the
+    ``PyObserver`` constructor, while ``earth_locations`` retain metres for
+    Astropy frame transforms.
+    """
+
+    antenna_names: tuple[str, ...]
+    longitudes_deg: np.ndarray
+    latitudes_deg: np.ndarray
+    altitudes_m: np.ndarray
+    earth_locations: tuple[EarthLocation, ...]
+    pyobservers: np.ndarray
+
+
+@dataclass(frozen=True, slots=True)
+class TrackingUvwResult:
+    """
+    UVW products for one tracked celestial pointing plus propagated satellites.
+
+    Parameters
+    ----------
+    mjds : numpy.ndarray
+        Original observation-time array passed to the builder.
+    obs_times : astropy.time.Time
+        Flattened UTC observation times derived from *mjds*.
+    antenna_names : tuple of str
+        Antenna identifiers in baseline axis order.
+    satellite_names : tuple of str
+        Satellite identifiers in satellite axis order.
+    pointing_uvw_m : numpy.ndarray, shape (N_ant, T, 3)
+        UVW coordinates for the requested fixed RA/Dec phase centre.
+    pointing_hour_angles_rad : numpy.ndarray, shape (T,)
+        Hour-angle track for the fixed phase centre.
+    satellite_uvw_m : numpy.ndarray, shape (N_ant, T, N_sat, 3)
+        UVW coordinates for each propagated satellite, using its time-varying
+        ICRS RA/Dec as the phase centre.
+    satellite_hour_angles_rad : numpy.ndarray, shape (T, N_sat)
+        Satellite-specific hour-angle tracks in radians.
+    satellite_ra_deg : numpy.ndarray, shape (T, N_sat)
+        Satellite ICRS right ascension tracks in degrees.
+    satellite_dec_deg : numpy.ndarray, shape (T, N_sat)
+        Satellite ICRS declination tracks in degrees.
+    satellite_separation_deg : numpy.ndarray, shape (T, N_sat)
+        Angular separation between each satellite and the requested pointing in
+        the reference antenna's local AltAz frame.
+
+    Notes
+    -----
+    All UVW arrays use antenna 0, or the requested reference index, as the
+    baseline origin. ``pointing_uvw_m[ref_index]`` and
+    ``satellite_uvw_m[ref_index]`` are therefore identically zero.
+    """
+
+    mjds: np.ndarray
+    obs_times: Time
+    antenna_names: tuple[str, ...]
+    satellite_names: tuple[str, ...]
+    pointing_uvw_m: np.ndarray
+    pointing_hour_angles_rad: np.ndarray
+    satellite_uvw_m: np.ndarray
+    satellite_hour_angles_rad: np.ndarray
+    satellite_ra_deg: np.ndarray
+    satellite_dec_deg: np.ndarray
+    satellite_separation_deg: np.ndarray
+
+
+_ARRAY_NAME_FIELDS = frozenset({"name", "antenna", "antenna_name", "station", "id"})
+_ARRAY_LON_FIELDS = frozenset({"lon", "longitude", "lon_deg", "longitude_deg"})
+_ARRAY_LAT_FIELDS = frozenset({"lat", "latitude", "lat_deg", "latitude_deg"})
+_ARRAY_ALT_FIELDS = frozenset({"alt", "altitude", "height", "alt_m", "height_m"})
+
+
+def _normalise_header_name(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", value.strip().lower()).strip("_")
+
+
+def _split_coordinate_fields(line: str, delimiter: str | None) -> list[str]:
+    if delimiter is None:
+        return re.split(r"\s+", line.strip())
+    return [field.strip() for field in line.split(delimiter)]
+
+
+def _token_is_float(token: str) -> bool:
+    try:
+        float(token)
+    except ValueError:
+        return False
+    return True
+
+
+def _resolve_array_column(
+    header_map: dict[str, int],
+    accepted_names: frozenset[str],
+    column_label: str,
+) -> int:
+    for candidate in accepted_names:
+        if candidate in header_map:
+            return int(header_map[candidate])
+    expected = ", ".join(sorted(accepted_names))
+    raise ValueError(
+        f"Array file is missing a {column_label} column. Expected one of: {expected}."
+    )
+
+
+def load_telescope_array_file(
+    array_file: str | Path,
+    *,
+    altitude_unit: u.UnitBase | None = None,
+) -> AntennaArrayGeometry:
+    """
+    Read an antenna-coordinate text file and build propagation/UVW objects.
+
+    Parameters
+    ----------
+    array_file : str or pathlib.Path
+        Path to the telescope-array definition. Supported formats are:
+
+        - comma-separated text,
+        - tab-separated text,
+        - whitespace-delimited text.
+
+        Blank lines and ``#`` comments are ignored. The file may either:
+
+        1. include a header row with longitude/latitude/altitude column names,
+           optionally plus a name/id column, or
+        2. omit the header, in which case the first three columns are assumed to
+           be ``lon_deg lat_deg alt`` and the optional fourth column is treated
+           as the antenna name.
+    altitude_unit : astropy.units.UnitBase, optional
+        Physical unit of the altitude column. Defaults to metres. The parsed
+        altitude is stored internally in metres and converted to kilometres when
+        creating the corresponding ``cysgp4.PyObserver`` objects.
+
+    Returns
+    -------
+    AntennaArrayGeometry
+        Parsed antenna coordinates together with matching ``EarthLocation`` and
+        ``PyObserver`` containers.
+
+    Raises
+    ------
+    ImportError
+        If astropy or cysgp4 is unavailable.
+    FileNotFoundError
+        If *array_file* does not exist.
+    ValueError
+        If the file is empty, malformed, or does not contain enough columns to
+        infer longitude, latitude, and altitude.
+
+    Notes
+    -----
+    Header names are matched case-insensitively after normalising punctuation.
+    Accepted aliases are:
+
+    - longitude: ``lon``, ``longitude``, ``lon_deg``, ``longitude_deg``
+    - latitude: ``lat``, ``latitude``, ``lat_deg``, ``latitude_deg``
+    - altitude: ``alt``, ``altitude``, ``height``, ``alt_m``, ``height_m``
+    - optional name: ``name``, ``antenna``, ``antenna_name``, ``station``, ``id``
+    """
+    if not ASTROPY_AVAILABLE:
+        raise ImportError(
+            "astropy is required for load_telescope_array_file. "
+            "Install with: pip install astropy"
+        )
+    if not CYSGP4_AVAILABLE:
+        raise ImportError(
+            "cysgp4 is required for load_telescope_array_file. "
+            "Install with: pip install cysgp4"
+        )
+
+    path = Path(array_file)
+    if not path.is_file():
+        raise FileNotFoundError(f"Telescope array file not found: {path}")
+
+    altitude_unit = u.m if altitude_unit is None else altitude_unit
+    lines: list[str] = []
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.split("#", 1)[0].strip()
+        if line:
+            lines.append(line)
+
+    if not lines:
+        raise ValueError(f"Telescope array file '{path}' is empty.")
+
+    first_line = lines[0]
+    if "," in first_line:
+        delimiter: str | None = ","
+    elif "\t" in first_line:
+        delimiter = "\t"
+    else:
+        delimiter = None
+
+    first_fields = _split_coordinate_fields(first_line, delimiter)
+    header_present = len(first_fields) < 3 or not all(
+        _token_is_float(token) for token in first_fields[:3]
+    )
+
+    antenna_names: list[str] = []
+    lons_deg: list[float] = []
+    lats_deg: list[float] = []
+    alts_m: list[float] = []
+
+    if header_present:
+        header_map = {
+            _normalise_header_name(field): idx for idx, field in enumerate(first_fields)
+        }
+        name_idx = next(
+            (header_map[field] for field in _ARRAY_NAME_FIELDS if field in header_map),
+            None,
+        )
+        lon_idx = _resolve_array_column(header_map, _ARRAY_LON_FIELDS, "longitude")
+        lat_idx = _resolve_array_column(header_map, _ARRAY_LAT_FIELDS, "latitude")
+        alt_idx = _resolve_array_column(header_map, _ARRAY_ALT_FIELDS, "altitude")
+        data_lines = lines[1:]
+    else:
+        name_idx = 3
+        lon_idx, lat_idx, alt_idx = 0, 1, 2
+        data_lines = lines
+
+    if not data_lines:
+        raise ValueError(f"Telescope array file '{path}' does not contain any data rows.")
+
+    required_columns = max(lon_idx, lat_idx, alt_idx) + 1
+    for row_idx, line in enumerate(data_lines):
+        fields = _split_coordinate_fields(line, delimiter)
+        if len(fields) < required_columns:
+            raise ValueError(
+                f"Row {row_idx + 1} in '{path}' has {len(fields)} columns but "
+                f"at least {required_columns} are required."
+            )
+        antenna_names.append(
+            fields[name_idx] if name_idx is not None and len(fields) > name_idx else f"ant{row_idx}"
+        )
+        lons_deg.append(float(fields[lon_idx]))
+        lats_deg.append(float(fields[lat_idx]))
+        alts_m.append(u.Quantity(float(fields[alt_idx]), altitude_unit).to_value(u.m))
+
+    longitudes = np.asarray(lons_deg, dtype=np.float64)
+    latitudes = np.asarray(lats_deg, dtype=np.float64)
+    altitudes = np.asarray(alts_m, dtype=np.float64)
+    earth_locations = tuple(
+        EarthLocation(lon=lon * u.deg, lat=lat * u.deg, height=alt * u.m)
+        for lon, lat, alt in zip(longitudes, latitudes, altitudes)
+    )
+    pyobservers = np.asarray(
+        [
+            cysgp4.PyObserver(float(lon), float(lat), float(alt / 1000.0))
+            for lon, lat, alt in zip(longitudes, latitudes, altitudes)
+        ],
+        dtype=object,
+    )
+
+    return AntennaArrayGeometry(
+        antenna_names=tuple(antenna_names),
+        longitudes_deg=longitudes,
+        latitudes_deg=latitudes,
+        altitudes_m=altitudes,
+        earth_locations=earth_locations,
+        pyobservers=pyobservers,
+    )
+
+
+def load_tle_files(tle_files: str | Path | Sequence[str | Path]) -> np.ndarray:
+    """
+    Load one or more ASCII TLE files into a single ``PyTle`` object array.
+
+    Parameters
+    ----------
+    tle_files : str, pathlib.Path, or sequence of either
+        One or more plain-text TLE files accepted by
+        ``scepter.obs.tle_ascii_to_pytles``.
+
+    Returns
+    -------
+    numpy.ndarray
+        One-dimensional object array of ``cysgp4.PyTle`` instances in file
+        order. Multiple files are concatenated.
+
+    Raises
+    ------
+    ValueError
+        If *tle_files* is empty or if no TLEs were loaded.
+    """
+    if isinstance(tle_files, (str, Path)):
+        tle_paths = (tle_files,)
+    else:
+        tle_paths = tuple(tle_files)
+
+    if len(tle_paths) == 0:
+        raise ValueError("tle_files cannot be empty.")
+
+    from . import obs
+
+    batches = [
+        np.asarray(obs.tle_ascii_to_pytles(str(path)), dtype=object).ravel()
+        for path in tle_paths
+    ]
+    if any(batch.size == 0 for batch in batches):
+        raise ValueError("All TLE files must contain at least one valid TLE block.")
+
+    return np.concatenate(batches)
+
+
+def _extract_tle_names_from_text(tle_text: str) -> list[str]:
+    lines = [
+        line.strip()
+        for line in tle_text.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    names: list[str] = []
+    idx = 0
+    while idx < len(lines):
+        line = lines[idx]
+        if line.startswith("1 "):
+            if idx + 1 >= len(lines) or not lines[idx + 1].startswith("2 "):
+                raise ValueError("Malformed 2-line TLE block encountered while extracting names.")
+            satnum = line[2:7].strip()
+            names.append(f"sat_{satnum}" if satnum else f"sat{len(names)}")
+            idx += 2
+            continue
+        if idx + 2 < len(lines) and lines[idx + 1].startswith("1 ") and lines[idx + 2].startswith("2 "):
+            names.append(line)
+            idx += 3
+            continue
+        idx += 1
+    return names
+
+
+def load_tle_files_with_names(
+    tle_files: str | Path | Sequence[str | Path],
+) -> tuple[np.ndarray, tuple[str, ...]]:
+    """
+    Load ASCII TLE files together with stable satellite names.
+
+    Parameters
+    ----------
+    tle_files : str, pathlib.Path, or sequence of either
+        One or more plain-text TLE files.
+
+    Returns
+    -------
+    tles : numpy.ndarray
+        One-dimensional object array of ``cysgp4.PyTle`` instances.
+    names : tuple of str
+        Satellite names in the same order as *tles*. Three-line TLE blocks use
+        their explicit name line; unnamed two-line blocks fall back to the line
+        1 catalogue number.
+    """
+    if isinstance(tle_files, (str, Path)):
+        tle_paths = (tle_files,)
+    else:
+        tle_paths = tuple(tle_files)
+
+    if len(tle_paths) == 0:
+        raise ValueError("tle_files cannot be empty.")
+
+    from . import obs
+
+    all_tles: list[np.ndarray] = []
+    all_names: list[str] = []
+    for path_like in tle_paths:
+        path = Path(path_like)
+        tle_text = path.read_text(encoding="utf-8")
+        tles = np.asarray(obs.tle_ascii_to_pytles(str(path)), dtype=object).ravel()
+        names = _extract_tle_names_from_text(tle_text)
+        if len(names) != tles.size:
+            names = [f"sat{len(all_names) + idx}" for idx in range(tles.size)]
+        all_tles.append(tles)
+        all_names.extend(names)
+
+    return np.concatenate(all_tles), tuple(all_names)
+
+
+def _default_tracking_mjds(
+    *,
+    epochs: int,
+    cadence,
+    trange,
+    tint,
+    startdate,
+) -> np.ndarray:
+    if not CYSGP4_AVAILABLE:
+        raise ImportError(
+            "cysgp4 is required for default time-grid generation. "
+            "Install with: pip install cysgp4"
+        )
+
+    from . import skynet
+
+    startdate = cysgp4.PyDateTime() if startdate is None else startdate
+    return skynet.plantime(
+        epochs=epochs,
+        cadence=cadence,
+        trange=trange,
+        tint=tint,
+        startdate=startdate,
+    )
+
+
+@dataclass(slots=True)
+class TrackingUvwBuilder:
+    """
+    Build UVW products from a tracked RA/Dec, an array file, and TLE catalogs.
+
+    Parameters
+    ----------
+    array_file : str or pathlib.Path
+        Telescope-array coordinate file consumed by
+        :func:`load_telescope_array_file`.
+    tle_files : str, pathlib.Path, or sequence of either
+        One or more ASCII TLE files consumed by :func:`load_tle_files`.
+    mjds : numpy.ndarray
+        Observation-time array in MJD. The shape is preserved for the returned
+        metadata; UVW calculations flatten this to a one-dimensional time axis
+        of length ``T = mjds.size``.
+    ref_index : int, optional
+        Reference antenna index for the UVW origin.
+    altitude_unit : astropy.units.UnitBase, optional
+        Unit used to interpret the array-file altitude column. Defaults to
+        metres.
+    d_rx : astropy.units.Quantity, optional
+        Receiver diameter. Defaults to ``13.5 m``.
+    eta_a_rx : float, optional
+        Receiver aperture efficiency. Defaults to ``0.7``.
+    freq : astropy.units.Quantity, optional
+        Receiver centre frequency. Defaults to ``1420 MHz``.
+    bandwidth : astropy.units.Quantity, optional
+        Receiver bandwidth. Defaults to ``10 MHz``.
+    elevation_limit_deg : float, optional
+        Optional mean-elevation filter passed to ``obs.obs_sim.reduce_sats``.
+        ``None`` keeps all propagated satellites.
+    save_propagation : bool, optional
+        If ``True``, let ``obs.obs_sim.populate`` save the propagation cache.
+    propagation_save_path : str or pathlib.Path, optional
+        Output path used only when ``save_propagation`` is ``True``.
+    verbose : bool, optional
+        Forwarded to ``obs.obs_sim.populate``.
+
+    Notes
+    -----
+    The builder uses ``EarthLocation`` objects for the UVW transforms and
+    ``PyObserver`` objects for ``cysgp4`` propagation so that the metres-based
+    array file remains the single source of truth for antenna altitude.
+    Celestial tracking and pointing-to-satellite angular separations are
+    delegated to ``obs.obs_sim.sky_track`` and ``obs.obs_sim.sat_separation``
+    to avoid duplicating that workflow inside ``uvw.py``.
+    """
+
+    array_file: str | Path
+    tle_files: str | Path | Sequence[str | Path]
+    mjds: np.ndarray
+    ref_index: int = 0
+    altitude_unit: u.UnitBase | None = None
+    d_rx: u.Quantity | None = None
+    eta_a_rx: float = 0.7
+    freq: u.Quantity | None = None
+    bandwidth: u.Quantity | None = None
+    elevation_limit_deg: float | None = None
+    save_propagation: bool = False
+    propagation_save_path: str | Path | None = None
+    verbose: bool = False
+
+    def build(self, ra_deg: float, dec_deg: float) -> TrackingUvwResult:
+        """
+        Generate pointing and satellite UVW tracks for a fixed celestial target.
+
+        Parameters
+        ----------
+        ra_deg : float
+            Right ascension of the tracked phase centre in degrees.
+        dec_deg : float
+            Declination of the tracked phase centre in degrees.
+
+        Returns
+        -------
+        TrackingUvwResult
+            UVW arrays for the fixed pointing and every propagated satellite.
+        """
+        if not ASTROPY_AVAILABLE:
+            raise ImportError(
+                "astropy is required for TrackingUvwBuilder. "
+                "Install with: pip install astropy"
+            )
+        if not CYSGP4_AVAILABLE:
+            raise ImportError(
+                "cysgp4 is required for TrackingUvwBuilder. "
+                "Install with: pip install cysgp4"
+            )
+
+        from . import obs, skynet
+
+        geometry = load_telescope_array_file(
+            self.array_file,
+            altitude_unit=self.altitude_unit,
+        )
+        tles, satellite_names_all = load_tle_files_with_names(self.tle_files)
+        skygrid = skynet.pointgen_S_1586_1(niters=1)
+        receiver = obs.receiver_info(
+            d_rx=13.5 * u.m if self.d_rx is None else self.d_rx,
+            eta_a_rx=self.eta_a_rx,
+            pyobs=geometry.pyobservers,
+            freq=1420 * u.MHz if self.freq is None else self.freq,
+            bandwidth=10 * u.MHz if self.bandwidth is None else self.bandwidth,
+        )
+        sim = obs.obs_sim(receiver, skygrid, self.mjds)
+        save_name = (
+            "satellite_info.npz"
+            if self.propagation_save_path is None
+            else str(self.propagation_save_path)
+        )
+        sim.populate(
+            tles,
+            save=self.save_propagation,
+            savename=save_name,
+            verbose=self.verbose,
+        )
+        visible_names = satellite_names_all
+        if self.elevation_limit_deg is not None:
+            sim.reduce_sats(el_limit=self.elevation_limit_deg)
+            mask = np.asarray(sim.elevation_mask, dtype=bool)
+            visible_names = tuple(name for name, keep in zip(satellite_names_all, mask) if keep)
+
+        obs_times = Time(np.asarray(self.mjds, dtype=np.float64).ravel(), format="mjd", scale="utc")
+        sim.sky_track(ra_deg, dec_deg, observer_index=self.ref_index)
+        satellite_separation_deg = np.asarray(
+            sim.sat_separation(mode="tracking")[self.ref_index, 0, 0, 0, :, :].to_value(u.deg),
+            dtype=np.float64,
+        )
+        antennas = list(geometry.earth_locations)
+        pointing_uvw, pointing_ha = compute_uvw(
+            antennas,
+            ra_deg=ra_deg,
+            dec_deg=dec_deg,
+            obs_times=obs_times,
+            ref_index=self.ref_index,
+        )
+
+        ref_location = sim.altaz_frame.location
+        topo_az = np.asarray(sim.topo_pos_az[self.ref_index, 0, 0, 0, :, :], dtype=np.float64)
+        topo_el = np.asarray(sim.topo_pos_el[self.ref_index, 0, 0, 0, :, :], dtype=np.float64)
+        sat_altaz = SkyCoord(
+            az=topo_az * u.deg,
+            alt=topo_el * u.deg,
+            frame=AltAz(obstime=obs_times[:, np.newaxis], location=ref_location),
+        )
+        sat_icrs = sat_altaz.transform_to(ICRS())
+        satellite_ra_deg = np.asarray(sat_icrs.ra.deg, dtype=np.float64)
+        satellite_dec_deg = np.asarray(sat_icrs.dec.deg, dtype=np.float64)
+        satellite_uvw, satellite_ha = compute_uvw(
+            antennas,
+            ra_deg=satellite_ra_deg,
+            dec_deg=satellite_dec_deg,
+            obs_times=obs_times,
+            ref_index=self.ref_index,
+        )
+        return TrackingUvwResult(
+            mjds=np.asarray(self.mjds, dtype=np.float64),
+            obs_times=obs_times,
+            antenna_names=geometry.antenna_names,
+            satellite_names=visible_names,
+            pointing_uvw_m=np.asarray(pointing_uvw, dtype=np.float64),
+            pointing_hour_angles_rad=np.asarray(pointing_ha, dtype=np.float64),
+            satellite_uvw_m=np.asarray(satellite_uvw, dtype=np.float64),
+            satellite_hour_angles_rad=np.asarray(satellite_ha, dtype=np.float64),
+            satellite_ra_deg=satellite_ra_deg,
+            satellite_dec_deg=satellite_dec_deg,
+            satellite_separation_deg=satellite_separation_deg,
+        )
+
+
+def build_tracking_uvw(
+    *,
+    ra_deg: float,
+    dec_deg: float,
+    array_file: str | Path,
+    tle_files: str | Path | Sequence[str | Path],
+    mjds: np.ndarray | None = None,
+    epochs: int = 1,
+    cadence=None,
+    trange=None,
+    tint=None,
+    startdate=None,
+    ref_index: int = 0,
+    altitude_unit: u.UnitBase | None = None,
+    d_rx: u.Quantity | None = None,
+    eta_a_rx: float = 0.7,
+    freq: u.Quantity | None = None,
+    bandwidth: u.Quantity | None = None,
+    elevation_limit_deg: float | None = None,
+    save_propagation: bool = False,
+    propagation_save_path: str | Path | None = None,
+    verbose: bool = False,
+) -> TrackingUvwResult:
+    """
+    Convenience wrapper for :class:`TrackingUvwBuilder`.
+
+    Parameters
+    ----------
+    ra_deg, dec_deg : float
+        Fixed tracking coordinates in ICRS degrees.
+    array_file : str or pathlib.Path
+        Telescope-array coordinate file.
+    tle_files : str, pathlib.Path, or sequence of either
+        One or more ASCII TLE files.
+    mjds : numpy.ndarray, optional
+        Explicit observation-time grid in MJD. If omitted, a default grid is
+        generated with ``epochs=1``, ``cadence=24 h``, ``trange=3600 s``, and
+        ``tint=1 s`` unless overridden.
+    epochs, cadence, trange, tint, startdate
+        Parameters forwarded to ``scepter.skynet.plantime`` when *mjds* is not
+        supplied.
+    ref_index, altitude_unit, d_rx, eta_a_rx, freq, bandwidth,
+    elevation_limit_deg, save_propagation, propagation_save_path, verbose
+        Passed through to :class:`TrackingUvwBuilder`.
+
+    Returns
+    -------
+    TrackingUvwResult
+        Pointing and satellite UVW products for the requested observation.
+    """
+    if mjds is None:
+        if not ASTROPY_AVAILABLE:
+            raise ImportError(
+                "astropy is required for build_tracking_uvw. "
+                "Install with: pip install astropy"
+            )
+        cadence = 24 * u.hour if cadence is None else cadence
+        trange = 3600 * u.s if trange is None else trange
+        tint = 1 * u.s if tint is None else tint
+        mjds = _default_tracking_mjds(
+            epochs=epochs,
+            cadence=cadence,
+            trange=trange,
+            tint=tint,
+            startdate=startdate,
+        )
+
+    builder = TrackingUvwBuilder(
+        array_file=array_file,
+        tle_files=tle_files,
+        mjds=np.asarray(mjds, dtype=np.float64),
+        ref_index=ref_index,
+        altitude_unit=altitude_unit,
+        d_rx=d_rx,
+        eta_a_rx=eta_a_rx,
+        freq=freq,
+        bandwidth=bandwidth,
+        elevation_limit_deg=elevation_limit_deg,
+        save_propagation=save_propagation,
+        propagation_save_path=propagation_save_path,
+        verbose=verbose,
+    )
+    return builder.build(ra_deg=ra_deg, dec_deg=dec_deg)
