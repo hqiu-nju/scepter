@@ -365,6 +365,419 @@ def test_aggregate_cap_rec12_pattern_runs_and_matches_expectations():
 
 
 @GPU_REQUIRED
+def test_peak_pfd_k_lut_custom_1d_matches_native_rec12():
+    """Stage 16: a Custom-1D K-LUT built from a Rec 1.2 evaluator
+    matches the native Rec 1.2 K-LUT within K-LUT resampling noise.
+
+    End-to-end K-LUT path: ``prepare_peak_pfd_lut_context`` →
+    ``_build_peak_pfd_k_lut_cp`` → ``_evaluate_normalised_pattern_cp``
+    → ``_evaluate_custom_1d_pattern_cp``. Every Stage-9 "NEEDS UPGRADE"
+    consumer along this chain accepts the Custom-1D context.
+    """
+    import numpy as np
+    from scepter import analytical_fixtures as af
+
+    session = gpu_accel.GpuScepterSession(compute_dtype=np.float32, watchdog_enabled=False)
+    with session.activate():
+        # Native Rec 1.2 context.
+        ctx_native = session.prepare_s1528_rec12_pattern_context(
+            wavelength_m=0.15, gm_dbi=34.0, ln_db=-15.0, z=1.0, diameter_m=1.8,
+        )
+        # Custom-1D sampled densely from the same Rec 1.2 evaluator.
+        evaluator = af.s1528_rec1_2_evaluator(
+            gm_dbi=34.0, diameter_m=1.8, wavelength_m=0.15,
+        )
+        theta_grid = np.linspace(0.0, 180.0, 18001)
+        pat = af.sample_analytical_1d(evaluator, theta_grid, peak_gain_dbi=34.0)
+        ctx_custom = session.prepare_custom_pattern_1d_context(
+            pattern=pat, wavelength_m=0.15,
+        )
+
+        orbit_radii = np.asarray([6_903_000.0])
+        lut_native = session.prepare_peak_pfd_lut_context(
+            pattern_context=ctx_native,
+            sat_orbit_radius_m_per_sat=orbit_radii,
+            atmosphere_lut_context=None,
+            target_alt_km=0.0,
+        )
+        lut_custom = session.prepare_peak_pfd_lut_context(
+            pattern_context=ctx_custom,
+            sat_orbit_radius_m_per_sat=orbit_radii,
+            atmosphere_lut_context=None,
+            target_alt_km=0.0,
+        )
+    session.close(reset_device=False)
+
+    assert lut_native.is_2d is False
+    assert lut_custom.is_2d is False
+    assert lut_native.n_beta == lut_custom.n_beta
+
+    k_native = lut_native.d_k_lut.get()
+    k_custom = lut_custom.d_k_lut.get()
+    assert k_native.shape == k_custom.shape
+
+    # Relative comparison excluding the far-sidelobe floor where K is
+    # tiny and relative errors blow up.
+    peak = max(float(k_native.max()), float(k_custom.max()))
+    mask = (k_native > peak * 1.0e-5) & (k_custom > peak * 1.0e-5)
+    assert mask.sum() > 10
+    rel = np.abs(k_custom[mask] - k_native[mask]) / np.maximum(k_native[mask], 1.0e-30)
+    # Two independent LUT pipelines (analytical piecewise Rec 1.2 on
+    # the native side; LUT→LUT resample on the custom side). 2%
+    # relative agreement is tight — picks up any structural mistake
+    # while absorbing legitimate float32 roundoff across the chain.
+    assert float(np.max(rel)) < 2.0e-2, (
+        f"Custom-1D K-LUT vs native Rec 1.2 K-LUT: max relative error = "
+        f"{float(np.max(rel)):.3e}"
+    )
+
+
+@GPU_REQUIRED
+def test_peak_pfd_k_lut_custom_2d_matches_native_asym_s1528():
+    """Stage 17: a Custom-2D K-LUT built from an asymmetric S.1528
+    Rec 1.4 evaluator matches the native asymmetric-S.1528 1-D K(β)
+    LUT built from the same evaluator.
+
+    Both pipelines are α-invariant 1-D K(β) tables (aperture rotates
+    with the beam); they should therefore agree to within LUT-
+    resample + float32 roundoff.
+    """
+    import numpy as np
+    from scepter import analytical_fixtures as af
+
+    session = gpu_accel.GpuScepterSession(compute_dtype=np.float32, watchdog_enabled=False)
+    with session.activate():
+        # Native asymmetric S.1528 Rec 1.4.
+        ctx_native = session.prepare_s1528_pattern_context(
+            wavelength_m=0.15, lt_m=3.2, lr_m=1.6, slr_db=20.0, l=2,
+            far_sidelobe_start_deg=90.0, far_sidelobe_level_db=-20.0, gm_db=34.0,
+        )
+        assert ctx_native.is_2d
+
+        # Custom-2D sampled densely from the same Rec 1.4 evaluator.
+        # Grid-aligned resample step keeps bilinear-of-bilinear exact.
+        evaluator = af.s1528_rec1_4_evaluator(
+            wavelength_m=0.15, lr_m=1.6, lt_m=3.2, slr_db=20.0, l=2,
+            gm_db=34.0,
+            far_sidelobe_start_deg=90.0, far_sidelobe_level_db=-20.0,
+        )
+        theta_grid = np.linspace(0.0, 180.0, 18001)
+        phi_grid = np.linspace(-180.0, 180.0, 361)
+        pat = af.sample_analytical_2d_theta_phi(
+            evaluator, theta_grid, phi_grid, peak_gain_dbi=34.0, phi_wraps=True,
+        )
+        ctx_custom = session.prepare_custom_pattern_2d_context(
+            pattern=pat, wavelength_m=0.15,
+            axis0_step_deg=0.01, axis1_step_deg=1.0,
+        )
+
+        orbit_radii = np.asarray([6_903_000.0])
+        lut_native = session.prepare_peak_pfd_lut_context(
+            pattern_context=ctx_native,
+            sat_orbit_radius_m_per_sat=orbit_radii,
+            atmosphere_lut_context=None,
+            target_alt_km=0.0,
+        )
+        lut_custom = session.prepare_peak_pfd_lut_context(
+            pattern_context=ctx_custom,
+            sat_orbit_radius_m_per_sat=orbit_radii,
+            atmosphere_lut_context=None,
+            target_alt_km=0.0,
+        )
+    session.close(reset_device=False)
+
+    # Both must be 1-D (α-invariant).
+    assert lut_native.is_2d is False
+    assert lut_custom.is_2d is False
+    assert lut_native.n_beta == lut_custom.n_beta
+
+    k_native = lut_native.d_k_lut.get()
+    k_custom = lut_custom.d_k_lut.get()
+    peak = max(float(k_native.max()), float(k_custom.max()))
+    mask = (k_native > peak * 1.0e-4) & (k_custom > peak * 1.0e-4)
+    assert mask.sum() > 10
+    rel = np.abs(k_custom[mask] - k_native[mask]) / np.maximum(k_native[mask], 1.0e-30)
+    # Same 2-D (ψ, φ) observation sweep; only the pattern evaluator
+    # differs (analytical Bessel/Taylor on the native side, bilinear
+    # LUT on the custom side).  3% relative agreement is tight enough
+    # to catch any dispatch error while absorbing LUT roundoff.
+    assert float(np.max(rel)) < 3.0e-2, (
+        f"Custom-2D K-LUT vs native asym S.1528 K-LUT: max relative = "
+        f"{float(np.max(rel)):.3e}"
+    )
+
+
+@GPU_REQUIRED
+def test_stage26_surface_pfd_cap_regression_custom_1d_and_2d():
+    """Stage 26: surface-PFD cap regression. A Custom-1D pattern and a
+    Custom-2D pattern, both sampled from the same analytical
+    evaluator, produce surface-PFD K-LUTs that match the native
+    analytical K-LUT within 3 % relative error.
+
+    This is the correctness sibling of the (longer) benchmark
+    harness ``benchmark_surface_pfd_cap.py`` — it doesn't measure
+    throughput, but it does verify that the cap infrastructure (K-LUT
+    build + lookup + cap-factor computation) accepts Custom contexts
+    and produces physically equivalent output.
+    """
+    import numpy as np
+    from scepter import analytical_fixtures as af
+
+    session = gpu_accel.GpuScepterSession(compute_dtype=np.float32, watchdog_enabled=False)
+    with session.activate():
+        # --- 1-D leg: Rec 1.2 analytical vs Custom-1D of same curve. ---
+        ctx_native_1d = session.prepare_s1528_rec12_pattern_context(
+            wavelength_m=0.15, gm_dbi=34.0, ln_db=-15.0, z=1.0, diameter_m=1.8,
+        )
+        ev_1d = af.s1528_rec1_2_evaluator(
+            gm_dbi=34.0, diameter_m=1.8, wavelength_m=0.15,
+        )
+        pat_1d = af.sample_analytical_1d(
+            ev_1d, np.linspace(0.0, 180.0, 18001), peak_gain_dbi=34.0,
+        )
+        ctx_custom_1d = session.prepare_custom_pattern_1d_context(
+            pattern=pat_1d, wavelength_m=0.15,
+        )
+        orbit_radii = np.asarray([6_903_000.0])
+        lut_native_1d = session.prepare_peak_pfd_lut_context(
+            pattern_context=ctx_native_1d,
+            sat_orbit_radius_m_per_sat=orbit_radii,
+            atmosphere_lut_context=None, target_alt_km=0.0,
+        )
+        lut_custom_1d = session.prepare_peak_pfd_lut_context(
+            pattern_context=ctx_custom_1d,
+            sat_orbit_radius_m_per_sat=orbit_radii,
+            atmosphere_lut_context=None, target_alt_km=0.0,
+        )
+        k_native = lut_native_1d.d_k_lut.get()
+        k_custom = lut_custom_1d.d_k_lut.get()
+        peak = max(float(k_native.max()), float(k_custom.max()))
+        mask = (k_native > peak * 1e-5) & (k_custom > peak * 1e-5)
+        assert mask.sum() > 10
+        rel_1d = np.abs(k_custom[mask] - k_native[mask]) / np.maximum(k_native[mask], 1e-30)
+        assert float(np.max(rel_1d)) < 3.0e-2
+
+        # --- 2-D leg: asym S.1528 Rec 1.4 analytical vs Custom-2D. ---
+        ctx_native_2d = session.prepare_s1528_pattern_context(
+            wavelength_m=0.15, lt_m=3.2, lr_m=1.6, slr_db=20.0, l=2,
+            far_sidelobe_start_deg=90.0, far_sidelobe_level_db=-20.0,
+            gm_db=34.0,
+        )
+        ev_2d = af.s1528_rec1_4_evaluator(
+            wavelength_m=0.15, lr_m=1.6, lt_m=3.2, slr_db=20.0, l=2,
+            gm_db=34.0,
+            far_sidelobe_start_deg=90.0, far_sidelobe_level_db=-20.0,
+        )
+        pat_2d = af.sample_analytical_2d_theta_phi(
+            ev_2d,
+            np.linspace(0.0, 180.0, 18001),
+            np.linspace(-180.0, 180.0, 361),
+            peak_gain_dbi=34.0, phi_wraps=True,
+        )
+        ctx_custom_2d = session.prepare_custom_pattern_2d_context(
+            pattern=pat_2d, wavelength_m=0.15,
+            axis0_step_deg=0.01, axis1_step_deg=1.0,
+        )
+        lut_native_2d = session.prepare_peak_pfd_lut_context(
+            pattern_context=ctx_native_2d,
+            sat_orbit_radius_m_per_sat=orbit_radii,
+            atmosphere_lut_context=None, target_alt_km=0.0,
+        )
+        lut_custom_2d = session.prepare_peak_pfd_lut_context(
+            pattern_context=ctx_custom_2d,
+            sat_orbit_radius_m_per_sat=orbit_radii,
+            atmosphere_lut_context=None, target_alt_km=0.0,
+        )
+        k_native_2d = lut_native_2d.d_k_lut.get()
+        k_custom_2d = lut_custom_2d.d_k_lut.get()
+        peak_2d = max(float(k_native_2d.max()), float(k_custom_2d.max()))
+        mask_2d = (k_native_2d > peak_2d * 1e-4) & (k_custom_2d > peak_2d * 1e-4)
+        assert mask_2d.sum() > 10
+        rel_2d = np.abs(k_custom_2d[mask_2d] - k_native_2d[mask_2d]) / np.maximum(
+            k_native_2d[mask_2d], 1e-30
+        )
+        assert float(np.max(rel_2d)) < 3.0e-2
+    session.close(reset_device=False)
+
+
+@GPU_REQUIRED
+def test_peak_pfd_k_lut_custom_2d_low_level_builder_direct():
+    """Stage 17: the Custom-2D K-LUT builder accepts a Custom-2D
+    context directly and produces a 1-D K(β) array.
+
+    Complements the session-level test by pinning the low-level
+    builder contract.
+    """
+    import numpy as np
+    from scepter import analytical_fixtures as af
+
+    evaluator = af.s1528_rec1_4_evaluator(
+        wavelength_m=0.15, lr_m=1.6, lt_m=3.2, slr_db=20.0, l=2,
+        gm_db=34.0,
+    )
+    pat = af.sample_analytical_2d_theta_phi(
+        evaluator,
+        theta_grid_deg=np.linspace(0.0, 180.0, 361),
+        phi_grid_deg=np.linspace(-180.0, 180.0, 73),
+        peak_gain_dbi=34.0,
+    )
+    session = gpu_accel.GpuScepterSession(compute_dtype=np.float32, watchdog_enabled=False)
+    with session.activate():
+        ctx = session.prepare_custom_pattern_2d_context(
+            pattern=pat, wavelength_m=0.15,
+        )
+        k_cp, beta_step, beta_max, n_beta, psi_horizon = (
+            gpu_accel._build_peak_pfd_k_lut_custom2d_cp(
+                pattern_context=ctx,
+                orbit_radius_m=6_903_000.0,
+                earth_radius_m=float(_earth_radius_m()),
+                atmosphere_lut_context=None,
+                target_alt_km=0.0,
+                beta_step_deg=0.5,   # coarser than default so the test is fast
+                psi_step_deg=0.25,
+                phi_step_deg=5.0,
+            )
+        )
+        k_host = k_cp.get()
+    session.close(reset_device=False)
+    assert k_host.ndim == 1
+    assert k_host.shape == (n_beta,)
+    assert n_beta > 0
+    assert np.all(np.isfinite(k_host)) and np.all(k_host >= 0.0)
+    # K peaks at β=0 for a narrow main-lobe pattern.
+    assert float(k_host[0]) == float(k_host.max())
+
+
+@GPU_REQUIRED
+def test_lookup_peak_pfd_k_any_routes_custom_2d_to_1d_lookup():
+    """Stage 18: ``_lookup_peak_pfd_k_any_cp`` dispatches on
+    ``lut_context.is_2d``. Custom-2D produces a 1-D K(β) LUT (Stage 17
+    physics), so the runtime lookup picks ``_lookup_peak_pfd_k_cp`` —
+    not the 2-D ``_lookup_peak_pfd_k_2d_cp``. Verifies that α is
+    correctly ignored for the Custom-2D case (rotating a beam's
+    steering azimuth must not change its K value, same as for
+    asymmetric S.1528).
+    """
+    import cupy as cp
+    import numpy as np
+    from scepter import analytical_fixtures as af
+
+    session = gpu_accel.GpuScepterSession(compute_dtype=np.float32, watchdog_enabled=False)
+    with session.activate():
+        evaluator = af.s1528_rec1_4_evaluator(
+            wavelength_m=0.15, lr_m=1.6, lt_m=3.2, slr_db=20.0, l=2,
+            gm_db=34.0,
+        )
+        pat = af.sample_analytical_2d_theta_phi(
+            evaluator,
+            theta_grid_deg=np.linspace(0.0, 180.0, 361),
+            phi_grid_deg=np.linspace(-180.0, 180.0, 73),
+            peak_gain_dbi=34.0,
+        )
+        ctx = session.prepare_custom_pattern_2d_context(
+            pattern=pat, wavelength_m=0.15,
+        )
+        orbit_r = 6_903_000.0
+        lut = session.prepare_peak_pfd_lut_context(
+            pattern_context=ctx,
+            sat_orbit_radius_m_per_sat=np.asarray([orbit_r]),
+            atmosphere_lut_context=None,
+            target_alt_km=0.0,
+        )
+        assert lut.is_2d is False  # Stage 17 produces 1-D K(β).
+
+        # Query K at a fixed β for two wildly different α values — the
+        # 1-D lookup must return identical K (α-invariance of the
+        # aperture-rotates-with-beam physics).
+        beta_rad = cp.full((4,), float(np.deg2rad(15.0)), dtype=cp.float32)
+        alpha_rad = cp.asarray(
+            [0.0, np.deg2rad(30.0), np.deg2rad(90.0), np.deg2rad(170.0)],
+            dtype=cp.float32,
+        )
+        shell_ids = cp.zeros((4,), dtype=cp.int32)
+        k_values = gpu_accel._lookup_peak_pfd_k_any_cp(
+            lut, alpha_rad, beta_rad, shell_ids,
+        ).get()
+        assert np.all(k_values > 0)
+        # All four must be identical to within float32 roundoff.
+        assert np.max(np.abs(k_values - k_values[0])) < 1.0e-7 * float(k_values[0])
+
+
+@GPU_REQUIRED
+def test_peak_pfd_k_lut_custom_2d_builder_rejects_non_custom_2d():
+    """Low-level Custom-2D builder rejects other context types with a
+    clear error — guard against type confusion."""
+    import numpy as np
+    from scepter import analytical_fixtures as af
+
+    session = gpu_accel.GpuScepterSession(compute_dtype=np.float32, watchdog_enabled=False)
+    with session.activate():
+        rec12_ctx = _make_narrow_s1528_rec12(session)
+        with pytest.raises(TypeError, match="GpuCustomPattern2DContext"):
+            gpu_accel._build_peak_pfd_k_lut_custom2d_cp(
+                pattern_context=rec12_ctx,
+                orbit_radius_m=6_903_000.0,
+                earth_radius_m=float(_earth_radius_m()),
+                atmosphere_lut_context=None,
+                target_alt_km=0.0,
+            )
+    session.close(reset_device=False)
+
+
+@GPU_REQUIRED
+def test_aggregate_cap_asymmetric_s1528_rec14_runs():
+    """Aggregate helper works with an asymmetric S.1528 Rec 1.4 pattern.
+
+    Stage 9b regression: before the (θ, φ) branch landed,
+    ``_compute_aggregate_surface_pfd_cap_cp`` routed asymmetric
+    contexts through ``_evaluate_normalised_pattern_cp`` which would
+    raise ``NotImplementedError`` at the 1-D LUT evaluator's Stage-5
+    guard. Now the asymmetric branch derives φ per (candidate, beam)
+    pair and dispatches the 2-D (θ, φ) LUT. The K=1, β=0 main-lobe
+    nadir case should still match the free-space ``EIRP / (4π h²)``
+    reference, same as the Rec 1.2 test above.
+    """
+    session = gpu_accel.GpuScepterSession(compute_dtype=np.float32, watchdog_enabled=False)
+    with session.activate():
+        ctx = session.prepare_s1528_pattern_context(
+            wavelength_m=0.15, lt_m=3.2, lr_m=1.6, slr_db=20.0, l=2,
+            far_sidelobe_start_deg=90.0, far_sidelobe_level_db=-20.0, gm_db=34.1,
+        )
+        assert ctx.is_2d
+
+        earth_r = _earth_radius_m()
+        orbit_r = earth_r + 550.0e3
+        h = orbit_r - earth_r
+
+        T, S, K = 1, 1, 1
+        beam_alpha = np.zeros((T, S, K), dtype=np.float32)
+        beam_beta = np.zeros((T, S, K), dtype=np.float32)
+        beam_valid = np.ones((T, S, K), dtype=bool)
+        eirp_peak = np.full((T, S, K), 500.0, dtype=np.float32)
+        orbit_radii = np.array([orbit_r], dtype=np.float32)
+
+        kwargs = _agg_helper_kwargs(
+            session, ctx,
+            beam_alpha_host=beam_alpha,
+            beam_beta_host=beam_beta,
+            beam_valid_host=beam_valid,
+            eirp_peak_host=eirp_peak,
+            orbit_radii_host=orbit_radii,
+            sat_axis_index=1,
+            max_surface_pfd_lin=1.0e30,
+        )
+        _, peak_pfd_cp, _ = gpu_accel._compute_aggregate_surface_pfd_cap_cp(**kwargs)
+        peak = float(peak_pfd_cp.get()[0, 0])
+    session.close(reset_device=False)
+
+    expected = 500.0 / (4.0 * math.pi * h * h)
+    # Asymmetric pattern at θ=0 still peaks at G_max (= 1.0 in normalised
+    # form), so the aggregate cap peak reduces to the same free-space
+    # PFD as the symmetric case.
+    assert peak == pytest.approx(expected, rel=1.0e-3)
+
+
+@GPU_REQUIRED
 def test_per_beam_cap_rec12_pattern_full_pipeline():
     """End-to-end cap application with a Rec 1.2 pattern through the
     public ``accumulate_ras_power`` wrapper."""
@@ -1799,6 +2212,118 @@ def test_aggregate_cap_nadir_dominates_for_wide_pattern_off_nadir_beam():
         f"Wide pattern at 55° should have the nadir sidelobe dominating; "
         f"peak_agg={peak_agg:.3e} vs main_lobe_only={main_lobe_pfd:.3e}"
     )
+
+
+def test_cap_disabled_zeroes_stored_thresholds_in_scenario_layer():
+    """Regression for iteration 18: when the GUI sets
+    ``max_surface_pfd_enabled=False`` but leaves the stored threshold
+    value at e.g. ``-83.5 dBW/m²/MHz`` (the GUI preserves the last
+    used threshold across toggle changes), the scenario layer
+    must zero the threshold to ``None`` before it propagates into
+    the power kernel.  Without this zero-out, the kernel raises
+    ``ValueError: max_surface_pfd_dbw_m2_* limit supplied but
+    peak_pfd_lut_context is None ...``.
+
+    This test asserts the invariant by source inspection — the
+    fix is a 3-line conditional at a stable location in
+    ``scenario.py``.  Source inspection is slightly brittle but
+    catches the most common reintroduction mode (someone
+    refactoring the cap gate and removing the early zero-out).
+    """
+    from pathlib import Path
+    from scepter import scenario as _scen
+    src = Path(_scen.__file__).read_text(encoding="utf-8")
+    # The fix block — look for the exact conditional form that
+    # zeroes both thresholds when the cap is disabled.
+    assert "if not bool(max_surface_pfd_enabled):" in src, (
+        "Iteration-18 cap-disable zero-out conditional is missing "
+        "from scenario.py — GUI-serialised threshold values may now "
+        "leak into the power kernel when the cap toggle is off."
+    )
+    # Extract the block text and sanity-check both threshold kwargs
+    # are set to None (not numeric zero, which would be a real cap).
+    idx = src.index("if not bool(max_surface_pfd_enabled):")
+    block = src[idx:idx + 400]
+    assert "max_surface_pfd_dbw_m2_mhz = None" in block, (
+        "Iteration-18 fix: per-MHz threshold must be reset to None, "
+        "not dropped or left untouched."
+    )
+    assert "max_surface_pfd_dbw_m2_channel = None" in block, (
+        "Iteration-18 fix: per-channel threshold must be reset to "
+        "None, not dropped or left untouched."
+    )
+    # Belt-and-braces: "0" or "0.0" must not appear as the reset
+    # value — that would be a valid (extremely loose) cap, not
+    # 'disabled'.  See the user Q&A recorded in the memory file
+    # (feedback_cupy_raw_kernel_contiguity / aggregate_cap_chunking).
+    assert "max_surface_pfd_dbw_m2_mhz = 0" not in block
+    assert "max_surface_pfd_dbw_m2_channel = 0" not in block
+
+
+@GPU_REQUIRED
+def test_aggregate_cap_chunking_bit_exact_vs_single_pass():
+    """Regression test for iteration 19: the ``n_groups``-axis
+    chunking path in :func:`_compute_aggregate_surface_pfd_cap_cp`
+    must produce bit-exact ``cap_factor``, ``peak_pfd``, and stats
+    compared to the single-pass path.
+
+    Chunking is triggered automatically when
+    ``n_groups × n_cand × K_act × 4 × 3`` exceeds
+    ``chunk_memory_budget_bytes``.  Passing a tiny budget forces
+    every group to its own chunk; the expected (single-pass)
+    output is obtained with a huge budget.  Each group is
+    physics-independent, so correctness requires **bit-exact**
+    equality — any tolerance would hide a real bug.
+    """
+    session = gpu_accel.GpuScepterSession(compute_dtype=np.float32, watchdog_enabled=False)
+    with session.activate():
+        tx_ctx = _make_narrow_s1528(session)
+        earth_r = _earth_radius_m()
+        orbit_r = earth_r + 550.0e3
+
+        T, S, K = 3, 6, 4
+        rng = np.random.default_rng(1234)
+        beam_alpha = rng.uniform(-np.pi, np.pi, (T, S, K)).astype(np.float32)
+        beam_beta = rng.uniform(0.0, np.radians(40.0), (T, S, K)).astype(np.float32)
+        beam_valid = np.ones((T, S, K), dtype=bool)
+        beam_valid[:, :, -1] = rng.random((T, S)) > 0.3
+        # Large EIRP so the tight cap below actually triggers.
+        eirp_peak = np.full((T, S, K), 1.0e6, dtype=np.float32)
+        orbit_radii = np.full((S,), orbit_r, dtype=np.float32)
+
+        kwargs_single = _agg_helper_kwargs(
+            session, tx_ctx,
+            beam_alpha_host=beam_alpha,
+            beam_beta_host=beam_beta,
+            beam_valid_host=beam_valid,
+            eirp_peak_host=eirp_peak,
+            orbit_radii_host=orbit_radii,
+            sat_axis_index=1,
+            max_surface_pfd_lin=1.0e-8,  # tight → clamping active
+        )
+        cap_s_cp, peak_s_cp, stats_s = gpu_accel._compute_aggregate_surface_pfd_cap_cp(
+            **kwargs_single,
+            chunk_memory_budget_bytes=1_000_000_000,
+        )
+        cap_c_cp, peak_c_cp, stats_c = gpu_accel._compute_aggregate_surface_pfd_cap_cp(
+            **kwargs_single,
+            chunk_memory_budget_bytes=4_096,  # force fine-grained chunking
+        )
+        cap_s = cap_s_cp.get()
+        peak_s = peak_s_cp.get()
+        cap_c = cap_c_cp.get()
+        peak_c = peak_c_cp.get()
+    session.close(reset_device=False)
+
+    np.testing.assert_array_equal(cap_s, cap_c)
+    np.testing.assert_array_equal(peak_s, peak_c)
+    assert stats_s == stats_c, (
+        f"Chunked stats {stats_c} diverge from single-pass {stats_s} "
+        "— iteration 19 chunking invariant broken."
+    )
+    # Sanity: the tight limit should actually have clamped a bunch
+    # of groups so this test is not a trivial no-op.
+    assert int(stats_s["n_capped"]) > 0
 
 
 @GPU_REQUIRED

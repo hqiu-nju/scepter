@@ -391,6 +391,16 @@ def _build_reuse_neighbors_from_xy(
     *,
     point_spacing_km: float,
 ) -> list[list[int]]:
+    """Find up to 6 nearest-neighbours within a hexagonal-spacing window.
+
+    Uses ``scipy.spatial.cKDTree`` so the cost is O(N log N) instead of
+    the O(N²) pairwise-distance matrix the naive implementation built.
+    At ~500 k cells the pairwise path needed 3.57 TiB of RAM for the
+    ``(N, N, 2)`` deltas tensor; the kd-tree path stays within a few
+    hundred MB.  Falls back to the original O(N²) path for tiny grids
+    (where the kd-tree overhead dominates) and when SciPy is
+    unavailable.
+    """
     point_count = int(np.asarray(x_km).size)
     if point_count != int(np.asarray(y_km).size):
         raise ValueError("x_km and y_km must share a common one-dimensional axis.")
@@ -402,12 +412,44 @@ def _build_reuse_neighbors_from_xy(
             np.asarray(y_km, dtype=np.float64).reshape(-1),
         ]
     )
-    deltas = coords[:, None, :] - coords[None, :, :]
-    distances_km = np.sqrt(np.sum(deltas**2, axis=2))
     spacing_value = max(1.0e-6, float(point_spacing_km))
     min_neighbor_distance = 0.45 * spacing_value
     max_neighbor_distance = 1.28 * spacing_value
     neighbors: list[list[int]] = [[] for _ in range(point_count)]
+
+    # For small grids the naive path is actually faster (kd-tree build
+    # amortises slowly) and the pairwise matrix only uses ~80 MB at
+    # 1000 cells.  Above the threshold the pairwise matrix would
+    # exceed host RAM, so switch to the kd-tree path.
+    try:
+        from scipy.spatial import cKDTree  # type: ignore[import-not-found]
+        _have_kdtree = True
+    except Exception:
+        _have_kdtree = False
+
+    if _have_kdtree and point_count > 1500:
+        tree = cKDTree(coords)
+        # ``query_ball_tree`` returns, for each point, all indices within
+        # ``r``.  We filter by the min distance afterwards.
+        radius_lists = tree.query_ball_tree(tree, r=max_neighbor_distance)
+        for index in range(point_count):
+            candidate_ids = np.asarray(radius_lists[index], dtype=np.int64)
+            if candidate_ids.size == 0:
+                continue
+            cand_coords = coords[candidate_ids]
+            dists = np.sqrt(np.sum((cand_coords - coords[index]) ** 2, axis=1))
+            keep_mask = (dists >= min_neighbor_distance) & (dists <= max_neighbor_distance)
+            kept_ids = candidate_ids[keep_mask]
+            if kept_ids.size > 6:
+                kept_dists = dists[keep_mask]
+                order = np.argsort(kept_dists, kind="stable")
+                kept_ids = kept_ids[order[:6]]
+            neighbors[int(index)] = [int(value) for value in kept_ids.tolist()]
+        return neighbors
+
+    # Naive O(N²) path for small grids or when SciPy is unavailable.
+    deltas = coords[:, None, :] - coords[None, :, :]
+    distances_km = np.sqrt(np.sum(deltas**2, axis=2))
     for index in range(point_count):
         neighbor_ids = np.nonzero(
             (distances_km[index] >= min_neighbor_distance)
@@ -1577,9 +1619,17 @@ def resolve_contour_half_angle_deg(
     contour_drop: str | float | u.Quantity,
     **antenna_pattern_kwargs: Any,
 ) -> float:
-    """Return the half-angle of a contour drop for a configured antenna pattern."""
+    """Return the half-angle of a contour drop for a configured antenna pattern.
+
+    Dispatches to ``calculate_beamwidth_2d`` which scans both principal
+    planes for 2-D patterns (Custom 2-D, M.2101, asymmetric S.1528
+    Rec 1.4) and falls back to ``calculate_beamwidth_1d`` for
+    axisymmetric patterns. The returned half-angle is the geometric
+    mean of the two principal-plane half-widths when the pattern is
+    2-D, or the single radial half-width for 1-D.
+    """
     drop_info = normalize_contour_drop(contour_drop, name="contour_drop")
-    beamwidth = calculate_beamwidth_1d(
+    beamwidth = calculate_beamwidth_2d(
         antenna_gain_func,
         level_drop=drop_info["drop_quantity"],
         wavelength=wavelength,
