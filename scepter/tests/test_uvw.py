@@ -72,6 +72,118 @@ def test_obs_sim_sky_track_respects_observer_index() -> None:
     )
 
 
+def test_receiver_info_loads_array_layout_file(tmp_path) -> None:
+    array_file = tmp_path / "array.csv"
+    array_file.write_text(
+        "name,lon_deg,lat_deg,alt_m\n"
+        "ref,21.4430,-30.7130,1086.0\n"
+        "east,21.4440,-30.7130,1086.0\n",
+        encoding="utf-8",
+    )
+
+    receiver = obs.receiver_info(
+        d_rx=13.5 * u.m,
+        eta_a_rx=0.7,
+        pyobs=array_file,
+        freq=1420 * u.MHz,
+        bandwidth=10 * u.MHz,
+    )
+
+    assert receiver.antenna_names == ("ref", "east")
+    assert receiver.array_geometry is not None
+    assert receiver.location.shape == (2,)
+    assert_allclose(
+        [receiver.location[0].loc.lon, receiver.location[1].loc.lon],
+        [21.4430, 21.4440],
+    )
+    assert_allclose(
+        [receiver.location[0].loc.lat, receiver.location[1].loc.lat],
+        [-30.7130, -30.7130],
+    )
+    assert_allclose(
+        [receiver.location[0].loc.alt, receiver.location[1].loc.alt],
+        [1.086, 1.086],
+    )
+
+
+def test_uvw_baseline_helpers_return_reference_relative_vectors() -> None:
+    antennas = [
+        PyObserver(21.4430, -30.7130, 1.086),
+        PyObserver(21.4440, -30.7130, 1.086),
+    ]
+
+    bearings, distances = uvw.baseline_pairs(antennas)
+    bearing, distance = uvw.baseline_bearing(antennas[0], antennas[1])
+
+    assert bearings.shape == (2, 3)
+    assert distances.shape == (2,)
+    assert_allclose(bearings[0], 0.0, atol=1e-9)
+    assert_allclose(distances[0], 0.0, atol=1e-9)
+    assert_allclose(bearing, bearings[1])
+    assert_allclose(distance, distances[1])
+
+
+def test_uvw_delay_and_fringe_helpers_preserve_shapes() -> None:
+    baselines_itrf = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [0.0, 100.0, 0.0],
+        ],
+        dtype=np.float64,
+    )
+    delay = uvw.geometric_delay_az_el(
+        baselines_itrf,
+        az=np.array([90.0, 0.0]),
+        el=np.array([0.0, 0.0]),
+        ref_lon_rad=0.0,
+        ref_lat_rad=0.0,
+    )
+    baselines_enu = uvw.itrf_to_enu(baselines_itrf, 0.0, 0.0)
+    expected_delay = baselines_enu[:, 0] / 3e8
+    corrected = uvw.baseline_nearfield_delay(
+        550.0 * u.km,
+        np.array([550.0, 551.0]) * u.km,
+        delay[1],
+    )
+    fringes = uvw.bw_fringe(corrected, 10 * u.kHz, 1420 * u.MHz, chan_bin=8)
+
+    assert delay.shape == (2, 2)
+    assert_allclose(delay[0].to_value(u.s), 0.0, atol=1e-15)
+    assert_allclose(delay[:, 0].to_value(u.s), expected_delay)
+    assert corrected.shape == (2,)
+    assert fringes.shape == (2,)
+    assert np.all(np.isfinite(fringes))
+
+
+def test_obs_sim_nearfield_delays_use_uvw_geometric_delay() -> None:
+    observers = np.array(
+        [
+            PyObserver(21.4430, -30.7130, 1.086),
+            PyObserver(21.4440, -30.7130, 1.086),
+        ],
+        dtype=object,
+    )
+    receiver = obs.receiver_info(
+        d_rx=13.5 * u.m,
+        eta_a_rx=0.7,
+        pyobs=observers,
+        freq=1420 * u.MHz,
+        bandwidth=10 * u.MHz,
+    )
+    mjd = Time("2025-01-01T00:00:00", scale="utc").mjd
+    mjds = np.array([mjd], dtype=np.float64).reshape(1, 1, 1, 1, 1, 1)
+    sim = obs.obs_sim(receiver, skynet.pointgen_S_1586_1(niters=1), mjds)
+    sim.azel_track(az=90.0, el=45.0)
+    sim.topo_pos_dist = np.full((2, 1, 1, 1, 1, 1), 550.0, dtype=np.float64)
+    sim.create_baselines()
+
+    delays = sim.baselines_nearfield_delays(mode="tracking")
+
+    assert delays.shape == sim.topo_pos_dist.shape
+    assert sim.pnt_tau.shape == sim.topo_pos_dist.shape
+    assert_allclose(delays[0].to_value(u.s), 0.0, atol=1e-15)
+
+
 def test_build_tracking_uvw_from_array_and_tle_files(tmp_path) -> None:
     array_file = tmp_path / "array.csv"
     array_file.write_text(

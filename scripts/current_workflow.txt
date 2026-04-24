@@ -1,0 +1,17 @@
+conda activate scepter
+
+python example_obs_uvw_plane.py -a example_telescope_array.csv -t oneweb-limited.txt --ra 20 --dec -20  --trange-seconds 3600
+
+
+### advanced array test
+
+python example_obs_uvw_plane.py -a advanced_example_array.csv -t oneweb-limited.txt --ra 20 --dec -20  --trange-seconds 3600
+
+
+
+### check uvplane and filter fov
+python plot_uv_plane.py -i tracking_uvw.npz -a -n 651 --fov-radius-deg 10 --output-filtered-npz filtered_uvw.npz
+
+
+
+python image_filtered_uvw.py --input filtered_uvw.npz --data-phase-center-ra-deg 20 --data-phase-center-dec-deg -20 --phase-center-ra-deg 20.1 --phase-center-dec-deg -20.1

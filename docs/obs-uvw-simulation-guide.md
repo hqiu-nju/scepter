@@ -63,13 +63,23 @@ Notes:
 Load the file like this:
 
 ```python
-from scepter import uvw
+from astropy import units as u
+from scepter import obs, uvw
 
 geometry = uvw.load_telescope_array_file("array.csv")
 
 print(geometry.antenna_names)
 print(geometry.pyobservers.shape)      # (N_ant,)
 print(len(geometry.earth_locations))   # N_ant
+
+receiver = obs.receiver_info(
+    d_rx=13.5 * u.m,
+    eta_a_rx=0.7,
+    pyobs="array.csv",
+    freq=1420 * u.MHz,
+    bandwidth=10 * u.MHz,
+)
+print(receiver.antenna_names)
 ```
 
 ## 2. Define the observation times

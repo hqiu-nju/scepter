@@ -21,7 +21,8 @@ array file and covers both ``obs.py`` and ``uvw.py``, see
 - UVW generation with ``scepter.uvw.build_tracking_uvw`` and
   ``scepter.uvw.compute_uvw``
 
-1. Create telescope observers with ``cysgp4.PyObserver``.
+1. Create telescope observers with ``cysgp4.PyObserver`` or pass an ASCII
+   array-layout file directly to ``scepter.obs.receiver_info``.
 2. Build a sky grid with ``scepter.skynet.pointgen_S_1586_1`` or
    ``scepter.skynet.pointgen``.
 3. Define observation times with ``scepter.skynet.plantime`` or another MJD
@@ -58,6 +59,9 @@ Minimal sketch
        freq=1420 * u.MHz,
        bandwidth=10 * u.MHz,
    )
+
+   # CSV/text array layouts are also accepted:
+   # pyobs="scripts/example_telescope_array.csv"
 
    skygrid = skynet.pointgen_S_1586_1(niters=1)
    mjds = ...

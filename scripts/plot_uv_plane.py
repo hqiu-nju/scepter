@@ -180,13 +180,22 @@ def _select_satellites_with_optional_separation(
     satellite_uvw_m: np.ndarray,
     satellite_separation_deg: np.ndarray | None,
     num_satellites: int,
+    fov_radius_deg: float | None,
 ) -> tuple[np.ndarray, np.ndarray | None]:
-    """Select first N satellites and keep separation aligned if available."""
+    """
+    Select satellites and keep separation aligned if available.
+
+    When ``fov_radius_deg`` and ``satellite_separation_deg`` are provided,
+    satellites are prioritized by FoV visibility (any time sample with
+    separation <= ``fov_radius_deg``). If fewer than requested are visible,
+    remaining slots are filled in index order.
+    """
     if num_satellites <= 0:
         raise ValueError("--num-satellites must be a positive integer.")
 
     sat_axis, _ = _infer_satellite_time_axes(satellite_uvw_m, satellite_separation_deg)
-    n_available = int(np.asarray(satellite_uvw_m).shape[sat_axis])
+    satellite_uvw_arr = np.asarray(satellite_uvw_m)
+    n_available = int(satellite_uvw_arr.shape[sat_axis])
     n_selected = min(num_satellites, n_available)
     if n_selected < num_satellites:
         print(
@@ -195,17 +204,54 @@ def _select_satellites_with_optional_separation(
             f"Using {n_selected}."
         )
 
+    selected_indices = np.arange(n_selected, dtype=int)
+    sep = None if satellite_separation_deg is None else np.asarray(satellite_separation_deg, dtype=np.float64)
+    if (
+        fov_radius_deg is not None
+        and sep is not None
+        and sep.ndim == 2
+        and sep.shape[1] == n_available
+        and n_selected > 0
+    ):
+        visible_mask = np.any(sep <= float(fov_radius_deg), axis=0)
+        visible_indices = np.flatnonzero(visible_mask)
+
+        if visible_indices.size > 0:
+            selected_indices = visible_indices[:n_selected]
+            if selected_indices.size < n_selected:
+                all_indices = np.arange(n_available, dtype=int)
+                remaining = all_indices[~np.isin(all_indices, selected_indices)]
+                selected_indices = np.concatenate(
+                    [selected_indices, remaining[: n_selected - selected_indices.size]]
+                )
+                print(
+                    "Warning: only "
+                    f"{visible_indices.size} satellite(s) are within FoV "
+                    f"({fov_radius_deg:.2f} deg). "
+                    f"Filled remaining {n_selected - visible_indices.size} slot(s) "
+                    "with non-visible satellites."
+                )
+        else:
+            print(
+                "Warning: no satellites found within FoV "
+                f"({fov_radius_deg:.2f} deg). Using first {n_selected} satellite(s)."
+            )
+    elif fov_radius_deg is not None and sep is not None and sep.shape[1] != n_available:
+        print(
+            "Warning: satellite_separation_deg does not match satellite_uvw_m "
+            "satellite axis; falling back to first-N satellite selection."
+        )
+
     satellite_uvw_selected = np.take(
-        np.asarray(satellite_uvw_m),
-        indices=np.arange(n_selected, dtype=int),
+        satellite_uvw_arr,
+        indices=selected_indices,
         axis=sat_axis,
     )
 
     sep_selected: np.ndarray | None = None
-    if satellite_separation_deg is not None:
-        sep = np.asarray(satellite_separation_deg, dtype=np.float64)
-        if sep.ndim == 2 and sep.shape[1] >= n_selected:
-            sep_selected = sep[:, :n_selected]
+    if sep is not None:
+        if sep.ndim == 2 and sep.shape[1] >= int(selected_indices.size):
+            sep_selected = sep[:, selected_indices]
         else:
             print(
                 "Warning: satellite_separation_deg is missing or incompatible; "
@@ -261,6 +307,60 @@ def _flatten_satellite_uv_samples(
         np.concatenate([v_flat, -v_flat]),
         n_in_fov,
     )
+
+
+def _filter_satellite_uvw_by_fov(
+    satellite_uvw_m: np.ndarray,
+    satellite_separation_deg: np.ndarray | None,
+    fov_radius_deg: float,
+) -> tuple[np.ndarray, np.ndarray | None, np.ndarray]:
+    """
+    Filter satellite UVW data to time steps where any satellite is within a
+    given field-of-view radius.
+
+    A time step is kept when at least one satellite's angular separation from
+    the pointing is at or below ``fov_radius_deg``.
+
+    Parameters
+    ----------
+    satellite_uvw_m : numpy.ndarray
+        Satellite UVW coordinates.  Supported shapes:
+        ``(N_sat, T, 3)``, ``(T, N_sat, 3)``,
+        ``(N_sat, N_ant, T, 3)``, ``(N_ant, T, N_sat, 3)``.
+    satellite_separation_deg : numpy.ndarray or None, shape (T, N_sat)
+        Angular separation of each satellite from the pointing direction at
+        each time step, in degrees.  When ``None`` the function returns the
+        input array unchanged with a full boolean mask.
+    fov_radius_deg : float
+        Keep time steps where *any* satellite is within this radius (degrees).
+
+    Returns
+    -------
+    satellite_uvw_filtered : numpy.ndarray
+        UVW array with the time axis compressed to in-FoV time steps only.
+        Shape is the same as the input except the time axis is shortened.
+    satellite_separation_filtered : numpy.ndarray or None
+        ``satellite_separation_deg`` rows that correspond to the retained time
+        steps, or ``None`` when the input was ``None``.
+    time_mask : numpy.ndarray, shape (T,)
+        Boolean mask that was applied along the time axis (``True`` = kept).
+    """
+    sat_axis, time_axis = _infer_satellite_time_axes(satellite_uvw_m, satellite_separation_deg)
+    uvw = np.asarray(satellite_uvw_m, dtype=np.float64)
+
+    if satellite_separation_deg is None:
+        n_time = int(uvw.shape[time_axis])
+        time_mask = np.ones(n_time, dtype=bool)
+        return uvw, None, time_mask
+
+    sep = np.asarray(satellite_separation_deg, dtype=np.float64)  # (T, N_sat)
+    # Keep time steps where any satellite is within FoV.
+    time_mask = np.any(sep <= float(fov_radius_deg), axis=1)  # (T,)
+
+    uvw_filtered = np.compress(time_mask, uvw, axis=time_axis)
+    sep_filtered = sep[time_mask, :]  # (T_kept, N_sat)
+
+    return uvw_filtered, sep_filtered, time_mask
 
 
 def _plot_uv_plane(
@@ -365,7 +465,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "-n","--num-satellites",
         type=int,
         default=2,
-        help="Number of satellites to include when plotting satellite UV data. Default: 2",
+        help=(
+            "Number of satellites to include when plotting satellite UV data. "
+            "When satellite_separation_deg is present, satellites within "
+            "--fov-radius-deg are prioritized. Default: 2"
+        ),
     )
     parser.add_argument(
         "--fov-radius-deg",
@@ -386,6 +490,18 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=150,
         help="Output figure DPI. Default: 150",
+    )
+    parser.add_argument(
+        "--output-filtered-npz",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Save an NPZ file containing the FoV-filtered satellite UVW data. "
+            "Keeps only time steps where at least one selected satellite is within "
+            "--fov-radius-deg. Also writes the corresponding pointing_uvw_m rows, "
+            "satellite_separation_deg rows, freq_mhz, and a boolean time_mask. "
+            "Ignored when --disable-fov-filter is set."
+        ),
     )
     return parser
 
@@ -456,6 +572,7 @@ def main() -> None:
                 satellite_uvw,
                 satellite_sep,
                 args.num_satellites,
+                args.fov_radius_deg,
             )
 
             print("Creating satellites-only UV plane figure...")
@@ -471,7 +588,7 @@ def main() -> None:
                 u_sat,
                 v_sat,
                 frequency_mhz,
-                f"UV Plane: Satellites Only (first {n_sat_selected} satellite(s))",
+                f"UV Plane: Satellites Only ({n_sat_selected} selected satellite(s))",
                 output_dir / "uv_plane_satellites.png",
                 dpi=args.dpi,
             )
@@ -489,6 +606,44 @@ def main() -> None:
                         f"{n_in_fov}/{total_ts} time-satellite samples "
                         "before conjugate mirroring."
                     )
+
+            # Optionally save FoV-filtered UVW array.
+            if args.output_filtered_npz and not args.disable_fov_filter:
+                out_npz_path = Path(args.output_filtered_npz)
+                out_npz_path.parent.mkdir(parents=True, exist_ok=True)
+                fov_r = args.fov_radius_deg
+                sat_uvw_filt, sat_sep_filt, time_mask = _filter_satellite_uvw_by_fov(
+                    satellite_uvw,
+                    satellite_sep,
+                    fov_radius_deg=fov_r,
+                )
+                save_dict: dict[str, np.ndarray] = {
+                    "satellite_uvw_m": sat_uvw_filt,
+                    "freq_mhz": np.float64(frequency_mhz),
+                    "time_mask": time_mask,
+                    "fov_radius_deg": np.float64(fov_r),
+                }
+                if sat_sep_filt is not None:
+                    save_dict["satellite_separation_deg"] = sat_sep_filt
+                # Include aligned pointing rows when available.
+                if "pointing_uvw_m" in data:
+                    pt = np.asarray(data["pointing_uvw_m"], dtype=np.float64)
+                    sat_axis_f, time_axis_f = _infer_satellite_time_axes(
+                        satellite_uvw, satellite_sep
+                    )
+                    # Determine pointing time axis (axis 1 for shape (N_ant, T, 3)).
+                    pt_time_axis = 1 if pt.ndim == 3 else 0
+                    save_dict["pointing_uvw_m"] = np.compress(
+                        time_mask, pt, axis=pt_time_axis
+                    )
+                np.savez(out_npz_path, **save_dict)
+                n_kept = int(np.count_nonzero(time_mask))
+                n_total = int(time_mask.size)
+                print(
+                    f"Saved FoV-filtered UVW to {out_npz_path} "
+                    f"({n_kept}/{n_total} time steps kept, "
+                    f"satellite_uvw_m shape: {sat_uvw_filt.shape})."
+                )
 
             if args.include_satellites and not args.satellite_only and u_point is not None and v_point is not None:
                 print("Creating combined UV plane figure...")

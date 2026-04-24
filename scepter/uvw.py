@@ -66,8 +66,8 @@ Integration with scepter.obs
 -----------------------------
 This module extends the interferometry capabilities in scepter.obs:
 
-- `scepter.obs.baseline_bearing()` → provides ITRF baseline vectors
-- `scepter.obs.baseline_pairs()` → computes all baselines in an array
+- `scepter.uvw.baseline_bearing()` → provides ITRF baseline vectors
+- `scepter.uvw.baseline_pairs()` → computes all baselines in an array
 - `scepter.uvw.itrf_to_enu()` → converts to local topocentric frame
 - `scepter.uvw.enu_to_uvw()` → transforms to interferometry UVW frame
 
@@ -141,9 +141,9 @@ References
 
 See Also
 --------
-scepter.obs.baseline_bearing : Calculate ITRF baseline between two antennas
-scepter.obs.baseline_pairs : Calculate all baselines in an array
-scepter.obs.mod_tau : Calculate geometric delay from baseline
+scepter.uvw.baseline_bearing : Calculate ITRF baseline between two antennas
+scepter.uvw.baseline_pairs : Calculate all baselines in an array
+scepter.uvw.geometric_delay_az_el : Calculate geometric delay from Az/El
 
 Author: Generated for SCEPTer package
 Date Created: 2026-02-06
@@ -260,6 +260,372 @@ def hour_angle(ra_rad, lst_rad):
     return ha
 
 
+def _as_antenna_list(antennas) -> list:
+    antennas_array = np.atleast_1d(np.asarray(antennas, dtype=object))
+    return list(antennas_array.ravel())
+
+
+def _antenna_itrf_positions_m(antennas) -> np.ndarray:
+    antenna_list = _as_antenna_list(antennas)
+    if len(antenna_list) == 0:
+        raise ValueError("antennas cannot be empty.")
+
+    if not ASTROPY_AVAILABLE:
+        raise ImportError(
+            "astropy is required for antenna baseline calculations. "
+            "Install with: pip install astropy"
+        )
+
+    first = antenna_list[0]
+    if CYSGP4_AVAILABLE and isinstance(first, cysgp4.PyObserver):
+        if not PYCRAF_AVAILABLE:
+            raise ImportError(
+                "pycraf is required when using PyObserver antennas. "
+                "Install with: pip install pycraf"
+            )
+        if not all(isinstance(antenna, cysgp4.PyObserver) for antenna in antenna_list):
+            raise ValueError("antennas must not mix PyObserver and other location types.")
+        lons = np.asarray([antenna.loc.lon for antenna in antenna_list], dtype=np.float64) * u.deg
+        lats = np.asarray([antenna.loc.lat for antenna in antenna_list], dtype=np.float64) * u.deg
+        alts = np.asarray([antenna.loc.alt for antenna in antenna_list], dtype=np.float64) * u.m
+        xs, ys, zs = geospatial.wgs84_to_itrf2008(lons, lats, alts)
+        return np.stack(
+            [xs.to_value(u.m), ys.to_value(u.m), zs.to_value(u.m)],
+            axis=-1,
+        )
+
+    if ASTROPY_AVAILABLE and isinstance(first, EarthLocation):
+        if not all(isinstance(antenna, EarthLocation) for antenna in antenna_list):
+            raise ValueError("antennas must not mix EarthLocation and other location types.")
+        return np.stack(
+            [
+                np.asarray([antenna.x.to_value(u.m) for antenna in antenna_list], dtype=np.float64),
+                np.asarray([antenna.y.to_value(u.m) for antenna in antenna_list], dtype=np.float64),
+                np.asarray([antenna.z.to_value(u.m) for antenna in antenna_list], dtype=np.float64),
+            ],
+            axis=-1,
+        )
+
+    raise ValueError(
+        "antennas must contain cysgp4.PyObserver or astropy.coordinates.EarthLocation objects."
+    )
+
+
+def baseline_bearing(ref, ant) -> tuple[np.ndarray, float]:
+    """
+    Calculate one ITRF baseline vector and its Euclidean length.
+
+    Parameters
+    ----------
+    ref : cysgp4.PyObserver or astropy.coordinates.EarthLocation
+        Reference antenna used as the baseline origin.
+    ant : cysgp4.PyObserver or astropy.coordinates.EarthLocation
+        Target antenna. The type must match *ref*.
+
+    Returns
+    -------
+    bearing : numpy.ndarray, shape (3,)
+        ITRF Cartesian baseline vector from *ref* to *ant* in metres.
+    distance : float
+        Baseline length in metres.
+
+    Raises
+    ------
+    ImportError
+        If Astropy is unavailable, or if PyObserver inputs are used without
+        pycraf.
+    ValueError
+        If the inputs are empty, mixed-type, or unsupported location objects.
+
+    Notes
+    -----
+    For ``cysgp4.PyObserver`` inputs, this uses the same WGS84 to ITRF2008
+    conversion as ``compute_uvw``. For ``EarthLocation`` inputs, geocentric
+    ``x``, ``y``, and ``z`` coordinates are used directly.
+    """
+    bearings, distances = baseline_pairs([ref, ant])
+    return np.asarray(bearings[1], dtype=np.float64), float(distances[1])
+
+
+def baseline_pairs(antennas, ref_index: int = 0) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Calculate ITRF baseline vectors from one reference antenna to an array.
+
+    Parameters
+    ----------
+    antennas : array-like
+        One or more ``cysgp4.PyObserver`` or ``astropy.coordinates.EarthLocation``
+        objects. All entries must have the same type.
+    ref_index : int, optional
+        Antenna index used as the baseline origin. Default is 0.
+
+    Returns
+    -------
+    bearings : numpy.ndarray, shape (N_ant, 3)
+        ITRF Cartesian baseline vectors in metres. ``bearings[ref_index]`` is
+        the zero vector.
+    baselines : numpy.ndarray, shape (N_ant,)
+        Euclidean baseline lengths in metres.
+
+    Raises
+    ------
+    ImportError
+        If required coordinate packages are unavailable.
+    IndexError
+        If *ref_index* does not select an antenna.
+    ValueError
+        If *antennas* is empty or contains unsupported/mixed location objects.
+
+    Notes
+    -----
+    This helper intentionally returns baselines relative to one reference
+    antenna, matching the historical ``obs.baseline_pairs`` behaviour and the
+    baseline axis used by ``compute_uvw``.
+    """
+    itrf = _antenna_itrf_positions_m(antennas)
+    index = int(ref_index)
+    if index < 0 or index >= itrf.shape[0]:
+        raise IndexError(f"ref_index {index} is out of range for {itrf.shape[0]} antennas.")
+    bearings = itrf - itrf[index]
+    baselines = np.linalg.norm(bearings, axis=1)
+    return bearings, baselines
+
+
+def _angle_array_to_rad(values, *, input_unit: u.UnitBase) -> np.ndarray:
+    if hasattr(values, "to_value"):
+        return np.asarray(values.to_value(u.rad), dtype=np.float64)
+    return np.asarray(u.Quantity(values, input_unit).to_value(u.rad), dtype=np.float64)
+
+
+def geometric_delay_az_el(
+    baselines_itrf,
+    az,
+    el,
+    ref_lon_rad,
+    ref_lat_rad,
+    *,
+    angle_unit: u.UnitBase = u.deg,
+):
+    """
+    Calculate far-field geometric delay for topocentric Az/El directions.
+
+    Parameters
+    ----------
+    baselines_itrf : array-like or astropy.Quantity, shape (N_ant, 3)
+        Reference-relative ITRF baseline vectors. Non-quantity inputs are
+        interpreted as metres. The vector convention is the same as
+        ``baseline_pairs``: each row points from the reference antenna to the
+        target antenna.
+    az : float or array-like or astropy.Quantity
+        Topocentric azimuth of the source. Quantity inputs may carry any angle
+        unit. Non-quantity inputs use *angle_unit*.
+    el : float or array-like or astropy.Quantity
+        Topocentric elevation of the source. Quantity inputs may carry any
+        angle unit. Non-quantity inputs use *angle_unit*.
+    ref_lon_rad : float
+        Reference antenna geodetic longitude in radians.
+    ref_lat_rad : float
+        Reference antenna geodetic latitude in radians.
+    angle_unit : astropy.units.UnitBase, optional
+        Unit for non-quantity *az* and *el* inputs. Defaults to degrees to
+        match SCEPTer sky-grid arrays.
+
+    Returns
+    -------
+    delay : astropy.Quantity
+        Far-field geometric delay in seconds. The shape is ``(N_ant,)`` plus
+        the broadcast shape of *az* and *el*.
+
+    Raises
+    ------
+    ValueError
+        If the baseline vectors do not have a final dimension of length 3, or
+        if *az* and *el* cannot be broadcast together.
+
+    Notes
+    -----
+    The calculation uses the UVW coordinate pipeline's local-frame conversion:
+    ITRF baselines are rotated to ENU with ``itrf_to_enu`` and then projected
+    onto the topocentric unit vector
+    ``[east, north, up] = [cos(el) sin(az), cos(el) cos(az), sin(el)]``.
+
+    The sign convention is ``dot(baseline_enu, source_unit) / c``. For a
+    distant source this matches the leading path-length difference
+    ``(l_ref - l_target) / c`` used by ``baseline_nearfield_delay``.
+    """
+    if hasattr(baselines_itrf, "to_value"):
+        baselines_m = np.asarray(baselines_itrf.to_value(u.m), dtype=np.float64)
+    else:
+        baselines_m = np.asarray(baselines_itrf, dtype=np.float64)
+    if baselines_m.shape[-1] != 3:
+        raise ValueError("baselines_itrf must have a final dimension of length 3.")
+
+    baselines_enu = itrf_to_enu(
+        baselines_m,
+        float(ref_lon_rad),
+        float(ref_lat_rad),
+    )
+    az_rad, el_rad = np.broadcast_arrays(
+        _angle_array_to_rad(az, input_unit=angle_unit),
+        _angle_array_to_rad(el, input_unit=angle_unit),
+    )
+    source_enu = np.stack(
+        [
+            np.cos(el_rad) * np.sin(az_rad),
+            np.cos(el_rad) * np.cos(az_rad),
+            np.sin(el_rad),
+        ],
+        axis=-1,
+    )
+    expanded_baselines = baselines_enu[
+        (slice(None),) + (np.newaxis,) * az_rad.ndim + (slice(None),)
+    ]
+    path_m = np.sum(expanded_baselines * source_enu[np.newaxis, ...], axis=-1)
+    return path_m * u.m / (3e8 * u.m / u.s)
+
+
+def baseline_nearfield_delay(l1, l2, tau):
+    """
+    Apply near-field path-length correction to a far-field delay.
+
+    Parameters
+    ----------
+    l1 : astropy.Quantity
+        Distance from source to the reference antenna.
+    l2 : astropy.Quantity
+        Distance from source to each target antenna.
+    tau : astropy.Quantity
+        Far-field delay to subtract.
+
+    Returns
+    -------
+    delay : astropy.Quantity
+        Corrected delay in seconds, computed as ``(l1 - l2) / c - tau``.
+
+    Raises
+    ------
+    AttributeError
+        If inputs are not Astropy quantities with ``to`` methods.
+
+    Notes
+    -----
+    This helper is used by ``obs_sim.baselines_nearfield_delays`` for LEO
+    satellite fringe calculations where wavefront curvature matters.
+    """
+    c = 3e8 * u.m / u.s
+    return (l1.to(u.m) - l2.to(u.m)) / c - tau
+
+
+def fringe_attenuation(theta, baseline, bandwidth):
+    """
+    Estimate finite-bandwidth fringe attenuation for an angular offset.
+
+    Parameters
+    ----------
+    theta : astropy.Quantity
+        Angular offset from phase centre.
+    baseline : astropy.Quantity
+        Baseline length.
+    bandwidth : astropy.Quantity
+        Observing bandwidth.
+
+    Returns
+    -------
+    attenuation : float or numpy.ndarray
+        Dimensionless sinc attenuation factor.
+
+    Raises
+    ------
+    AttributeError
+        If any input is not an Astropy quantity with a ``to`` method.
+
+    Notes
+    -----
+    The model is ``sinc(sin(theta) * baseline * bandwidth / c)`` and matches
+    the historical ``obs.fringe_attenuation`` implementation.
+    """
+    c = 3e8
+    theta = theta.to(u.rad).value
+    baseline = baseline.to(u.m).value
+    bandwidth = bandwidth.to(u.Hz).value
+    return np.sinc(np.sin(theta) * baseline * bandwidth / c)
+
+
+def fringe_response(delay, frequency):
+    """
+    Calculate monochromatic interferometric fringe response.
+
+    Parameters
+    ----------
+    delay : astropy.Quantity
+        Geometric delay.
+    frequency : astropy.Quantity
+        Observing frequency.
+
+    Returns
+    -------
+    response : float or numpy.ndarray
+        Dimensionless cosine fringe response.
+
+    Raises
+    ------
+    AttributeError
+        If inputs are not Astropy quantities with ``to`` methods.
+
+    Notes
+    -----
+    The returned response is ``cos(2*pi*frequency*delay)``.
+    """
+    delay = delay.to(u.s).value
+    frequency = frequency.to(u.Hz).value
+    return np.cos(2 * np.pi * frequency * delay)
+
+
+def bw_fringe(delays, bwchan, fch1, chan_bin: int = 100) -> np.ndarray:
+    """
+    Calculate bandwidth-averaged fringe response.
+
+    Parameters
+    ----------
+    delays : astropy.Quantity
+        Geometric delays. The input is flattened by callers that need to
+        restore a simulation shape.
+    bwchan : astropy.Quantity
+        Channel bandwidth.
+    fch1 : astropy.Quantity
+        Channel centre frequency.
+    chan_bin : int, optional
+        Number of frequency samples used for the average. Default is 100.
+
+    Returns
+    -------
+    response : numpy.ndarray
+        Dimensionless fringe response with shape ``delays.shape``.
+
+    Raises
+    ------
+    AttributeError
+        If frequency or delay inputs are not Astropy quantities with ``to``
+        methods.
+
+    Notes
+    -----
+    Frequencies are sampled linearly across the channel and averaged using the
+    same numerical convention as the historical ``obs.bw_fringe`` helper.
+    """
+    delay_shape = np.shape(delays)
+    delays_flat = np.ravel(delays)
+    fch1_khz = fch1.to(u.kHz).value
+    bwchan_khz = bwchan.to(u.kHz).value
+    freq_array = np.linspace(
+        fch1_khz - bwchan_khz * 0.5,
+        fch1_khz + bwchan_khz * 0.5,
+        int(chan_bin),
+    ) * u.kHz
+    fringes = fringe_response(delays_flat[:, np.newaxis], freq_array[np.newaxis, :])
+    return np.mean(fringes, axis=1).reshape(delay_shape)
+
+
 def itrf_to_enu(baseline_itrf, longitude_rad, latitude_rad):
     """
     Convert ITRF baseline vector to local East-North-Up coordinates.
@@ -274,8 +640,8 @@ def itrf_to_enu(baseline_itrf, longitude_rad, latitude_rad):
     baseline_itrf : array-like, shape (..., 3)
         Baseline vector in ITRF Cartesian coordinates (meters)
         Components: [ΔX, ΔY, ΔZ] in ITRF frame
-        Can be obtained from scepter.obs.baseline_bearing() or 
-        scepter.obs.baseline_pairs()
+        Can be obtained from scepter.uvw.baseline_bearing() or
+        scepter.uvw.baseline_pairs()
         Last dimension must be 3 (X, Y, Z components)
     longitude_rad : float
         Observer's geodetic longitude (radians)
@@ -355,8 +721,8 @@ def itrf_to_enu(baseline_itrf, longitude_rad, latitude_rad):
     See Also
     --------
     enu_to_uvw : Second transformation step to UVW coordinates
-    scepter.obs.baseline_bearing : Get ITRF baseline between two antennas
-    scepter.obs.baseline_pairs : Get ITRF baselines for antenna array
+    baseline_bearing : Get ITRF baseline between two antennas
+    baseline_pairs : Get ITRF baselines for antenna array
     compute_uvw_from_observers : Complete pipeline including this transformation
     
     References
@@ -756,8 +1122,8 @@ def compute_uvw(
     hour_angle : Compute hour angle from RA and LST.
     itrf_to_enu : ITRF → ENU rotation.
     enu_to_uvw : ENU → UVW rotation.
-    scepter.obs.baseline_bearing : ITRF baseline between two antennas.
-    scepter.obs.baseline_pairs : All ITRF baselines in an array.
+    baseline_bearing : ITRF baseline between two antennas.
+    baseline_pairs : All ITRF baselines in an array.
 
     References
     ----------

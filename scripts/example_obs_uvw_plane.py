@@ -13,6 +13,15 @@ catalogs, and writes a ``.npz`` bundle containing:
 - per-satellite UVW tracks using each satellite's time-varying ICRS RA/Dec,
 - the corresponding satellite RA/Dec and angular-separation time series.
 
+In addition to the ``.npz`` archive, the script always saves two PNG figures:
+
+- ``<output_stem>_array_layout.png`` — antenna positions as East/North offsets
+  (km) from the reference antenna.
+- ``<output_stem>_radec_fov.png`` — satellite transit tracks plotted as
+  tangent-plane offsets (ΔRA·cos Dec, ΔDec) from the pointing in the ICRS
+  frame, within the requested FoV radius (default 10°).  Use
+  ``--fov-radius-deg`` to change the FoV.
+
 When ``--show-interactive-plots`` is enabled, the script also opens
 matplotlib windows that show:
 
@@ -56,6 +65,7 @@ from scepter import uvw
 
 
 SPEED_OF_LIGHT_M_PER_S = 299_792_458.0
+_EARTH_RADIUS_KM = 6_371.0
 
 
 def _build_unit_point_source_vis(pointing_uvw_m: np.ndarray) -> np.ndarray:
@@ -229,6 +239,159 @@ def _show_uv_preview_interactive(
     plt.show()
 
 
+def _save_array_layout_figure(
+    geometry: "uvw.TelescopeArrayGeometry",
+    ref_index: int,
+    output_path: "Path",
+) -> None:
+    """
+    Save an array-layout PNG showing antenna positions as ENU offsets.
+
+    Parameters
+    ----------
+    geometry : scepter.uvw.TelescopeArrayGeometry
+        Parsed array geometry.
+    ref_index : int
+        Reference antenna index placed at the ENU origin.
+    output_path : pathlib.Path
+        Destination file path (PNG).
+    """
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("Matplotlib is not available. Skipping array layout figure.")
+        return
+
+    lon_deg = geometry.longitudes_deg
+    lat_deg = geometry.latitudes_deg
+    names = geometry.antenna_names
+
+    lon_ref = lon_deg[ref_index]
+    lat_ref = lat_deg[ref_index]
+    lat_ref_rad = np.deg2rad(lat_ref)
+
+    east_km = (lon_deg - lon_ref) * np.cos(lat_ref_rad) * _EARTH_RADIUS_KM
+    north_km = (lat_deg - lat_ref) * _EARTH_RADIUS_KM
+
+    fig, ax = plt.subplots(figsize=(7, 6))
+    ax.scatter(east_km, north_km, c="tab:blue", s=40, zorder=3, label="Antenna")
+    ax.scatter(
+        east_km[ref_index], north_km[ref_index],
+        c="tab:red", s=100, marker="*", zorder=4,
+        label=f"Ref: {names[ref_index]}",
+    )
+    if len(names) <= 64:
+        for i, name in enumerate(names):
+            ax.annotate(
+                name, (east_km[i], north_km[i]),
+                textcoords="offset points", xytext=(4, 4),
+                fontsize=6, alpha=0.8,
+            )
+    ax.set_xlabel("East offset [km]")
+    ax.set_ylabel("North offset [km]")
+    ax.set_title("Array Layout (ENU, reference at origin)")
+    ax.set_aspect("equal")
+    ax.grid(True, alpha=0.35, linestyle="--")
+    ax.legend(loc="best", fontsize=8)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    print(f"Saved array layout figure to {output_path}")
+
+
+def _save_radec_fov_figure(
+    ra_deg: float,
+    dec_deg: float,
+    satellite_ra_deg: np.ndarray,
+    satellite_dec_deg: np.ndarray,
+    satellite_names: tuple[str, ...],
+    fov_radius_deg: float,
+    output_path: "Path",
+) -> None:
+    """
+    Save a pointing-centred RA/Dec FoV figure with satellite transit tracks.
+
+    Satellite positions are projected onto a gnomonic tangent plane centred
+    on the pointing using (ΔRA·cos Dec, ΔDec) offsets in degrees. Only
+    epochs within ``fov_radius_deg`` of the pointing centre are rendered.
+    The RA axis is displayed with West to the right (increasing RA to the
+    left) following the standard radio-astronomy sky-map convention.
+
+    Parameters
+    ----------
+    ra_deg : float
+        Pointing right ascension in degrees (ICRS).
+    dec_deg : float
+        Pointing declination in degrees (ICRS).
+    satellite_ra_deg : numpy.ndarray, shape (T, N_sat)
+        Satellite ICRS right ascension tracks in degrees.
+    satellite_dec_deg : numpy.ndarray, shape (T, N_sat)
+        Satellite ICRS declination tracks in degrees.
+    satellite_names : tuple of str
+        Satellite identifiers.
+    fov_radius_deg : float
+        Half-width of the field of view in degrees.
+    output_path : pathlib.Path
+        Destination file path (PNG).
+    """
+    try:
+        import matplotlib.pyplot as plt
+        from matplotlib.patches import Circle
+    except ImportError:
+        print("Matplotlib is not available. Skipping RA/Dec FoV figure.")
+        return
+
+    sat_ra = np.asarray(satellite_ra_deg, dtype=np.float64)   # (T, N_sat)
+    sat_dec = np.asarray(satellite_dec_deg, dtype=np.float64) # (T, N_sat)
+    dec_ref_rad = np.deg2rad(dec_deg)
+    nsat = sat_ra.shape[1] if sat_ra.ndim == 2 else 0
+
+    fig, ax = plt.subplots(figsize=(7, 7))
+    ax.plot(0.0, 0.0, "+", color="black", markersize=14, markeredgewidth=2,
+            zorder=5, label="Pointing")
+    ax.add_patch(
+        Circle((0, 0), fov_radius_deg, fill=False, linestyle="--",
+               color="gray", linewidth=1.0, zorder=2)
+    )
+
+    for sat_idx in range(nsat):
+        ra_s = sat_ra[:, sat_idx]
+        dec_s = sat_dec[:, sat_idx]
+        dec_mid_rad = np.deg2rad(0.5 * (dec_deg + dec_s))
+        dra_raw = (ra_s - ra_deg + 180.0) % 360.0 - 180.0
+        dra_eff = dra_raw * np.cos(dec_mid_rad)
+        ddec_eff = dec_s - dec_deg
+        mask = np.hypot(dra_eff, ddec_eff) <= fov_radius_deg
+        if not np.any(mask):
+            continue
+        label = satellite_names[sat_idx] if sat_idx < len(satellite_names) else f"sat{sat_idx}"
+        (line,) = ax.plot(
+            dra_eff[mask], ddec_eff[mask],
+            linewidth=0.8, alpha=0.75,
+            label=label if nsat <= 12 else None,
+        )
+        idx_first = int(np.argmax(mask))
+        ax.plot(dra_eff[idx_first], ddec_eff[idx_first], "o",
+                markersize=3, alpha=0.6, color=line.get_color())
+
+    ax.set_xlim(fov_radius_deg * 1.08, -fov_radius_deg * 1.08)  # RA increases to the left
+    ax.set_ylim(-fov_radius_deg * 1.08, fov_radius_deg * 1.08)
+    ax.set_xlabel("ΔRA·cos(Dec) [deg]  ← East")
+    ax.set_ylabel("ΔDec [deg]")
+    ax.set_title(
+        f"Satellite Transit Tracks — {fov_radius_deg:.1f}° RA/Dec FoV\n"
+        f"Pointing: RA {ra_deg:.3f}°, Dec {dec_deg:.3f}° (ICRS)"
+    )
+    ax.set_aspect("equal")
+    ax.grid(True, alpha=0.35, linestyle="--")
+    if nsat <= 12:
+        ax.legend(loc="best", fontsize=7)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    print(f"Saved RA/Dec FoV figure to {output_path}")
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -304,6 +467,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Enable verbose propagation logging from obs.obs_sim.populate.",
     )
     parser.add_argument(
+        "--fov-radius-deg",
+        type=float,
+        default=10.0,
+        help="Field-of-view radius in degrees for the saved Az/El FoV figure. Default: 10.",
+    )
+    parser.add_argument(
         "--show-interactive-plots",
         action="store_true",
         help="Display interactive Az/El and UV preview matplotlib windows.",
@@ -339,31 +508,31 @@ def main() -> None:
     satellite_dec_deg = np.asarray(result.satellite_dec_deg, dtype=np.float64)
     satellite_separation_deg = np.asarray(result.satellite_separation_deg, dtype=np.float64)
 
+    geometry = uvw.load_telescope_array_file(
+        args.array_file,
+        altitude_unit=u.Unit(args.altitude_unit),
+    )
+    ref_location = geometry.earth_locations[args.ref_index]
+
+    pointing_icrs = SkyCoord(
+        ra=np.full(result.obs_times.shape, args.ra_deg, dtype=np.float64) * u.deg,
+        dec=np.full(result.obs_times.shape, args.dec_deg, dtype=np.float64) * u.deg,
+        frame=ICRS(),
+    )
+    pointing_altaz = pointing_icrs.transform_to(
+        AltAz(obstime=result.obs_times, location=ref_location)
+    )
+
+    sat_icrs = SkyCoord(
+        ra=satellite_ra_deg * u.deg,
+        dec=satellite_dec_deg * u.deg,
+        frame=ICRS(),
+    )
+    sat_altaz = sat_icrs.transform_to(
+        AltAz(obstime=result.obs_times[:, np.newaxis], location=ref_location)
+    )
+
     if args.show_interactive_plots:
-        geometry = uvw.load_telescope_array_file(
-            args.array_file,
-            altitude_unit=u.Unit(args.altitude_unit),
-        )
-        ref_location = geometry.earth_locations[args.ref_index]
-
-        pointing_icrs = SkyCoord(
-            ra=np.full(result.obs_times.shape, args.ra_deg, dtype=np.float64) * u.deg,
-            dec=np.full(result.obs_times.shape, args.dec_deg, dtype=np.float64) * u.deg,
-            frame=ICRS(),
-        )
-        pointing_altaz = pointing_icrs.transform_to(
-            AltAz(obstime=result.obs_times, location=ref_location)
-        )
-
-        sat_icrs = SkyCoord(
-            ra=satellite_ra_deg * u.deg,
-            dec=satellite_dec_deg * u.deg,
-            frame=ICRS(),
-        )
-        sat_altaz = sat_icrs.transform_to(
-            AltAz(obstime=result.obs_times[:, np.newaxis], location=ref_location)
-        )
-
         print("Showing interactive Az/El track window...")
         _show_az_el_tracks_interactive(
             np.asarray(pointing_altaz.az.deg, dtype=np.float64),
@@ -402,6 +571,23 @@ def main() -> None:
     print(f"Satellite RA/Dec shape : {satellite_ra_deg.shape}")
     print(f"Antenna count          : {len(result.antenna_names)}")
     print(f"Satellite count        : {len(satellite_names)}")
+
+    stem = output_path.stem
+    out_dir = output_path.parent
+    _save_array_layout_figure(
+        geometry,
+        args.ref_index,
+        out_dir / f"{stem}_array_layout.png",
+    )
+    _save_radec_fov_figure(
+        args.ra_deg,
+        args.dec_deg,
+        satellite_ra_deg,
+        satellite_dec_deg,
+        satellite_names,
+        args.fov_radius_deg,
+        out_dir / f"{stem}_radec_fov.png",
+    )
 
     if args.show_interactive_plots:
         print("Showing final interactive UV preview window...")
