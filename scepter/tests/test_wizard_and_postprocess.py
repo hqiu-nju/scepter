@@ -403,6 +403,467 @@ class TestSatelliteAntennasConfig:
         assert legacy.ras is not None  # RAS filled with defaults
 
 
+# ---------------------------------------------------------------------------
+# Stage 3: optional ``custom_pattern`` field on RAS + Satellite antenna configs
+# ---------------------------------------------------------------------------
+
+
+def _example_1d_pattern():
+    """Minimal valid 1-D axisymmetric pattern for embedding in configs."""
+    from scepter.custom_antenna import CustomAntennaPattern
+
+    return CustomAntennaPattern.from_json_dict(
+        {
+            "scepter_antenna_pattern_format": "v1",
+            "kind": "1d_axisymmetric",
+            "normalisation": "absolute",
+            "peak_gain_source": "explicit",
+            "peak_gain_dbi": 40.0,
+            "grid_deg": [0.0, 1.0, 10.0, 180.0],
+            "gain_db": [40.0, 30.0, 0.0, -50.0],
+            "meta": {"title": "Example for embedding"},
+        }
+    )
+
+
+def _example_2d_azel_pattern():
+    """Minimal valid 2-D az/el pattern."""
+    from scepter.custom_antenna import CustomAntennaPattern
+
+    return CustomAntennaPattern.from_json_dict(
+        {
+            "scepter_antenna_pattern_format": "v1",
+            "kind": "2d",
+            "grid_mode": "az_el",
+            "normalisation": "relative",
+            "peak_gain_source": "explicit",
+            "peak_gain_dbi": 30.0,
+            "az_wraps": True,
+            "az_grid_deg": [-180.0, 0.0, 180.0],
+            "el_grid_deg": [-90.0, 0.0, 90.0],
+            "gain_db": [
+                [-30.0, -20.0, -30.0],
+                [-20.0,   0.0, -20.0],
+                [-30.0, -20.0, -30.0],
+            ],
+            "meta": {"title": "Example az/el for embedding"},
+        }
+    )
+
+
+def _example_2d_thetaphi_pattern():
+    """Minimal valid 2-D theta/phi pattern (ITU S.1528 Rec 1.4 style)."""
+    from scepter.custom_antenna import CustomAntennaPattern
+
+    return CustomAntennaPattern.from_json_dict(
+        {
+            "scepter_antenna_pattern_format": "v1",
+            "kind": "2d",
+            "grid_mode": "theta_phi",
+            "normalisation": "relative",
+            "peak_gain_source": "explicit",
+            "peak_gain_dbi": 30.0,
+            "phi_wraps": True,
+            "theta_grid_deg": [0.0, 90.0, 180.0],
+            "phi_grid_deg": [-180.0, 0.0, 180.0],
+            "gain_db": [
+                [  0.0,   0.0,   0.0],
+                [-20.0, -15.0, -20.0],
+                [-35.0, -30.0, -35.0],
+            ],
+            "meta": {"title": "Example θ/φ"},
+        }
+    )
+
+
+class TestRasAntennaConfigCustomPattern:
+    """The ``custom_pattern`` field round-trips through project JSON."""
+
+    def test_default_is_none(self):
+        from scepter.scepter_GUI import RasAntennaConfig
+
+        cfg = RasAntennaConfig()
+        assert cfg.custom_pattern is None
+
+    def test_round_trip_with_1d_pattern(self):
+        from scepter.scepter_GUI import RasAntennaConfig
+
+        pattern = _example_1d_pattern()
+        cfg = RasAntennaConfig(
+            antenna_diameter_m=100.0,
+            operational_elevation_min_deg=5.0,
+            operational_elevation_max_deg=90.0,
+            custom_pattern=pattern,
+        )
+        payload = cfg.to_json_dict()
+        # Embedded as a schema-v1 object, not a filesystem reference.
+        assert isinstance(payload["custom_pattern"], dict)
+        assert payload["custom_pattern"]["scepter_antenna_pattern_format"] == "v1"
+        cfg2 = RasAntennaConfig.from_json_dict(payload)
+        assert cfg2.custom_pattern is not None
+        assert cfg2.custom_pattern.kind == pattern.kind
+        assert cfg2.custom_pattern.peak_gain_dbi == pattern.peak_gain_dbi
+
+    def test_round_trip_without_pattern(self):
+        """``custom_pattern=None`` serialises as JSON null and deserialises back."""
+        from scepter.scepter_GUI import RasAntennaConfig
+
+        cfg = RasAntennaConfig(antenna_diameter_m=50.0)
+        payload = cfg.to_json_dict()
+        assert payload["custom_pattern"] is None
+        cfg2 = RasAntennaConfig.from_json_dict(payload)
+        assert cfg2.custom_pattern is None
+        assert cfg2.antenna_diameter_m == 50.0
+
+    def test_old_project_without_field_loads_cleanly(self):
+        """A project-state JSON from a pre-v0.25.3 release lacks the field entirely.
+
+        The loader must treat an absent ``custom_pattern`` key as None, not
+        raise — otherwise every existing project file would be rejected.
+        """
+        from scepter.scepter_GUI import RasAntennaConfig
+
+        legacy_payload = {
+            "antenna_diameter_m": 100.0,
+            "grx_max_dbi": None,
+            "frequency_mhz": 2690.0,
+            "operational_elevation_min_deg": 5.0,
+            "operational_elevation_max_deg": 90.0,
+            "target_pfd_dbw_m2_mhz": None,
+            # NOTE: no "custom_pattern" key at all — this is the pre-v0.25.3 shape.
+        }
+        cfg = RasAntennaConfig.from_json_dict(legacy_payload)
+        assert cfg.custom_pattern is None
+        assert cfg.antenna_diameter_m == 100.0
+
+    def test_malformed_custom_pattern_payload_refused(self):
+        """A mangled ``custom_pattern`` surfaces as ValueError pointing at the schema."""
+        from scepter.scepter_GUI import RasAntennaConfig
+
+        payload = RasAntennaConfig().to_json_dict()
+        # Wrong type entirely
+        payload["custom_pattern"] = "not a pattern"
+        with pytest.raises(ValueError, match="custom_pattern"):
+            RasAntennaConfig.from_json_dict(payload)
+
+    def test_pattern_with_bad_schema_version_refused(self):
+        """Embedded schema violations surface unchanged."""
+        from scepter.scepter_GUI import RasAntennaConfig
+
+        payload = RasAntennaConfig().to_json_dict()
+        payload["custom_pattern"] = {
+            "scepter_antenna_pattern_format": "v99",
+            "kind": "1d_axisymmetric",
+            "normalisation": "absolute",
+            "peak_gain_source": "explicit",
+            "peak_gain_dbi": 0.0,
+            "grid_deg": [0.0, 180.0],
+            "gain_db": [0.0, 0.0],
+        }
+        with pytest.raises(ValueError, match="scepter_antenna_pattern_format"):
+            RasAntennaConfig.from_json_dict(payload)
+
+    def test_stage20_validation_accepts_custom_1d_replacing_diameter(self):
+        """Stage 20: a Custom-1D RAS pattern replaces the RA.1631
+        diameter parameterisation. ``antenna_diameter_m=None`` is OK
+        when ``custom_pattern`` is present; elevation bounds are
+        still required.
+        """
+        import scepter.scepter_GUI as sgui
+        from scepter.scepter_GUI import RasAntennaConfig
+
+        # Diameter is None, but a valid 1-D custom pattern is present
+        # and elevations are set → valid.
+        cfg = RasAntennaConfig(
+            antenna_diameter_m=None,
+            operational_elevation_min_deg=5.0,
+            operational_elevation_max_deg=90.0,
+            custom_pattern=_example_1d_pattern(),
+        )
+        assert sgui._has_valid_ras_antenna_config(cfg) is True
+
+        # Same but elevations missing → invalid.
+        cfg_bad_elev = RasAntennaConfig(
+            antenna_diameter_m=None,
+            operational_elevation_min_deg=None,
+            operational_elevation_max_deg=90.0,
+            custom_pattern=_example_1d_pattern(),
+        )
+        assert sgui._has_valid_ras_antenna_config(cfg_bad_elev) is False
+
+        # No pattern, no diameter → invalid (legacy path needs diameter).
+        cfg_no_anything = RasAntennaConfig(
+            antenna_diameter_m=None,
+            operational_elevation_min_deg=5.0,
+            operational_elevation_max_deg=90.0,
+        )
+        assert sgui._has_valid_ras_antenna_config(cfg_no_anything) is False
+
+        # Legacy RA.1631 (diameter + no custom) still works.
+        cfg_legacy = RasAntennaConfig(
+            antenna_diameter_m=100.0,
+            operational_elevation_min_deg=5.0,
+            operational_elevation_max_deg=90.0,
+        )
+        assert sgui._has_valid_ras_antenna_config(cfg_legacy) is True
+
+    def test_custom_2d_on_ras_side_is_now_supported(self):
+        """Custom-2D RAS patterns are accepted end-to-end. The main
+        power path derives φ (rotation around the telescope boresight)
+        from the pointing + satellite geometry and feeds both θ and φ
+        into the Custom-2D LUT. Both ``az_el`` and ``theta_phi`` grid
+        modes are accepted.
+        """
+        import scepter.scepter_GUI as sgui
+        from scepter.scepter_GUI import RasAntennaConfig
+
+        cfg_azel = RasAntennaConfig(
+            operational_elevation_min_deg=5.0,
+            operational_elevation_max_deg=90.0,
+            custom_pattern=_example_2d_azel_pattern(),
+        )
+        assert sgui._has_valid_ras_antenna_config(cfg_azel) is True
+
+        cfg_thetaphi = RasAntennaConfig(
+            operational_elevation_min_deg=5.0,
+            operational_elevation_max_deg=90.0,
+            custom_pattern=_example_2d_thetaphi_pattern(),
+        )
+        assert sgui._has_valid_ras_antenna_config(cfg_thetaphi) is True
+
+
+class TestSatelliteAntennasConfigCustomPattern:
+    """Same story on the satellite-antenna side."""
+
+    def test_default_is_none(self):
+        assert SatelliteAntennasConfig().custom_pattern is None
+
+    def test_round_trip_with_2d_pattern(self):
+        pattern = _example_2d_azel_pattern()
+        cfg = SatelliteAntennasConfig(
+            frequency_mhz=12000.0,
+            antenna_model="s1528_rec1_4",
+            custom_pattern=pattern,
+        )
+        payload = cfg.to_json_dict()
+        assert isinstance(payload["custom_pattern"], dict)
+        assert payload["custom_pattern"]["grid_mode"] == "az_el"
+        cfg2 = SatelliteAntennasConfig.from_json_dict(payload)
+        assert cfg2.custom_pattern is not None
+        assert cfg2.custom_pattern.kind == pattern.kind
+        assert cfg2.custom_pattern.grid_mode == pattern.grid_mode
+        assert cfg2.custom_pattern.peak_gain_dbi == pattern.peak_gain_dbi
+
+    def test_round_trip_without_pattern(self):
+        cfg = SatelliteAntennasConfig(frequency_mhz=12000.0)
+        payload = cfg.to_json_dict()
+        assert payload["custom_pattern"] is None
+        cfg2 = SatelliteAntennasConfig.from_json_dict(payload)
+        assert cfg2.custom_pattern is None
+
+    def test_old_project_without_field_loads_cleanly(self):
+        """Pre-v0.25.3 satellite-antenna payload (no custom_pattern key).
+
+        Build a realistic legacy payload by round-tripping a populated
+        config and stripping the new ``custom_pattern`` key. The loader
+        must then treat the absent key as None, not raise.
+        """
+        reference = SatelliteAntennasConfig(
+            frequency_mhz=12000.0, antenna_model="s1528_rec1_4",
+        ).to_json_dict()
+        del reference["custom_pattern"]  # pre-v0.25.3 shape
+        assert "custom_pattern" not in reference
+
+        cfg = SatelliteAntennasConfig.from_json_dict(reference)
+        assert cfg.custom_pattern is None
+        assert cfg.frequency_mhz == 12000.0
+        assert cfg.antenna_model == "s1528_rec1_4"
+
+    def test_from_antennas_config_bridge_sets_custom_pattern_to_none(self):
+        """Legacy ``AntennasConfig`` has no custom_pattern concept — bridge yields None."""
+        from scepter.scepter_GUI import AntennasConfig
+
+        legacy = AntennasConfig(frequency_mhz=2690.0, antenna_model="m2101")
+        sat_cfg = SatelliteAntennasConfig.from_antennas_config(legacy)
+        assert sat_cfg.custom_pattern is None
+
+    def test_stage22_has_valid_config_returns_false_for_missing_custom_pattern(self):
+        """Stage 22: the config-validator returns False when a Custom
+        model is selected but ``custom_pattern=None`` (common after
+        the user switches back from Isotropic, where the widget is
+        hidden) — the downstream pre-commit validator turns this into
+        an actionable message pointing at the Load-pattern button.
+        """
+        import scepter.scepter_GUI as sgui
+
+        cfg = SatelliteAntennasConfig(
+            frequency_mhz=12000.0,
+            derive_pattern_wavelength_from_frequency=True,
+            antenna_model=sgui._ANTENNA_MODEL_CUSTOM_1D,
+            custom_pattern=None,
+        )
+        assert sgui._has_valid_satellite_antenna_config(cfg) is False
+
+    def test_satellite_antenna_pattern_spec_callable_matches_gui_shape_custom_1d(self):
+        """Audit regression: the callable returned by
+        ``_satellite_antenna_pattern_spec`` for Custom-1D must accept
+        the GUI-preview call shape ``func(angles, wavelength=...,
+        **kwargs)``. The raw ``evaluate_pattern_1d`` takes
+        ``(pattern, angles)`` positionally, so returning it directly
+        would crash the GUI antenna-pattern plot.
+        """
+        import numpy as np
+        import scepter.scepter_GUI as sgui
+        from astropy import units as u
+
+        cfg = SatelliteAntennasConfig(
+            frequency_mhz=12000.0,
+            derive_pattern_wavelength_from_frequency=True,
+            antenna_model=sgui._ANTENNA_MODEL_CUSTOM_1D,
+            custom_pattern=_example_1d_pattern(),
+        )
+        antenna_func, wavelength, pattern_kwargs = sgui._satellite_antenna_pattern_spec(cfg)
+        # GUI-preview call shape.
+        offset_angles = np.linspace(0.0, 90.0, 361) * u.deg
+        gains_result = antenna_func(
+            offset_angles, wavelength=wavelength, **pattern_kwargs,
+        )
+        # Must return an astropy Quantity in dBi (same as the
+        # analytical-pattern branch).
+        assert hasattr(gains_result, "to_value")
+        from pycraf import conversions as cnv
+        gains_dbi = gains_result.to_value(cnv.dBi)
+        assert gains_dbi.shape == (361,)
+        # Peak at boresight should be near the declared peak.
+        assert abs(float(gains_dbi[0]) - 40.0) < 0.5
+
+    def test_satellite_antenna_pattern_spec_callable_matches_gui_shape_custom_2d(self):
+        import numpy as np
+        import scepter.scepter_GUI as sgui
+        from astropy import units as u
+
+        cfg = SatelliteAntennasConfig(
+            frequency_mhz=12000.0,
+            derive_pattern_wavelength_from_frequency=True,
+            antenna_model=sgui._ANTENNA_MODEL_CUSTOM_2D,
+            custom_pattern=_example_2d_azel_pattern(),
+        )
+        antenna_func, wavelength, pattern_kwargs = sgui._satellite_antenna_pattern_spec(cfg)
+        offset_angles = np.linspace(0.0, 90.0, 181) * u.deg
+        gains_result = antenna_func(
+            offset_angles, wavelength=wavelength, **pattern_kwargs,
+        )
+        assert hasattr(gains_result, "to_value")
+        from pycraf import conversions as cnv
+        gains_dbi = gains_result.to_value(cnv.dBi)
+        assert gains_dbi.shape == (181,)
+
+    def test_stage23_project_state_round_trip_preserves_custom_pattern(self):
+        """Stage 23: saving and reloading a ``SatelliteAntennasConfig``
+        carrying an embedded custom pattern round-trips the LUT inline
+        (no filesystem reference). Combined with the Phase-1 Stage-3
+        round-trip tests this closes the save/load migration story —
+        old project JSONs without the ``custom_pattern`` key load
+        cleanly (that case is covered by
+        ``test_old_project_without_field_loads_cleanly``); new projects
+        embed the full LUT so a project file is self-contained across
+        machines.
+        """
+        pat = _example_2d_azel_pattern()
+        cfg = SatelliteAntennasConfig(
+            frequency_mhz=12000.0,
+            derive_pattern_wavelength_from_frequency=True,
+            antenna_model="custom_2d",
+            custom_pattern=pat,
+        )
+        payload = cfg.to_json_dict()
+        # Embedded inline, not a path reference.
+        assert isinstance(payload["custom_pattern"], dict)
+        assert payload["custom_pattern"]["grid_mode"] == "az_el"
+        assert payload["custom_pattern"]["scepter_antenna_pattern_format"] == "v1"
+
+        restored = SatelliteAntennasConfig.from_json_dict(payload)
+        assert restored.antenna_model == "custom_2d"
+        assert restored.custom_pattern is not None
+        assert restored.custom_pattern.kind == pat.kind
+        assert restored.custom_pattern.grid_mode == pat.grid_mode
+        assert restored.custom_pattern.peak_gain_dbi == pat.peak_gain_dbi
+        # The embedded LUT survives round-trip value-for-value.
+        import numpy as _np
+        _np.testing.assert_array_equal(
+            restored.custom_pattern.gain_db, pat.gain_db,
+        )
+
+    def test_stage22_has_valid_config_rejects_mismatched_kind(self):
+        """Stage 22: Custom-2D model with a 1-D pattern loaded (e.g.
+        user picked ``custom_2d`` after loading a 1-D file) must
+        fail config validation — the downstream validator attaches
+        an actionable message explaining the kind mismatch.
+        """
+        import scepter.scepter_GUI as sgui
+
+        cfg = SatelliteAntennasConfig(
+            frequency_mhz=12000.0,
+            derive_pattern_wavelength_from_frequency=True,
+            antenna_model=sgui._ANTENNA_MODEL_CUSTOM_2D,
+            custom_pattern=_example_1d_pattern(),
+        )
+        assert sgui._has_valid_satellite_antenna_config(cfg) is False
+
+    def test_custom_1d_validation_requires_pattern_and_matching_kind(self):
+        """Stage 19: validation for the ``custom_1d`` / ``custom_2d``
+        antenna-model choices comes from the embedded pattern, not
+        from Rec 1.2 / Rec 1.4 / M.2101 scalar fields.
+        """
+        import scepter.scepter_GUI as sgui
+
+        # A valid frequency-derived wavelength is a precondition for
+        # any antenna-model validity check — set it here so the
+        # Custom-model branches are the discriminator under test.
+        base_kwargs = dict(
+            frequency_mhz=12000.0,
+            derive_pattern_wavelength_from_frequency=True,
+        )
+
+        # custom_1d model + no pattern → invalid.
+        cfg = SatelliteAntennasConfig(
+            antenna_model=sgui._ANTENNA_MODEL_CUSTOM_1D, **base_kwargs,
+        )
+        assert sgui._has_valid_satellite_antenna_config(cfg) is False
+
+        # custom_1d + matching 1-D pattern → valid.
+        cfg_with_1d = SatelliteAntennasConfig(
+            antenna_model=sgui._ANTENNA_MODEL_CUSTOM_1D,
+            custom_pattern=_example_1d_pattern(),
+            **base_kwargs,
+        )
+        assert sgui._has_valid_satellite_antenna_config(cfg_with_1d) is True
+
+        # custom_1d + 2-D pattern → invalid (kind mismatch).
+        cfg_kind_mismatch = SatelliteAntennasConfig(
+            antenna_model=sgui._ANTENNA_MODEL_CUSTOM_1D,
+            custom_pattern=_example_2d_azel_pattern(),
+            **base_kwargs,
+        )
+        assert sgui._has_valid_satellite_antenna_config(cfg_kind_mismatch) is False
+
+        # custom_2d + matching 2-D pattern → valid.
+        cfg_with_2d = SatelliteAntennasConfig(
+            antenna_model=sgui._ANTENNA_MODEL_CUSTOM_2D,
+            custom_pattern=_example_2d_azel_pattern(),
+            **base_kwargs,
+        )
+        assert sgui._has_valid_satellite_antenna_config(cfg_with_2d) is True
+
+        # custom_2d + 1-D pattern → invalid (kind mismatch).
+        cfg_kind_mismatch_2 = SatelliteAntennasConfig(
+            antenna_model=sgui._ANTENNA_MODEL_CUSTOM_2D,
+            custom_pattern=_example_1d_pattern(),
+            **base_kwargs,
+        )
+        assert sgui._has_valid_satellite_antenna_config(cfg_kind_mismatch_2) is False
+
+
 class TestBoresightConfig:
 
     def test_round_trip(self):

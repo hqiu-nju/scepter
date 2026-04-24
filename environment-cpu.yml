@@ -34,6 +34,11 @@ dependencies:
   - shapely
   - psutil
 
+  # --- Numba (CPU JIT for satsim / earthgrid / visualise) ---
+  # numba-cuda and cupy deliberately omitted — the GUI is fully
+  # functional without them and the Run button is auto-disabled.
+  - numba
+
   # --- Desktop GUI ---
   - pyside6
   - pyvista

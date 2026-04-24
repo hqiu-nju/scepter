@@ -154,6 +154,7 @@ never touch cached device arrays.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 import functools
@@ -176,10 +177,69 @@ from pycraf import conversions as cnv
 from pycraf.geometry import true_angular_distance
 from scipy import special as scipy_special
 
+# No-CUDA fallback stub.  Defined unconditionally so it's always
+# introspectable (tests can instantiate it directly to verify decorator
+# behaviour even on a CUDA-enabled dev machine).  Only *instantiated*
+# below when ``from numba import cuda`` fails — that's the cross-platform
+# GUI path (e.g. macOS, Linux-without-NVIDIA) where the user edits
+# configurations and inspects HDF5 results but can't run simulations.
+class _CudaUnavailableStub:
+    """No-op stand-in for ``numba.cuda`` when CUDA is unavailable.
+
+    Exists so module-level ``@cuda.jit`` / ``@cuda.reduce`` decorators
+    survive import when numba-cuda isn't available.  Any attempt to
+    *call* a stubbed kernel raises a clear RuntimeError — non-CUDA
+    paths (GUI import, postprocessing) work; only simulation needs CUDA.
+    """
+
+    class _StubKernel:
+        def __init__(self, fn=None):
+            self._fn = fn
+            self.__name__ = getattr(fn, "__name__", "<cuda-stub>")
+
+        def __call__(self, *args, **kwargs):
+            raise RuntimeError(
+                "This CUDA kernel cannot be invoked because numba.cuda is not "
+                "available in this environment.  Install numba_cuda + cupy, or "
+                "use the pure-Python fallback paths where available."
+            )
+
+        def __getitem__(self, _grid_block):
+            # Support the ``kernel[grid, block](...)`` launch syntax.
+            return self
+
+    def jit(self, *args, **kwargs):
+        # ``@cuda.jit`` or ``@cuda.jit(device=True)`` — return a decorator
+        # that wraps the target function in a stub.
+        if len(args) == 1 and callable(args[0]) and not kwargs:
+            return self._StubKernel(args[0])
+
+        def _decorator(fn):
+            return self._StubKernel(fn)
+
+        return _decorator
+
+    def reduce(self, *args, **kwargs):
+        return self.jit(*args, **kwargs)
+
+    def __getattr__(self, name):
+        # Any other attribute access returns a callable stub so expressions
+        # like ``cuda.is_available()`` or ``cuda.current_context()`` don't
+        # explode on import-order-sensitive code paths.
+        def _stub(*a, **k):
+            if name == "is_available":
+                return False
+            raise RuntimeError(
+                f"numba.cuda.{name} is not available — CUDA toolchain missing."
+            )
+
+        return _stub
+
+
 try:  # pragma: no cover - import availability is environment-dependent
     from numba import cuda
 except Exception:  # pragma: no cover - import availability is environment-dependent
-    cuda = None
+    cuda = _CudaUnavailableStub()
 
 try:  # pragma: no cover - import availability is environment-dependent
     from numba.core.errors import NumbaPerformanceWarning as _NumbaCorePerformanceWarning
@@ -197,6 +257,50 @@ try:  # pragma: no cover - import availability is environment-dependent
 except Exception:  # pragma: no cover - import availability is environment-dependent
     cp = None
     cupy_special = None
+
+
+def _patch_cupy_nvrtc_tempfile_encoding() -> None:
+    """Force CuPy's NVRTC temp ``.cu`` write to UTF-8.
+
+    CuPy 13.x's ``cupy/cuda/compiler.py::_compile_using_nvrtc_no_warning``
+    does ``open(cu_path, 'w')`` with no explicit ``encoding=``. On Windows
+    that resolves to ``locale.getpreferredencoding()`` which is ``cp1252``
+    on English locales, and crashes when any character in the kernel
+    source is outside cp1252 (e.g. ``->`` was once ``→`` in a kernel
+    comment; ``α``/``β``/``Δ``/``×`` also appear in ElementwiseKernel
+    operation strings). The failure surfaces up the direct-EPFD pipeline
+    as an opaque ``_DirectEpfdStageExecutionError: beam_finalize:
+    'charmap' codec ...``. Fix it by shadowing the module-level ``open``
+    name inside ``cupy.cuda.compiler`` with a wrapper that forces
+    ``encoding='utf-8'`` when the caller doesn't specify one and opens
+    in text mode — Python's name lookup resolves ``open`` inside that
+    module via its globals dict, so an injected attribute wins over
+    ``builtins.open``.
+    """
+    if cp is None:
+        return
+    try:
+        from cupy.cuda import compiler as _cupy_compiler
+    except Exception:  # pragma: no cover - defensive
+        return
+    if getattr(_cupy_compiler, "_scepter_utf8_tempfile_patch", False):
+        return
+
+    import builtins as _builtins
+
+    _real_open = _builtins.open
+
+    def _utf8_default_open(file, mode="r", *args, **kwargs):
+        # Only inject ``encoding`` for text-mode opens that didn't set one.
+        if "b" not in mode and "encoding" not in kwargs:
+            kwargs["encoding"] = "utf-8"
+        return _real_open(file, mode, *args, **kwargs)
+
+    _cupy_compiler.open = _utf8_default_open
+    _cupy_compiler._scepter_utf8_tempfile_patch = True
+
+
+_patch_cupy_nvrtc_tempfile_encoding()
 
 
 MJD_TO_JD_OFFSET = 2400000.5
@@ -1555,17 +1659,51 @@ def _splitmix64_cupy(x: Any) -> Any:
     return z ^ (z >> cp.uint64(32))
 
 
+_pair_priority_fused_kernel = None
+
+
+def _get_pair_priority_fused_kernel():
+    """Fused kernel: combine pair-priority key derivation + splitmix64
+    hash in one launch.  Replaces ~12 sequential CuPy operations
+    (uint64 arithmetic + bit mixing) with a single ElementwiseKernel."""
+    global _pair_priority_fused_kernel
+    if _pair_priority_fused_kernel is not None:
+        return _pair_priority_fused_kernel
+    _pair_priority_fused_kernel = cp.ElementwiseKernel(
+        "uint64 row_idx, uint64 sat_idx, uint64 seed, uint64 c1, uint64 c2",
+        "uint64 priority",
+        r"""
+        unsigned long long key = seed
+            + (row_idx + 1ULL) * c1
+            + (sat_idx + 1ULL) * c2;
+        /* splitmix64 */
+        key = key * 6364136223846793005ULL + 1442695040888963407ULL;
+        key ^= (key >> 33);
+        key *= 3202034522624059733ULL;
+        key ^= (key >> 29);
+        key *= 3935559000370003845ULL;
+        priority = key ^ (key >> 32);
+        """,
+        "pair_priority_splitmix64_fused",
+    )
+    return _pair_priority_fused_kernel
+
+
 def _pair_priority_random_cupy(
     seed_u64: np.uint64,
     row_index: Any,
     sat_index: Any,
 ) -> Any:
     _require_cupy()
-    row_u64 = _to_cupy_array(row_index, dtype=cp.uint64)
-    sat_u64 = _to_cupy_array(sat_index, dtype=cp.uint64)
-    key = cp.uint64(int(seed_u64)) + (row_u64 + cp.uint64(1)) * cp.uint64(int(_GPU_LINK_RANDOM_PAIR_C1))
-    key = key + (sat_u64 + cp.uint64(1)) * cp.uint64(int(_GPU_LINK_RANDOM_PAIR_C2))
-    return _splitmix64_cupy(key)
+    # Use fused kernel: 12 CuPy dispatches → 1 ElementwiseKernel.
+    _kernel = _get_pair_priority_fused_kernel()
+    return _kernel(
+        _to_cupy_array(row_index, dtype=cp.uint64),
+        _to_cupy_array(sat_index, dtype=cp.uint64),
+        np.uint64(int(seed_u64)),
+        np.uint64(int(_GPU_LINK_RANDOM_PAIR_C1)),
+        np.uint64(int(_GPU_LINK_RANDOM_PAIR_C2)),
+    )
 
 
 def _stable_lexsort_cupy(*keys: Any) -> Any:
@@ -1975,9 +2113,7 @@ def _frontier_select_link_candidates_reference_cp(
     cell_count_i32 = np.int32(int(library.cell_count))
     sat_count_i32 = np.int32(int(library.sat_count))
     beta_tol_rad = np.float32(float(library.beta_tol_deg) * np.pi / 180.0)
-    sat_beta_max_rad_cp = (
-        library.sat_beta_max_cp.astype(cp.float32, copy=False) * cp.float32(np.pi / 180.0)
-    ).astype(cp.float32, copy=False)
+    sat_beta_max_rad_cp = library.sat_beta_max_rad_cp
     has_link_geom = int(slab["candidate_alpha_rad"].size) > 0 and int(slab["candidate_beta_rad"].size) > 0
 
     active_rows_cp = cp.nonzero(row_cursor_cp < row_stop_cp)[0].astype(cp.int32, copy=False)
@@ -2059,6 +2195,108 @@ def _estimate_selector_row_chunk_size(
     return 65536
 
 
+_active_rows_mask_kernel = None
+
+
+def _get_active_rows_mask_kernel():
+    """Fused active-rows mask for the `_fast_select_link_candidates_cp` hot loop.
+
+    Replaces ``(row_fill == slot) & (row_cursor < row_stop)`` — a 2-launch
+    + 2-intermediate pattern — with a single elementwise kernel that
+    writes the final ``bool`` mask directly.  Called twice per
+    while-iteration (prime + restart), so cumulative savings scale with
+    the total window-iteration count (≈10 per fast-select call).
+    """
+    global _active_rows_mask_kernel
+    if _active_rows_mask_kernel is not None:
+        return _active_rows_mask_kernel
+    _active_rows_mask_kernel = cp.ElementwiseKernel(
+        "int32 row_fill, int64 row_cursor, int64 row_stop, int32 slot",
+        "bool active",
+        """
+        active = (row_fill == slot) && (row_cursor < row_stop);
+        """,
+        "active_rows_mask",
+    )
+    return _active_rows_mask_kernel
+
+
+# Lever #3: fused proposal-row compute kernel for the first-pass
+# selector inner loop.  Replaces 6 separate CuPy launches (gather
+# row_cursor, div/mod for t/c, gather candidate_sat, compute
+# group_key) with 1 launch.  The selector's while-loop iterates
+# 3-10× per link_slot × 30 slots, so this saves 180-1800 launches
+# per first-pass call (5-20 ms/batch on analytical at bulk=6).
+_first_pass_proposal_kernel = None
+_first_pass_chosen_gather_kernel = None
+
+
+def _get_first_pass_chosen_gather_kernel():
+    """Lever #5b: fused gather kernel for the post-proposal "chosen_*"
+    arrays in the first-pass selector inner loop.
+
+    Replaces 5 separate ``proposal_*[keep_local_cp]`` gathers + 5
+    ``.astype(cp.int32, copy=False)`` no-op casts with one
+    ElementwiseKernel launch.  The while-loop runs 3-10× per
+    link_slot × 30 slots, so this saves 150-500 CuPy launches per
+    first-pass call (3-10 ms/batch on analytical at bulk=6).
+
+    Inputs per output element:
+      keep_local — index into the proposal_* arrays
+      proposal_{row, t, c, sat, pos} — raw int32/int64 arrays
+    Outputs:
+      chosen_{rows, t, c, sat, pos}
+
+    ``chosen_slot`` is NOT produced here — it depends on
+    ``chosen_rows`` (a gather into row_fill) so it stays a
+    separate launch downstream.
+    """
+    global _first_pass_chosen_gather_kernel
+    if _first_pass_chosen_gather_kernel is not None:
+        return _first_pass_chosen_gather_kernel
+    _first_pass_chosen_gather_kernel = cp.ElementwiseKernel(
+        "int64 keep_local, raw int32 proposal_row, raw int32 proposal_t, "
+        "raw int32 proposal_c, raw int32 proposal_sat, raw int64 proposal_pos",
+        "int32 chosen_row, int32 chosen_t, int32 chosen_c, "
+        "int32 chosen_sat, int64 chosen_pos",
+        r"""
+        chosen_row = proposal_row[keep_local];
+        chosen_t   = proposal_t[keep_local];
+        chosen_c   = proposal_c[keep_local];
+        chosen_sat = proposal_sat[keep_local];
+        chosen_pos = proposal_pos[keep_local];
+        """,
+        "first_pass_chosen_gather_fused",
+    )
+    return _first_pass_chosen_gather_kernel
+
+
+def _get_first_pass_proposal_kernel():
+    global _first_pass_proposal_kernel
+    if _first_pass_proposal_kernel is not None:
+        return _first_pass_proposal_kernel
+    _first_pass_proposal_kernel = cp.ElementwiseKernel(
+        "int32 active_row, raw int64 row_cursor, raw int32 candidate_sat, "
+        "int32 cell_count, int32 sat_count",
+        "int32 proposal_row, int64 proposal_pos, "
+        "int32 proposal_t, int32 proposal_c, "
+        "int32 proposal_sat, int32 group_key",
+        r"""
+        proposal_row = active_row;
+        long long pos = row_cursor[active_row];
+        proposal_pos = pos;
+        int t = active_row / cell_count;
+        proposal_t = t;
+        proposal_c = active_row - t * cell_count;
+        int sat = candidate_sat[pos];
+        proposal_sat = sat;
+        group_key = t * sat_count + sat;
+        """,
+        "first_pass_proposal_fused",
+    )
+    return _first_pass_proposal_kernel
+
+
 def _fast_select_link_candidates_cp(
     library: "GpuSatelliteLinkSelectionLibrary",
     *,
@@ -2107,9 +2345,7 @@ def _fast_select_link_candidates_cp(
     cell_count_i32 = np.int32(int(library.cell_count))
     sat_count_i32 = np.int32(int(library.sat_count))
     beta_tol_rad = np.float32(float(library.beta_tol_deg) * np.pi / 180.0)
-    sat_beta_max_rad_cp = (
-        library.sat_beta_max_cp.astype(cp.float32, copy=False) * cp.float32(np.pi / 180.0)
-    ).astype(cp.float32, copy=False)
+    sat_beta_max_rad_cp = library.sat_beta_max_rad_cp
     has_link_geom = int(slab["candidate_alpha_rad"].size) > 0 and int(slab["candidate_beta_rad"].size) > 0
     debug_stats = {
         "window_iterations": 0,
@@ -2118,24 +2354,31 @@ def _fast_select_link_candidates_cp(
         "fast_backend_used": True,
     }
 
+    active_rows_mask_kernel = _get_active_rows_mask_kernel()
     for link_slot in range(int(library.n_links)):
-        active_rows_cp = cp.nonzero(
-            (row_fill_cp == np.int32(link_slot)) & (row_cursor_cp < row_stop_cp)
-        )[0].astype(cp.int32, copy=False)
+        slot_i32 = np.int32(link_slot)
+        active_mask_cp = active_rows_mask_kernel(
+            row_fill_cp, row_cursor_cp, row_stop_cp, slot_i32,
+        )
+        active_rows_cp = cp.nonzero(active_mask_cp)[0].astype(cp.int32, copy=False)
+        _proposal_kernel = _get_first_pass_proposal_kernel()
         while int(active_rows_cp.size) > 0:
             debug_stats["window_iterations"] += 1
             debug_stats["active_rows_peak"] = max(
                 int(debug_stats["active_rows_peak"]),
                 int(active_rows_cp.size),
             )
-            proposal_row_cp = active_rows_cp.astype(cp.int32, copy=False)
-            proposal_pos_cp = row_cursor_cp[proposal_row_cp].astype(cp.int64, copy=False)
-            proposal_t_cp = (proposal_row_cp // cell_count_i32).astype(cp.int32, copy=False)
-            proposal_c_cp = (proposal_row_cp - proposal_t_cp * cell_count_i32).astype(cp.int32, copy=False)
-            proposal_sat_cp = slab["candidate_sat"][proposal_pos_cp].astype(cp.int32, copy=False)
-            group_key_cp = (
-                proposal_t_cp * sat_count_i32 + proposal_sat_cp
-            ).astype(cp.int32, copy=False)
+            # Fused: compute (proposal_row, pos, t, c, sat, group_key)
+            # from active_rows_cp in one launch instead of 6.
+            (
+                proposal_row_cp, proposal_pos_cp, proposal_t_cp,
+                proposal_c_cp, proposal_sat_cp, group_key_cp,
+            ) = _proposal_kernel(
+                active_rows_cp,
+                row_cursor_cp,
+                slab["candidate_sat"].astype(cp.int32, copy=False),
+                cell_count_i32, sat_count_i32,
+            )
             remaining_cap_cp = cp.maximum(
                 np.int32(0),
                 n_beam_i32 - sat_used_cp.reshape(-1).astype(cp.int32, copy=False),
@@ -2147,43 +2390,70 @@ def _fast_select_link_candidates_cp(
             )
             row_cursor_cp[proposal_row_cp] = proposal_pos_cp + cp.int64(1)
             if int(keep_local_cp.size) > 0:
-                chosen_rows_cp = proposal_row_cp[keep_local_cp].astype(cp.int32, copy=False)
-                chosen_t_cp = proposal_t_cp[keep_local_cp].astype(cp.int32, copy=False)
-                chosen_c_cp = proposal_c_cp[keep_local_cp].astype(cp.int32, copy=False)
-                chosen_sat_cp = proposal_sat_cp[keep_local_cp].astype(cp.int32, copy=False)
+                # Lever #5b: fused "chosen_*" gather.  Replaces 5
+                # separate proposal_*[keep_local_cp] gathers with one
+                # ElementwiseKernel launch.
+                _chosen_kernel = _get_first_pass_chosen_gather_kernel()
+                (
+                    chosen_rows_cp, chosen_t_cp, chosen_c_cp,
+                    chosen_sat_cp, chosen_pos_cp,
+                ) = _chosen_kernel(
+                    keep_local_cp.astype(cp.int64, copy=False),
+                    proposal_row_cp, proposal_t_cp, proposal_c_cp,
+                    proposal_sat_cp, proposal_pos_cp,
+                )
+                # chosen_slot depends on chosen_rows (gather into
+                # row_fill) — can't fuse into the above kernel.
                 chosen_slot_cp = row_fill_cp[chosen_rows_cp].astype(cp.int32, copy=False)
-                chosen_pos_cp = proposal_pos_cp[keep_local_cp].astype(cp.int64, copy=False)
 
                 assignments_cp[chosen_t_cp, chosen_c_cp, chosen_slot_cp] = chosen_sat_cp
                 row_fill_cp[chosen_rows_cp] = chosen_slot_cp + np.int32(1)
                 cp.add.at(sat_used_cp, (chosen_t_cp, chosen_sat_cp), np.int32(1))
 
-                if library.use_cone_check and has_link_geom:
+                # Cone-check mask.  Two wins vs the old version:
+                #  - when ``use_cone_check`` is off, skip building a bool array
+                #    and the subsequent ``cp.nonzero(ok_cp)`` gather — scatter
+                #    the scalar True directly, and use the full ``chosen_*``
+                #    indices as the ``valid_geom_cp`` alias below;
+                #  - share the ``chosen_beta_cp`` gather between the cone
+                #    check and the ``selected_beta_rad`` scatter instead of
+                #    fetching it twice.
+                chosen_beta_cp = None
+                if has_link_geom:
                     chosen_beta_cp = slab["candidate_beta_rad"][chosen_pos_cp].astype(cp.float32, copy=False)
+                if library.use_cone_check and has_link_geom:
                     ok_cp = chosen_beta_cp <= (
                         sat_beta_max_rad_cp[chosen_sat_cp] + np.float32(beta_tol_rad)
                     )
+                    cone_ok_cp[chosen_t_cp, chosen_c_cp, chosen_slot_cp] = ok_cp
                 else:
-                    ok_cp = cp.ones((int(chosen_pos_cp.size),), dtype=cp.bool_)
-                cone_ok_cp[chosen_t_cp, chosen_c_cp, chosen_slot_cp] = ok_cp
+                    # All entries pass: scatter-assign a scalar True and
+                    # treat every chosen index as geom-valid below.
+                    cone_ok_cp[chosen_t_cp, chosen_c_cp, chosen_slot_cp] = True
+                    ok_cp = None
                 if has_link_geom:
                     chosen_alpha_cp = slab["candidate_alpha_rad"][chosen_pos_cp].astype(cp.float32, copy=False)
-                    chosen_beta_cp = slab["candidate_beta_rad"][chosen_pos_cp].astype(cp.float32, copy=False)
-                    valid_geom_cp = cp.nonzero(ok_cp)[0].astype(cp.int64, copy=False)
-                    if int(valid_geom_cp.size) > 0:
-                        selected_alpha_rad_cp[
-                            chosen_t_cp[valid_geom_cp],
-                            chosen_c_cp[valid_geom_cp],
-                            chosen_slot_cp[valid_geom_cp],
-                        ] = chosen_alpha_cp[valid_geom_cp]
-                        selected_beta_rad_cp[
-                            chosen_t_cp[valid_geom_cp],
-                            chosen_c_cp[valid_geom_cp],
-                            chosen_slot_cp[valid_geom_cp],
-                        ] = chosen_beta_cp[valid_geom_cp]
-            active_rows_cp = cp.nonzero(
-                (row_fill_cp == np.int32(link_slot)) & (row_cursor_cp < row_stop_cp)
-            )[0].astype(cp.int32, copy=False)
+                    if ok_cp is None:
+                        # Fast path: no cone filter, all chosen entries valid.
+                        selected_alpha_rad_cp[chosen_t_cp, chosen_c_cp, chosen_slot_cp] = chosen_alpha_cp
+                        selected_beta_rad_cp[chosen_t_cp, chosen_c_cp, chosen_slot_cp] = chosen_beta_cp
+                    else:
+                        valid_geom_cp = cp.nonzero(ok_cp)[0].astype(cp.int64, copy=False)
+                        if int(valid_geom_cp.size) > 0:
+                            selected_alpha_rad_cp[
+                                chosen_t_cp[valid_geom_cp],
+                                chosen_c_cp[valid_geom_cp],
+                                chosen_slot_cp[valid_geom_cp],
+                            ] = chosen_alpha_cp[valid_geom_cp]
+                            selected_beta_rad_cp[
+                                chosen_t_cp[valid_geom_cp],
+                                chosen_c_cp[valid_geom_cp],
+                                chosen_slot_cp[valid_geom_cp],
+                            ] = chosen_beta_cp[valid_geom_cp]
+            active_mask_cp = active_rows_mask_kernel(
+                row_fill_cp, row_cursor_cp, row_stop_cp, slot_i32,
+            )
+            active_rows_cp = cp.nonzero(active_mask_cp)[0].astype(cp.int32, copy=False)
 
     result_cp = {
         "assignments": assignments_cp,
@@ -3243,6 +3513,20 @@ class GpuS1528PatternContext:
     gain_lut_step_deg: float = field(default=0.0, repr=False)
     gain_lut_max_deg: float = field(default=0.0, repr=False)
     gain_lut_n: int = field(default=0, repr=False)
+    # Asymmetric Rec 1.4 path (lt_m != lr_m). When ``is_2d`` is True the
+    # axisymmetric (phi=0) 1-D LUT no longer captures the pattern and a
+    # 2-D LUT in (theta, phi) must be used instead. The phi grid spans
+    # [0, 90] deg and relies on the pattern's 4-fold symmetry (cos^2/sin^2
+    # in the u-formula) — runtime lookup folds arbitrary phi into this
+    # quadrant. See ``_ensure_s1528_gain_lut_2d``.
+    is_2d: bool = field(default=False, repr=False)
+    d_gain_lut_2d: Any = field(default=None, repr=False)
+    gain_lut_2d_theta_step_deg: float = field(default=0.0, repr=False)
+    gain_lut_2d_phi_step_deg: float = field(default=0.0, repr=False)
+    gain_lut_2d_n_theta: int = field(default=0, repr=False)
+    gain_lut_2d_n_phi: int = field(default=0, repr=False)
+    gain_lut_2d_theta_max_deg: float = field(default=0.0, repr=False)
+    gain_lut_2d_phi_max_deg: float = field(default=0.0, repr=False)
 
 
 @dataclass(slots=True)
@@ -3317,6 +3601,106 @@ class GpuIsotropicPatternContext:
 
     session: "GpuScepterSession" = field(repr=False, compare=False)
     wavelength_m: float = 0.1
+
+
+@dataclass(slots=True)
+class GpuCustomPattern1DContext:
+    """User-supplied 1-D (axisymmetric) custom antenna pattern.
+
+    Stage 11 of the 30-stage custom-antenna plan. Stores a
+    resampled-onto-regular-grid dB LUT on device so the hot path can
+    reuse the same bilinear-in-dB interpolation kernel as the S.1528
+    1-D LUT path (``_get_s1528_lut_1d_interp_kernel``). Input patterns
+    with duplicate grid points (step discontinuities per the schema's
+    right-continuous rule) are resampled off-device by
+    :func:`scepter.custom_antenna.evaluate_pattern_1d`; the resulting
+    regular LUT encodes the steps as rapid linear ramps between
+    adjacent samples — the GPU kernel does not need special handling.
+
+    Parameters
+    ----------
+    peak_gain_dbi : float
+        Authoritative peak gain in dBi, from the loaded
+        ``CustomAntennaPattern``. Stored verbatim — used by callers
+        that need an absolute ``G_max`` (normalised-gain path,
+        surface-PFD cap).
+    wavelength_m : float
+        Wavelength used for FSPL / PFD conversion. Mirrors the
+        convention of the S.1528 / M.2101 contexts.
+    """
+    session: "GpuScepterSession" = field(repr=False, compare=False)
+    compute_dtype: np.dtype
+    device_id: int
+    peak_gain_dbi: float
+    wavelength_m: float
+    # --- device-side regular-grid LUT ---
+    d_gain_lut: Any = field(repr=False)
+    gain_lut_step_deg: float = field(repr=False)
+    gain_lut_max_deg: float = field(repr=False)
+    gain_lut_n: int = field(repr=False)
+    # Retain the source CustomAntennaPattern purely for debuggability
+    # and to keep the object reachable for as long as the cache holds
+    # it. Cache keys are BLAKE2b-128 content fingerprints, not Python
+    # ids, so the cache stays correct even if this reference is ever
+    # dropped — this field is a diagnostic aid, not a correctness one.
+    source_pattern: Any = field(default=None, repr=False, compare=False)
+
+
+@dataclass(slots=True)
+class GpuCustomPattern2DContext:
+    """User-supplied 2-D custom antenna pattern on device.
+
+    Stage 12 of the 30-stage custom-antenna plan. Stores a resampled-
+    onto-regular-grid dB LUT on device plus enough metadata for the
+    runtime bilinear-interp kernel to honour the per-axis wrap-or-clip
+    policy the schema declares (``az_wraps`` / ``phi_wraps``). The
+    stored gain is always absolute dBi (relative-mode inputs have the
+    peak baked in at upload time), matching the Custom-1D convention.
+
+    The ``grid_mode`` field records whether the LUT is parameterised in
+    body-frame ``(az, el)`` (datasheet-style) or boresight-relative
+    ``(θ, φ)`` (ITU S.1528 Rec 1.4 style). Either way the aperture is
+    *attached to the beam boresight* — rotating the beam rotates the
+    pattern, same physical property that makes the surface-PFD cap
+    K-LUT stay α-invariant (Stage-10 decision doc).
+
+    Parameters
+    ----------
+    grid_mode : str
+        ``"az_el"`` or ``"theta_phi"`` — dictates what
+        ``(axis0_deg, axis1_deg)`` the evaluator expects. Matches the
+        :class:`~scepter.custom_antenna.CustomAntennaPattern` field.
+    """
+    session: "GpuScepterSession" = field(repr=False, compare=False)
+    compute_dtype: np.dtype
+    device_id: int
+    peak_gain_dbi: float
+    wavelength_m: float
+    grid_mode: str
+    # Regular-grid axis metadata — axis0 is the first (az or θ), axis1
+    # is the second (el or φ). ``wraps`` flags mirror the schema.
+    axis0_min_deg: float = field(repr=False)
+    axis0_step_deg: float = field(repr=False)
+    axis0_n: int = field(repr=False)
+    axis0_wraps: bool = field(repr=False)
+    axis1_min_deg: float = field(repr=False)
+    axis1_step_deg: float = field(repr=False)
+    axis1_n: int = field(repr=False)
+    axis1_wraps: bool = field(repr=False)
+    # Device LUT shape ``(axis0_n, axis1_n)`` float32 dBi.
+    d_gain_lut: Any = field(repr=False)
+    # See ``GpuCustomPattern1DContext.source_pattern`` — diagnostic
+    # aid only, kept for debuggability now that cache keys are content
+    # fingerprints rather than Python ids.
+    source_pattern: Any = field(default=None, repr=False, compare=False)
+
+    @property
+    def axis0_range_deg(self) -> float:
+        return float(self.axis0_step_deg) * (int(self.axis0_n) - 1)
+
+    @property
+    def axis1_range_deg(self) -> float:
+        return float(self.axis1_step_deg) * (int(self.axis1_n) - 1)
 
 
 @dataclass(slots=True)
@@ -3406,7 +3790,7 @@ class GpuPeakPfdLutContext:
         kernel at runtime so the cap and the emitted PFD cannot disagree.
     pattern_eval_mode : str
         Either ``"lut"`` or ``"analytical"``.  The builder dispatches on
-        ``gpu_accel._s1528_pattern_eval_mode`` at call time so the runtime
+        ``gpu_accel._pattern_eval_mode`` at call time so the runtime
         Review & Run "Pattern evaluation" setting is honoured without a
         per-batch rebuild.
     beta_step_deg, beta_max_deg, n_beta : float, float, int
@@ -3660,6 +4044,7 @@ class GpuSatelliteLinkSelectionLibrary:
     sat_belt_id_host: np.ndarray = field(init=False, repr=False)
     sat_min_elev_cp: Any = field(init=False, repr=False)
     sat_beta_max_cp: Any = field(init=False, repr=False)
+    sat_beta_max_rad_cp: Any = field(init=False, repr=False)
     sat_belt_id_cp: Any = field(init=False, repr=False)
     ras_topo_cp: Any | None = field(init=False, repr=False)
     cell_active_mask_cp: Any | None = field(init=False, repr=False)
@@ -3689,6 +4074,9 @@ class GpuSatelliteLinkSelectionLibrary:
     _direct_candidate_view_cp: dict[str, Any] | None = field(init=False, repr=False)
     last_add_chunk_telemetry: dict[str, Any] = field(init=False, repr=False, default_factory=dict)
     max_add_chunk_telemetry: dict[str, Any] = field(init=False, repr=False, default_factory=dict)
+    _finalize_workspace: dict[str, Any] = field(init=False, repr=False, default_factory=dict)
+    _use_parallel_finalize: bool = field(init=False, repr=False, default=False)
+    _load_balanced_beams: bool = field(init=False, repr=False, default=False)
 
     def __post_init__(self) -> None:
         _require_cupy()
@@ -3772,6 +4160,7 @@ class GpuSatelliteLinkSelectionLibrary:
         with self.session._temporary_activation():
             self.sat_min_elev_cp = cp.asarray(np.ascontiguousarray(self.sat_min_elev_host, dtype=self.session.compute_dtype))
             self.sat_beta_max_cp = cp.asarray(np.ascontiguousarray(self.sat_beta_max_host, dtype=np.float32))
+            self.sat_beta_max_rad_cp = (self.sat_beta_max_cp * cp.float32(np.pi / 180.0)).astype(cp.float32, copy=False)
             self.sat_belt_id_cp = cp.asarray(np.ascontiguousarray(self.sat_belt_id_host, dtype=np.int16))
             if self.include_payload:
                 if self.ras_topo is None:
@@ -3958,11 +4347,6 @@ class GpuSatelliteLinkSelectionLibrary:
                 min_elev_for_chunk = self.sat_min_elev_cp[sat_remap_cp]
             else:
                 min_elev_for_chunk = self.sat_min_elev_cp
-            visible = elev_deg >= min_elev_for_chunk[None, None, :]
-            if self.cell_active_mask_cp is not None:
-                visible = visible & self.cell_active_mask_cp[:, cell_offset_i:cell_stop, None]
-            chunk_memory_observation = _update_gpu_memory_observation_cp(chunk_memory_observation)
-
             sat_azel_cp = None
             theta_abs = None
             if sat_azel_dev is not None:
@@ -3976,28 +4360,54 @@ class GpuSatelliteLinkSelectionLibrary:
             else:
                 beta_max_for_chunk = None
 
-            eligible_matches_visible = False
+            # Fused visibility + eligible computation: elevation check +
+            # cell activity mask + cone check in a single kernel launch.
+            _cell_mask = (
+                self.cell_active_mask_cp[:, cell_offset_i:cell_stop, None]
+                if self.cell_active_mask_cp is not None
+                else cp.bool_(True)
+            )
+            _theta_for_vis = theta_abs if theta_abs is not None else cp.float32(0.0)
+            _beta_for_vis = (
+                beta_max_for_chunk[None, None, :] if beta_max_for_chunk is not None
+                else cp.float32(999.0)
+            )
+            _vis_kernel = _get_visibility_fused_kernel()
+            # The fused visibility kernel is declared with float32 inputs.
+            # Under ``compute_dtype=float64`` the propagation tensors
+            # (``sat_topo_cp``, ``sat_min_elev_cp``, ``sat_beta_max_cp``)
+            # arrive as float64, so we down-cast explicitly at the kernel
+            # boundary — these are degrees in the ±90 / ±180 range where
+            # fp32 is plenty, and the kernel's comparisons are semantically
+            # unchanged by the cast.  Without these casts CuPy raises
+            # ``TypeError: Type is mismatched`` on the first batch.
+            _elev_f32 = elev_deg.astype(cp.float32, copy=False)
+            _min_elev_f32 = min_elev_for_chunk.astype(cp.float32, copy=False)
+            if beta_max_for_chunk is not None:
+                _beta_for_vis = beta_max_for_chunk.astype(cp.float32, copy=False)[None, None, :]
+            visible, eligible_computed = _vis_kernel(
+                _elev_f32,
+                _min_elev_f32[None, None, :],
+                _cell_mask,
+                _theta_for_vis,
+                _beta_for_vis,
+                cp.int32(1 if self.cell_active_mask_cp is not None else 0),
+                cp.int32(1 if self.use_cone_check else 0),
+                cp.float32(float(self.beta_tol_deg)),
+            )
+            chunk_memory_observation = _update_gpu_memory_observation_cp(chunk_memory_observation)
+
+            eligible_matches_visible = not self.use_cone_check
             if self.include_eligible_mask and self.eligible_mask_cp is not None:
-                eligible = visible
-                if self.use_cone_check:
-                    eligible = eligible & (
-                        theta_abs <= (beta_max_for_chunk[None, None, :] + cp.float32(self.beta_tol_deg))
-                    )
-                else:
-                    eligible_matches_visible = True
+                eligible = eligible_computed
                 if sat_remap_cp is not None:
-                    # Scatter filtered eligible back into the full-sat mask.
                     self.eligible_mask_cp[:, cell_offset_i:cell_stop, :] = False
                     self.eligible_mask_cp[:, cell_offset_i:cell_stop, :][:, :, sat_remap_cp] = eligible.astype(cp.bool_, copy=False)
                 else:
                     self.eligible_mask_cp[:, cell_offset_i:cell_stop, :] = eligible.astype(cp.bool_, copy=False)
             elif self.include_eligible_mask:
-                eligible = visible
-                if self.use_cone_check:
-                    eligible = eligible & (
-                        theta_abs <= (beta_max_for_chunk[None, None, :] + cp.float32(self.beta_tol_deg))
-                    )
-                else:
+                eligible = eligible_computed
+                if not self.use_cone_check:
                     eligible_matches_visible = True
             else:
                 eligible = None
@@ -4027,18 +4437,43 @@ class GpuSatelliteLinkSelectionLibrary:
                     },
                 }
                 return
-            # Decompose the flat index into (time, local_cell, local_sat).
-            local_sat_idx = (flat_idx % cp.int64(chunk_sat_count)).astype(cp.int32, copy=False)
-            row_local = flat_idx // cp.int64(chunk_sat_count)
-            local_cell_idx = (row_local % cp.int64(chunk_cell_count)).astype(cp.int32, copy=False)
-            time_idx = (row_local // cp.int64(chunk_cell_count)).astype(cp.int32, copy=False)
-            # Map local sat indices to global sat indices.
-            sat_idx = sat_remap_cp[local_sat_idx] if sat_remap_cp is not None else local_sat_idx
-            global_cell_idx = local_cell_idx + cp.int32(cell_offset_i)
-            global_row_idx = (
-                time_idx.astype(cp.int64, copy=False) * cp.int64(self.cell_count)
-                + global_cell_idx.astype(cp.int64, copy=False)
+            # Fused candidate field gathering: decompose flat_idx AND
+            # gather all 7 candidate fields in ONE kernel launch.
+            # Replaces ~12 separate CuPy operations.
+            _has_azel = sat_azel_cp is not None and theta_abs is not None
+            _has_remap = sat_remap_cp is not None
+            _gather_k = _get_add_chunk_gather_kernel()
+            # Fused gather kernel declares float32 inputs; under fp64
+            # compute_dtype the propagation tensors land as float64, so
+            # cast at the kernel boundary (same rationale as the
+            # visibility-kernel cast above).  Elevation and azimuth are
+            # in degrees, well inside fp32's meaningful range.
+            _elev_flat_f32 = elev_deg.reshape(-1).astype(cp.float32, copy=False)
+            if _has_azel:
+                _az_flat_f32 = sat_azel_cp[..., 0].reshape(-1).astype(
+                    cp.float32, copy=False,
+                )
+                _theta_flat_f32 = theta_abs.reshape(-1).astype(cp.float32, copy=False)
+            else:
+                _az_flat_f32 = cp.zeros(1, dtype=cp.float32)
+                _theta_flat_f32 = cp.zeros(1, dtype=cp.float32)
+            (
+                time_idx, global_cell_idx, sat_idx,
+                _key_out, global_row_idx, _alpha_out, _beta_out,
+            ) = _gather_k(
+                flat_idx,
+                _elev_flat_f32,
+                _az_flat_f32,
+                _theta_flat_f32,
+                sat_remap_cp if _has_remap else cp.zeros(1, dtype=cp.int32),
+                np.int32(chunk_sat_count),
+                np.int32(chunk_cell_count),
+                np.int32(cell_offset_i),
+                np.int32(self.cell_count),
+                np.int32(1 if _has_remap else 0),
+                np.int32(1 if _has_azel else 0),
             )
+            local_cell_idx = global_cell_idx - cp.int32(cell_offset_i)
             chunk_memory_observation = _update_gpu_memory_observation_cp(chunk_memory_observation)
 
             if (
@@ -4054,29 +4489,29 @@ class GpuSatelliteLinkSelectionLibrary:
                 else:
                     eligible_flat = eligible.reshape(-1)
                     eligible_idx = cp.nonzero(eligible_flat)[0].astype(cp.int64, copy=False)
-                    eligible_local_sat = (eligible_idx % cp.int64(chunk_sat_count)).astype(cp.int32, copy=False)
-                    eligible_sat = sat_remap_cp[eligible_local_sat] if sat_remap_cp is not None else eligible_local_sat
-                    eligible_row = eligible_idx // cp.int64(chunk_sat_count)
-                    eligible_local_cell = (eligible_row % cp.int64(chunk_cell_count)).astype(cp.int32, copy=False)
-                    eligible_time = (eligible_row // cp.int64(chunk_cell_count)).astype(cp.int32, copy=False)
+                    _init_decode_edge_kernels()
+                    eligible_time, eligible_local_cell, eligible_local_sat = _decode_edge_kernel_3d(
+                        eligible_idx,
+                        np.int32(int(chunk_cell_count) * int(chunk_sat_count)),
+                        np.int32(int(chunk_sat_count)),
+                    )
+                    eligible_sat = sat_remap_cp[eligible_local_sat] if _has_remap else eligible_local_sat
                 self._eligible_time_parts.append(eligible_time.astype(cp.int32, copy=False))
                 self._eligible_cell_parts.append(eligible_local_cell + cp.int32(cell_offset_i))
                 self._eligible_sat_parts.append(eligible_sat.astype(cp.int32, copy=False))
                 chunk_memory_observation = _update_gpu_memory_observation_cp(chunk_memory_observation)
 
-            self._candidate_time_parts.append(time_idx.astype(cp.int32, copy=False))
-            self._candidate_cell_parts.append(global_cell_idx.astype(cp.int32, copy=False))
-            self._candidate_sat_parts.append(sat_idx.astype(cp.int32, copy=False))
+            self._candidate_time_parts.append(time_idx)
+            self._candidate_cell_parts.append(global_cell_idx)
+            self._candidate_sat_parts.append(sat_idx)
             if self.strategy_name == "max_elevation":
-                self._candidate_key_parts.append((-elev_deg.reshape(-1)[flat_idx]).astype(cp.float64, copy=False))
+                self._candidate_key_parts.append(_key_out)
             else:
                 self._candidate_key_parts.append(_pair_priority_random_cupy(self.seed_u64, global_row_idx, sat_idx))
 
             if self._candidate_alpha_parts is not None and self._candidate_beta_parts is not None:
-                alpha_flat = cp.remainder(sat_azel_cp[..., 0], cp.float32(360.0)).reshape(-1)
-                beta_flat = theta_abs.reshape(-1)
-                self._candidate_alpha_parts.append(alpha_flat[flat_idx].astype(cp.float32, copy=False))
-                self._candidate_beta_parts.append(beta_flat[flat_idx].astype(cp.float32, copy=False))
+                self._candidate_alpha_parts.append(_alpha_out)
+                self._candidate_beta_parts.append(_beta_out)
             finalized_chunk_memory = _finalize_gpu_memory_observation_cp(
                 _update_gpu_memory_observation_cp(chunk_memory_observation)
             )
@@ -4434,13 +4869,13 @@ def _compute_boresight_masks_slab_cp(
 
     if library.boresight_theta1_deg_value is not None:
         full_mask_cp = above_horizon & (
-            separation_deg < cp.float32(library.boresight_theta1_deg_value)
+            separation_deg <= cp.float32(library.boresight_theta1_deg_value)
         )
     else:
         full_mask_cp = cp.zeros_like(separation_deg, dtype=cp.bool_)
     if library.boresight_theta2_deg_value is not None:
         partial_mask_cp = above_horizon & (
-            separation_deg < cp.float32(library.boresight_theta2_deg_value)
+            separation_deg <= cp.float32(library.boresight_theta2_deg_value)
         )
         if library.boresight_theta1_deg_value is not None:
             partial_mask_cp &= ~full_mask_cp
@@ -5136,10 +5571,7 @@ def _finalize_staged_boresight_link_selection_library_cupy(
 
     sat_output_indices_cp = cp.arange(int(library.sat_count), dtype=cp.int32)
     sat_output_index_cp = sat_output_indices_cp.copy()
-    sat_beta_max_rad_cp = (
-        _to_cupy_array(library.sat_beta_max_cp, dtype=cp.float32)
-        * cp.float32(np.pi / 180.0)
-    ).astype(cp.float32, copy=False)
+    sat_beta_max_rad_cp = library.sat_beta_max_rad_cp
     slab_plan = _plan_direct_finalize_slabs(
         library,
         sat_output_count=int(library.sat_count),
@@ -5815,19 +6247,24 @@ def _store_direct_finalize_slab_result(
 
 
 def _stable_group_rank_cp(group_key_cp: Any, order_key_cp: Any) -> tuple[Any, Any]:
-    """Return a stable sort order and 0-based rank within each group."""
+    """Return a stable sort order and 0-based rank within each group.
+
+    Uses a composite-key argsort (group_key << 40 | order_key) instead
+    of ``cp.lexsort`` — ~3x faster for 14M elements (6.9ms vs 26.4ms).
+    The 40-bit shift accommodates order_key values up to ~1 trillion
+    (well beyond any candidate count). Group keys fit in the upper
+    24 bits (max ~16M groups).
+    """
     if int(group_key_cp.size) == 0:
         empty_i64 = cp.empty((0,), dtype=cp.int64)
         empty_i32 = cp.empty((0,), dtype=cp.int32)
         return empty_i64, empty_i32
-    keys_cp = cp.stack(
-        (
-            order_key_cp.astype(cp.int64, copy=False),
-            group_key_cp.astype(cp.int64, copy=False),
-        ),
-        axis=0,
-    )
-    order_cp = cp.lexsort(keys_cp).astype(cp.int64, copy=False)
+    # Composite key: group in upper bits, order in lower bits.
+    # Zero collision: group_key < 2^24, order_key < 2^40.
+    _composite = (
+        group_key_cp.astype(cp.int64, copy=False) << np.int64(40)
+    ) | (order_key_cp.astype(cp.int64, copy=False) & np.int64(0xFFFFFFFFFF))
+    order_cp = cp.argsort(_composite).astype(cp.int64, copy=False)
     group_sorted = group_key_cp[order_cp]
     item_count = int(group_sorted.size)
     is_new = cp.empty((item_count,), dtype=cp.bool_)
@@ -5843,6 +6280,630 @@ def _stable_group_rank_cp(group_key_cp: Any, order_key_cp: Any) -> tuple[Any, An
     return order_cp, rank_cp
 
 
+_decode_edge_kernel_3d: Any = None
+_decode_edge_kernel_4d: Any = None
+
+
+_eirp_fspl_raw_module: Any = None
+_power_mega_raw_module: Any = None
+_prx_output_raw_module: Any = None
+_edge_feasibility_raw_module: Any = None
+_scatter_edges_raw_module: Any = None
+_gather_edges_raw_module: Any = None
+_post_lexsort_raw_module: Any = None
+
+
+def _get_post_lexsort_kernel():
+    """Fused kernel: after lexsort, compute group boundaries + rank +
+    cap-limited selection in a single pass.  Replaces ~9 CuPy dispatches
+    (is_new + cumsum + nonzero + indexing + arange + subtraction).
+
+    NOTE: This is a SERIAL kernel (one thread) because the group
+    boundary detection is inherently sequential (depends on previous
+    element).  For ~5000 sorted edges this is <0.1ms.  The win is
+    eliminating 9 Python→CuPy dispatch round-trips (~4.5ms)."""
+    global _post_lexsort_raw_module
+    if _post_lexsort_raw_module is not None:
+        return _post_lexsort_raw_module
+    _post_lexsort_raw_module = cp.RawModule(code=r'''
+extern "C" __global__
+void compute_group_rank_and_select(
+    const int* __restrict__ group_sorted,     // (N,) group keys after lexsort reorder
+    const int* __restrict__ group_limit_flat, // (G,) per-group beam capacity
+    int N,
+    int* __restrict__ rank_out,               // (N,) output: within-group rank
+    bool* __restrict__ keep_out,              // (N,) output: true if rank < limit
+    int* __restrict__ n_kept_out              // (1,) output: total kept count
+) {
+    // Single-thread serial scan -- appropriate for N ~ 5000
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+
+    int n_kept = 0;
+    int prev_group = -1;
+    int rank = 0;
+
+    for (int i = 0; i < N; i++) {
+        int g = group_sorted[i];
+        if (g != prev_group) {
+            rank = 0;
+            prev_group = g;
+        }
+        rank_out[i] = rank;
+        int limit = (g >= 0) ? group_limit_flat[g] : 0;
+        bool k = (rank < limit);
+        keep_out[i] = k;
+        if (k) n_kept++;
+        rank++;
+    }
+    n_kept_out[0] = n_kept;
+}
+    ''')
+    return _post_lexsort_raw_module
+
+
+def _get_gather_edges_kernel():
+    """Fused kernel: from nonzero indices of assigned edges, decode
+    (t, cell, link) + exclude RAS cell + gather (sat, cone_ok, alpha, beta)
+    in a single CUDA launch.  Replaces ~8 CuPy dispatches."""
+    global _gather_edges_raw_module
+    if _gather_edges_raw_module is not None:
+        return _gather_edges_raw_module
+    _gather_edges_raw_module = cp.RawModule(code=r'''
+extern "C" __global__
+void gather_realized_edges_3d(
+    const long long* __restrict__ realized_idx,  // (N,) flat indices into assignment tensor
+    const int* __restrict__ assignments_flat,     // (T*C*K,) flat assignments
+    const bool* __restrict__ cone_ok_flat,        // (T*C*K,) cone check results
+    const float* __restrict__ alpha_flat,         // (T*C*K,) alpha angles
+    const float* __restrict__ beta_flat,          // (T*C*K,) beta angles
+    int cell_count, int n_links, int exclude_cell,
+    int N,
+    // Outputs -- write at positions [0..N), some may be filtered out
+    int* __restrict__ out_t,
+    int* __restrict__ out_cell,
+    int* __restrict__ out_link,
+    int* __restrict__ out_sat,
+    bool* __restrict__ out_cone_ok,
+    float* __restrict__ out_alpha,
+    float* __restrict__ out_beta,
+    long long* __restrict__ out_edge_linear,
+    bool* __restrict__ out_keep  // true if not excluded by RAS cell
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N) return;
+
+    long long flat = realized_idx[idx];
+    int row_width = cell_count * n_links;
+    int t = (int)(flat / row_width);
+    int rem = (int)(flat - (long long)t * row_width);
+    int cell = rem / n_links;
+    int link = rem - cell * n_links;
+
+    out_t[idx] = t;
+    out_cell[idx] = cell;
+    out_link[idx] = link;
+    out_sat[idx] = assignments_flat[flat];
+    out_cone_ok[idx] = cone_ok_flat[flat];
+    out_alpha[idx] = alpha_flat[flat];
+    out_beta[idx] = beta_flat[flat];
+    out_edge_linear[idx] = flat;
+    out_keep[idx] = (cell != exclude_cell);
+}
+    ''')
+    return _gather_edges_raw_module
+
+
+def _get_scatter_edges_kernel():
+    """Fused kernel: gather edge fields at selected positions AND scatter
+    into beam output arrays in a single CUDA launch.  Replaces ~13 CuPy
+    dispatches (gathers + count_nonzero host sync + advanced-index scatters).
+    Non-boresight (3-D) path only."""
+    global _scatter_edges_raw_module
+    if _scatter_edges_raw_module is not None:
+        return _scatter_edges_raw_module
+    _scatter_edges_raw_module = cp.RawModule(code=r'''
+extern "C" __global__
+void scatter_selected_edges_3d(
+    // Edge info arrays (full realised edge set)
+    const int* __restrict__ edge_sat,       // (N_realised,)
+    const int* __restrict__ edge_cell,      // (N_realised,)
+    const int* __restrict__ edge_link,      // (N_realised,)
+    const int* __restrict__ edge_t,         // (N_realised,)
+    const float* __restrict__ edge_alpha,   // (N_realised,)
+    const float* __restrict__ edge_beta,    // (N_realised,)
+    // Selected positions + slots
+    const long long* __restrict__ sel_pos,  // (N_selected,) indices into edge arrays
+    const int* __restrict__ sel_slot,       // (N_selected,) beam slot assignment
+    // Mapping
+    const int* __restrict__ sat_output_index, // (S_total,) sat -> output index
+    int n_links,
+    // Output arrays (3-D: T x S_out x K)
+    int S_out, int K,
+    int* __restrict__ beam_idx,
+    float* __restrict__ beam_alpha,
+    float* __restrict__ beam_beta,
+    // Optional: cell_slot_sat (T x C x n_links), may be NULL
+    int* __restrict__ cell_slot_sat,
+    int has_cell_slot,
+    int C,
+    // Count
+    int N_selected
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N_selected) return;
+
+    long long pos = sel_pos[idx];
+    int sat = edge_sat[pos];
+    int sat_out = sat_output_index[sat];
+    int cell = edge_cell[pos];
+    int link = edge_link[pos];
+    int t = edge_t[pos];
+    int slot = sel_slot[idx];
+    float alpha = edge_alpha[pos];
+    float beta = edge_beta[pos];
+    int beam_id = cell * n_links + link;
+
+    // Scatter into beam output arrays (only if sat has a valid output slot)
+    if (sat_out >= 0) {
+        int out_idx = (t * S_out + sat_out) * K + slot;
+        beam_idx[out_idx] = beam_id;
+        beam_alpha[out_idx] = alpha;
+        beam_beta[out_idx] = beta;
+    }
+
+    // Optional: update cell_slot_sat
+    if (has_cell_slot) {
+        int cs_idx = (t * C + cell) * n_links + link;
+        cell_slot_sat[cs_idx] = sat;
+    }
+}
+    ''')
+    return _scatter_edges_raw_module
+
+
+def _get_edge_feasibility_kernel():
+    """Fused kernel: cone_ok + RAS guard angular check → feasibility mask.
+    Replaces ~18 CuPy dispatches in the non-boresight edge processing."""
+    global _edge_feasibility_raw_module
+    if _edge_feasibility_raw_module is not None:
+        return _edge_feasibility_raw_module
+    _edge_feasibility_raw_module = cp.RawModule(code=r'''
+extern "C" __global__
+void compute_edge_feasibility(
+    const bool* __restrict__ cone_ok,          // (N,) per realized edge
+    const int* __restrict__ edge_t,            // (N,) time index per edge
+    const int* __restrict__ edge_sat,          // (N,) satellite index per edge
+    const float* __restrict__ edge_alpha,      // (N,) edge beam alpha
+    const float* __restrict__ edge_beta,       // (N,) edge beam beta
+    const bool* __restrict__ reserved_present, // (T, S) RAS reservation flags
+    const float* __restrict__ reserved_alpha,  // (T, S) RAS reserved alpha
+    const float* __restrict__ reserved_beta,   // (T, S) RAS reserved beta
+    float ras_guard_cos,
+    int use_ras_guard,
+    int sat_count,
+    int N,
+    bool* __restrict__ feasible                // (N,) output
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N) return;
+
+    if (!cone_ok[idx]) {
+        feasible[idx] = false;
+        return;
+    }
+
+    if (!use_ras_guard) {
+        feasible[idx] = true;
+        return;
+    }
+
+    int t = edge_t[idx];
+    int s = edge_sat[idx];
+    int ts = t * sat_count + s;
+
+    if (!reserved_present[ts]) {
+        feasible[idx] = true;
+        return;
+    }
+
+    float a_ras = reserved_alpha[ts];
+    float b_ras = reserved_beta[ts];
+    float a_edge = edge_alpha[idx];
+    float b_edge = edge_beta[idx];
+
+    // Check all finite
+    if (!isfinite(a_ras) || !isfinite(b_ras) ||
+        !isfinite(a_edge) || !isfinite(b_edge)) {
+        feasible[idx] = true;
+        return;
+    }
+
+    // Angular distance between RAS reserved beam and edge beam
+    float cos_da = cosf(a_ras - a_edge);
+    float cos_gamma = cosf(b_ras) * cosf(b_edge)
+                    + sinf(b_ras) * sinf(b_edge) * cos_da;
+
+    // Conflict if angular distance < guard angle (cos_gamma > cos threshold)
+    feasible[idx] = !(cos_gamma > ras_guard_cos);
+}
+    ''')
+    return _edge_feasibility_raw_module
+
+
+def _get_prx_output_kernel():
+    """Fused kernel: grx_lin × vis × scale → sum over sats → EPFD/PFD outputs.
+    Replaces ~7 CuPy dispatches in the output assembly."""
+    global _prx_output_raw_module
+    if _prx_output_raw_module is not None:
+        return _prx_output_raw_module
+    _prx_output_raw_module = cp.RawModule(code=r'''
+extern "C" __global__
+void compute_prx_and_reduce(
+    const float* __restrict__ grx_lin,        // (T, N_tel, S)
+    const float* __restrict__ scale_w_channel, // (T, S)
+    const bool* __restrict__ vis_horizon,      // (T, S)
+    float pfd_from_prx_scale,
+    int T, int N_tel, int S,
+    int want_prx_total,
+    int want_epfd,
+    int want_pfd_total,
+    float* __restrict__ prx_total,             // (T, N_tel) output
+    float* __restrict__ epfd,                  // (T, N_tel) output
+    float* __restrict__ pfd_total              // (T,) output
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // Each thread handles one (t, sky) pair for prx/epfd
+    // or one (t,) for pfd_total
+    if (idx < T * N_tel && (want_prx_total || want_epfd)) {
+        int sky = idx % N_tel;
+        int t = idx / N_tel;
+        float prx_sum = 0.0f;
+        for (int s = 0; s < S; s++) {
+            int ts = t * S + s;
+            float vis = vis_horizon[ts] ? 1.0f : 0.0f;
+            float grx = grx_lin[t * N_tel * S + sky * S + s];
+            float scale = scale_w_channel[ts];
+            prx_sum += grx * vis * scale;
+        }
+        if (want_prx_total) prx_total[idx] = prx_sum;
+        if (want_epfd) epfd[idx] = prx_sum * pfd_from_prx_scale;
+    }
+
+    // PFD total: sum scale_w_channel over satellites (no grx)
+    if (want_pfd_total && idx < T) {
+        float pfd_sum = 0.0f;
+        for (int s = 0; s < S; s++) {
+            pfd_sum += scale_w_channel[idx * S + s];
+        }
+        pfd_total[idx] = pfd_sum * pfd_from_prx_scale;
+    }
+}
+    ''')
+    return _prx_output_raw_module
+
+
+def _get_power_mega_kernel():
+    """Mega-fused power kernel: EIRP computation + leakage scaling +
+    beam-sum reduction + FSPL × atm × vis_horizon in TWO CUDA launches
+    (element-wise + reduction), replacing ~17 CuPy dispatches.
+
+    Kernel 1 (per-beam): valid_beam → EIRP → leakage → emitted_eirp
+    Kernel 2 (per-sat): sum(emitted_eirp, axis=beams) × FSPL × atm × vis
+    """
+    global _power_mega_raw_module
+    if _power_mega_raw_module is not None:
+        return _power_mega_raw_module
+    _power_mega_raw_module = cp.RawModule(code=r'''
+extern "C" __global__
+void compute_emitted_eirp_with_leakage(
+    const bool* __restrict__ valid_geom,
+    const bool* __restrict__ mask_bore,
+    const bool* __restrict__ valid_beam,
+    const float* __restrict__ d_target_m,
+    const float* __restrict__ atm_target,
+    const float* __restrict__ range_m,
+    const float* __restrict__ atm_ras,
+    const float* __restrict__ gtx_rel_lin,
+    const float* __restrict__ gtx_abs_lin,
+    const int* __restrict__ beam_idx,
+    const float* __restrict__ leakage_factors,
+    float target_pfd_lin,
+    float satellite_eirp_lin,
+    float satellite_ptx_lin,
+    int quantity_mode,  // 0=target_pfd, 1=satellite_eirp, 2=satellite_ptx
+    int use_ras_alt_co,
+    int n_links,
+    int ras_cell_idx,
+    int n_leakage_cells,
+    int has_leakage,
+    int T, int S, int K,
+    float* __restrict__ emitted_eirp
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = T * S * K;
+    if (idx >= total) return;
+
+    int k = idx % K;
+    int ts = idx / K;
+    int s = ts % S;
+    int t = ts / S;
+    int ts_idx = t * S + s;
+
+    if (!valid_beam[idx]) {
+        emitted_eirp[idx] = 0.0f;
+        return;
+    }
+
+    float eirp;
+    float four_pi = 12.5663706f;
+
+    if (quantity_mode == 0) {
+        // target_pfd mode
+        if (mask_bore[idx]) {
+            float r = range_m[ts_idx];
+            float a = use_ras_alt_co ? atm_ras[ts_idx] : 1.0f;
+            eirp = target_pfd_lin * four_pi * r * r / fmaxf(a, 1e-30f);
+        } else if (valid_geom[idx]) {
+            float d = d_target_m[idx];
+            float a = atm_target[idx];
+            eirp = target_pfd_lin * four_pi * d * d / fmaxf(a, 1e-30f);
+        } else {
+            eirp = 0.0f;
+        }
+        eirp *= gtx_rel_lin[idx];
+    } else if (quantity_mode == 1) {
+        // satellite_eirp mode
+        eirp = satellite_eirp_lin * gtx_rel_lin[idx];
+    } else {
+        // satellite_ptx mode
+        eirp = satellite_ptx_lin * gtx_abs_lin[idx];
+    }
+
+    // Leakage scaling
+    if (has_leakage) {
+        int bidx = beam_idx[idx];
+        if (bidx >= 0) {
+            int cell_idx = bidx / n_links;
+            if (mask_bore[idx]) cell_idx = ras_cell_idx;
+            if (cell_idx >= 0 && cell_idx < n_leakage_cells) {
+                eirp *= leakage_factors[cell_idx];
+            } else {
+                eirp = 0.0f;
+            }
+        }
+    }
+
+    emitted_eirp[idx] = eirp;
+}
+
+extern "C" __global__
+void reduce_eirp_to_scale(
+    const float* __restrict__ emitted_eirp,  // (T, S, K)
+    const float* __restrict__ range_m,       // (T, S)
+    const float* __restrict__ atm_ras,       // (T, S)
+    const bool* __restrict__ vis_horizon,    // (T, S)
+    float wavelength_m,
+    int T, int S, int K,
+    float* __restrict__ scale_w_channel      // (T, S) output
+) {
+    int ts = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ts >= T * S) return;
+
+    // Sum EIRP over beams
+    float eirp_sum = 0.0f;
+    int base = ts * K;
+    for (int k = 0; k < K; k++) {
+        eirp_sum += emitted_eirp[base + k];
+    }
+
+    // FSPL = (wavelength / (4*pi*range))^2
+    float four_pi = 12.5663706f;
+    float r = range_m[ts];
+    float fspl = wavelength_m / (four_pi * r);
+    fspl = fspl * fspl;
+
+    // Atmosphere attenuation
+    float atm = atm_ras[ts];
+
+    // Visibility mask
+    float vis = vis_horizon[ts] ? 1.0f : 0.0f;
+
+    scale_w_channel[ts] = eirp_sum * fspl * atm * vis;
+}
+    ''')
+    return _power_mega_raw_module
+
+
+def _get_eirp_fspl_fused_kernel():
+    """Fused CUDA kernel: computes emitted EIRP from beam geometry and
+    FSPL × atmosphere in a single launch.  Replaces ~8 separate CuPy
+    operations in the target_pfd power path.
+
+    Inputs (per element [t, s, k]):
+      valid_geom, mask_bore, valid_beam: bool masks
+      d_target_m: slant range to beam footprint on Earth
+      atm_target: atmosphere transmission for beam target (0-1)
+      range_m_ts: slant range to satellite from RAS station [t,s]
+      atm_ras_ts: atmosphere transmission at RAS elevation [t,s]
+      gtx_rel_lin: relative TX gain (pattern / Gmax) [t,s,k]
+      target_pfd_lin: target PFD in linear W/m²/channel (scalar)
+      wavelength_m: wavelength in metres (scalar)
+      use_ras_alt_for_co: whether CO beam uses RAS station altitude
+
+    Outputs (per element):
+      emitted_eirp: per-beam EIRP [t,s,k]
+      fspl_vis: FSPL × atm × vis_horizon [t,s] (only for the [t,s] subset)
+    """
+    global _eirp_fspl_raw_module
+    if _eirp_fspl_raw_module is not None:
+        return _eirp_fspl_raw_module
+    _eirp_fspl_raw_module = cp.RawModule(code=r'''
+extern "C" __global__
+void compute_eirp_and_scale(
+    const bool* __restrict__ valid_geom,   // (T, S, K)
+    const bool* __restrict__ mask_bore,    // (T, S, K)
+    const bool* __restrict__ valid_beam,   // (T, S, K)
+    const float* __restrict__ d_target_m,  // (T, S, K)
+    const float* __restrict__ atm_target,  // (T, S, K)
+    const float* __restrict__ range_m,     // (T, S)
+    const float* __restrict__ atm_ras,     // (T, S)
+    const float* __restrict__ gtx_rel_lin, // (T, S, K)
+    const bool* __restrict__ vis_horizon,  // (T, S)
+    float target_pfd_lin,
+    float wavelength_m,
+    int use_ras_alt_co,
+    int time_count,
+    int sat_count,
+    int beam_count,
+    float* __restrict__ emitted_eirp       // (T, S, K) output
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = time_count * sat_count * beam_count;
+    if (idx >= total) return;
+
+    int k = idx % beam_count;
+    int ts = idx / beam_count;
+    int s = ts % sat_count;
+    int t = ts / sat_count;
+
+    float four_pi = 12.5663706f;
+
+    if (!valid_beam[idx]) {
+        emitted_eirp[idx] = 0.0f;
+        return;
+    }
+
+    float eirp;
+    if (mask_bore[idx]) {
+        // Boresight (CO) beam: EIRP from RAS station range
+        float r = range_m[t * sat_count + s];
+        float a = use_ras_alt_co ? atm_ras[t * sat_count + s] : 1.0f;
+        eirp = target_pfd_lin * four_pi * r * r / fmaxf(a, 1e-30f);
+    } else if (valid_geom[idx]) {
+        // Off-boresight beam: EIRP from beam footprint geometry
+        float d = d_target_m[idx];
+        float a = atm_target[idx];
+        eirp = target_pfd_lin * four_pi * d * d / fmaxf(a, 1e-30f);
+    } else {
+        eirp = 0.0f;
+    }
+
+    emitted_eirp[idx] = eirp * gtx_rel_lin[idx];
+}
+    ''')
+    return _eirp_fspl_raw_module
+
+
+_add_chunk_gather_kernel: Any = None
+_visibility_fused_kernel: Any = None
+
+
+def _get_visibility_fused_kernel():
+    """Fused kernel: elevation check + cell activity mask + cone check
+    in a single CUDA launch.  Replaces 3-4 CuPy operations on the
+    full (T, C, S) visibility tensor."""
+    global _visibility_fused_kernel
+    if _visibility_fused_kernel is not None:
+        return _visibility_fused_kernel
+    _visibility_fused_kernel = cp.ElementwiseKernel(
+        "float32 elev_deg, float32 min_elev, "
+        "bool cell_active, float32 theta_abs, float32 beta_max, "
+        "int32 has_cell_mask, int32 has_cone_check, float32 beta_tol",
+        "bool visible, bool eligible",
+        """
+        visible = (elev_deg >= min_elev);
+        if (has_cell_mask && !cell_active) visible = false;
+        eligible = visible;
+        if (has_cone_check && theta_abs > (beta_max + beta_tol)) {
+            eligible = false;
+        }
+        """,
+        "visibility_fused",
+    )
+    return _visibility_fused_kernel
+
+
+def _get_add_chunk_gather_kernel():
+    """Fused kernel: from flat visible indices, gather all candidate fields
+    in one pass (time, cell, sat, key, global_row, alpha, beta).
+    Replaces ~12 separate CuPy operations."""
+    global _add_chunk_gather_kernel
+    if _add_chunk_gather_kernel is not None:
+        return _add_chunk_gather_kernel
+    _add_chunk_gather_kernel = cp.ElementwiseKernel(
+        "int64 flat_idx, raw float32 elev_flat, raw float32 azel_az_flat, "
+        "raw float32 theta_abs_flat, raw int32 sat_remap, "
+        "int32 chunk_sat_count, int32 chunk_cell_count, "
+        "int32 cell_offset, int32 total_cell_count, "
+        "int32 has_remap, int32 has_azel",
+        "int32 time_out, int32 cell_out, int32 sat_out, "
+        "float64 key_out, int64 row_out, float32 alpha_out, float32 beta_out",
+        """
+        int local_sat = (int)(flat_idx % chunk_sat_count);
+        long long row_local = flat_idx / chunk_sat_count;
+        int local_cell = (int)(row_local % chunk_cell_count);
+        int t = (int)(row_local / chunk_cell_count);
+
+        int sat = has_remap ? sat_remap[local_sat] : local_sat;
+        int global_cell = local_cell + cell_offset;
+        long long global_row = (long long)t * total_cell_count + global_cell;
+
+        time_out = t;
+        cell_out = global_cell;
+        sat_out = sat;
+        key_out = (double)(-elev_flat[flat_idx]);
+        row_out = global_row;
+        if (has_azel) {
+            float az = azel_az_flat[flat_idx];
+            // cp.remainder equivalent: fmodf then wrap negative
+            az = fmodf(az, 360.0f);
+            if (az < 0.0f) az += 360.0f;
+            alpha_out = az;
+            beta_out = theta_abs_flat[flat_idx];
+        } else {
+            alpha_out = 0.0f;
+            beta_out = 0.0f;
+        }
+        """,
+        "add_chunk_gather",
+    )
+    return _add_chunk_gather_kernel
+
+
+def _init_decode_edge_kernels() -> None:
+    """Lazily initialize the fused index-decomposition kernels."""
+    global _decode_edge_kernel_3d, _decode_edge_kernel_4d
+    if _decode_edge_kernel_3d is not None:
+        return
+    _decode_edge_kernel_3d = cp.ElementwiseKernel(
+        "int64 flat_idx, int32 row_width, int32 n_links",
+        "int32 t_out, int32 cell_out, int32 link_out",
+        """
+        int t = (int)(flat_idx / row_width);
+        int rem = (int)(flat_idx - (long long)t * row_width);
+        int c = rem / n_links;
+        int l = rem - c * n_links;
+        t_out = t; cell_out = c; link_out = l;
+        """,
+        "decode_edge_3d",
+    )
+    _decode_edge_kernel_4d = cp.ElementwiseKernel(
+        "int64 flat_idx, int32 row_width, int32 sky_width, int32 n_links",
+        "int32 t_out, int32 sky_out, int32 cell_out, int32 link_out",
+        """
+        int t = (int)(flat_idx / row_width);
+        int rem = (int)(flat_idx - (long long)t * row_width);
+        int s = rem / sky_width;
+        rem = rem - s * sky_width;
+        int c = rem / n_links;
+        int l = rem - c * n_links;
+        t_out = t; sky_out = s; cell_out = c; link_out = l;
+        """,
+        "decode_edge_4d",
+    )
+
+
 def _decode_realized_direct_edges_cp(
     edge_linear_cp: Any,
     *,
@@ -5851,33 +6912,21 @@ def _decode_realized_direct_edges_cp(
     cell_count: int,
     n_links: int,
 ) -> dict[str, Any]:
+    _init_decode_edge_kernels()
     edge_linear_cp = cp.asarray(edge_linear_cp, dtype=cp.int64).reshape(-1)
     if not boresight_active:
         row_width = int(cell_count) * int(n_links)
-        t_cp = (edge_linear_cp // row_width).astype(cp.int32, copy=False)
-        rem_cp = edge_linear_cp - t_cp.astype(cp.int64) * row_width
-        cell_cp = (rem_cp // int(n_links)).astype(cp.int32, copy=False)
-        link_cp = (rem_cp - cell_cp.astype(cp.int64) * int(n_links)).astype(cp.int32, copy=False)
-        return {
-            "t": t_cp,
-            "cell": cell_cp,
-            "link": link_cp,
-        }
+        t_cp, cell_cp, link_cp = _decode_edge_kernel_3d(
+            edge_linear_cp, np.int32(row_width), np.int32(n_links),
+        )
+        return {"t": t_cp, "cell": cell_cp, "link": link_cp}
 
     row_width = int(sky_count) * int(cell_count) * int(n_links)
     sky_width = int(cell_count) * int(n_links)
-    t_cp = (edge_linear_cp // row_width).astype(cp.int32, copy=False)
-    rem_cp = edge_linear_cp - t_cp.astype(cp.int64) * row_width
-    sky_cp = (rem_cp // sky_width).astype(cp.int32, copy=False)
-    rem_cp = rem_cp - sky_cp.astype(cp.int64) * sky_width
-    cell_cp = (rem_cp // int(n_links)).astype(cp.int32, copy=False)
-    link_cp = (rem_cp - cell_cp.astype(cp.int64) * int(n_links)).astype(cp.int32, copy=False)
-    return {
-        "t": t_cp,
-        "sky": sky_cp,
-        "cell": cell_cp,
-        "link": link_cp,
-    }
+    t_cp, sky_cp, cell_cp, link_cp = _decode_edge_kernel_4d(
+        edge_linear_cp, np.int32(row_width), np.int32(sky_width), np.int32(n_links),
+    )
+    return {"t": t_cp, "sky": sky_cp, "cell": cell_cp, "link": link_cp}
 
 
 def _gather_realized_direct_edges_cp(
@@ -5894,6 +6943,51 @@ def _gather_realized_direct_edges_cp(
     n_links = int(assignments_cp.shape[-1])
     sat_flat = assignments_cp.reshape(-1)
     realized_idx_cp = cp.nonzero(sat_flat >= 0)[0].astype(cp.int64, copy=False)
+    n_realized = int(realized_idx_cp.size)
+
+    # Non-boresight fused path: decode + exclude + gather in 1 kernel
+    if not boresight_active and n_realized > 0 and exclude_cell is not None:
+        _ge_mod = _get_gather_edges_kernel()
+        _ge_k = _ge_mod.get_function("gather_realized_edges_3d")
+        out_t = cp.empty(n_realized, dtype=cp.int32)
+        out_cell = cp.empty(n_realized, dtype=cp.int32)
+        out_link = cp.empty(n_realized, dtype=cp.int32)
+        out_sat = cp.empty(n_realized, dtype=cp.int32)
+        out_cone = cp.empty(n_realized, dtype=cp.bool_)
+        out_alpha = cp.empty(n_realized, dtype=cp.float32)
+        out_beta = cp.empty(n_realized, dtype=cp.float32)
+        out_linear = cp.empty(n_realized, dtype=cp.int64)
+        out_keep = cp.empty(n_realized, dtype=cp.bool_)
+        _block = 256
+        _ge_k(
+            ((n_realized + _block - 1) // _block,), (_block,),
+            (
+                realized_idx_cp,
+                sat_flat.astype(cp.int32, copy=False),
+                cone_ok_cp.reshape(-1),
+                alpha_cp.reshape(-1).astype(cp.float32, copy=False),
+                beta_cp.reshape(-1).astype(cp.float32, copy=False),
+                np.int32(cell_count), np.int32(n_links),
+                np.int32(int(exclude_cell)),
+                np.int32(n_realized),
+                out_t, out_cell, out_link, out_sat,
+                out_cone, out_alpha, out_beta, out_linear, out_keep,
+            ),
+        )
+        # Filter by keep mask (exclude RAS cell)
+        keep_pos = cp.nonzero(out_keep)[0]
+        return {
+            "t": out_t[keep_pos],
+            "cell": out_cell[keep_pos],
+            "link": out_link[keep_pos],
+            "edge_linear": out_linear[keep_pos],
+            "sat": out_sat[keep_pos],
+            "cone_ok": out_cone[keep_pos],
+            "alpha": out_alpha[keep_pos],
+            "beta": out_beta[keep_pos],
+        }
+
+    # Fallback: boresight or no exclude_cell
     edge_info = _decode_realized_direct_edges_cp(
         realized_idx_cp,
         boresight_active=boresight_active,
@@ -5907,10 +7001,10 @@ def _gather_realized_direct_edges_cp(
         for key, value in tuple(edge_info.items()):
             edge_info[key] = value[keep_mask]
     edge_info["edge_linear"] = realized_idx_cp
-    edge_info["sat"] = sat_flat[realized_idx_cp].astype(cp.int32, copy=False)
-    edge_info["cone_ok"] = cone_ok_cp.reshape(-1)[realized_idx_cp].astype(cp.bool_, copy=False)
-    edge_info["alpha"] = alpha_cp.reshape(-1)[realized_idx_cp].astype(cp.float32, copy=False)
-    edge_info["beta"] = beta_cp.reshape(-1)[realized_idx_cp].astype(cp.float32, copy=False)
+    edge_info["sat"] = sat_flat[realized_idx_cp]
+    edge_info["cone_ok"] = cone_ok_cp.reshape(-1)[realized_idx_cp]
+    edge_info["alpha"] = alpha_cp.reshape(-1)[realized_idx_cp]
+    edge_info["beta"] = beta_cp.reshape(-1)[realized_idx_cp]
     return edge_info
 
 
@@ -5929,38 +7023,73 @@ def _scatter_direct_edge_selection_cp(
 ) -> None:
     if int(selected_positions_cp.size) == 0:
         return
-    edge_sel = selected_positions_cp.astype(cp.int64, copy=False)
-    slot_sel = slot_cp.astype(cp.int32, copy=False)
-    sat_sel = edge_info["sat"][edge_sel].astype(cp.int32, copy=False)
-    sat_out_sel = sat_output_index_cp[sat_sel].astype(cp.int32, copy=False)
-    cell_sel = edge_info["cell"][edge_sel].astype(cp.int32, copy=False)
-    link_sel = edge_info["link"][edge_sel].astype(cp.int32, copy=False)
-    beam_id_sel = (cell_sel * np.int32(int(n_links)) + link_sel).astype(cp.int32, copy=False)
-    alpha_sel = edge_info["alpha"][edge_sel].astype(cp.float32, copy=False)
-    beta_sel = edge_info["beta"][edge_sel].astype(cp.float32, copy=False)
-    valid_out = sat_out_sel >= 0
     if beam_idx_cp.ndim == 4:
-        t_sel = edge_info["t"][edge_sel].astype(cp.int32, copy=False)
-        sky_sel = edge_info["sky"][edge_sel].astype(cp.int32, copy=False)
-        if int(cp.count_nonzero(valid_out)) > 0:
-            beam_idx_cp[t_sel[valid_out], sky_sel[valid_out], sat_out_sel[valid_out], slot_sel[valid_out]] = beam_id_sel[valid_out]
-            beam_alpha_cp[t_sel[valid_out], sky_sel[valid_out], sat_out_sel[valid_out], slot_sel[valid_out]] = alpha_sel[valid_out]
-            beam_beta_cp[t_sel[valid_out], sky_sel[valid_out], sat_out_sel[valid_out], slot_sel[valid_out]] = beta_sel[valid_out]
+        # 4D (boresight) path: pure-CuPy gather + boolean-indexed scatter.
+        # The fused RawModule below handles 3D only, so the CuPy pre-gather
+        # is required here.
+        edge_sel = selected_positions_cp.astype(cp.int64, copy=False)
+        sat_sel = edge_info["sat"][edge_sel]
+        sat_out_sel = sat_output_index_cp[sat_sel]
+        cell_sel = edge_info["cell"][edge_sel]
+        link_sel = edge_info["link"][edge_sel]
+        beam_id_sel = cell_sel * np.int32(int(n_links)) + link_sel
+        alpha_sel = edge_info["alpha"][edge_sel]
+        beta_sel = edge_info["beta"][edge_sel]
+        slot_sel = slot_cp.astype(cp.int32, copy=False)
+        valid_out = sat_out_sel >= 0
+        t_sel = edge_info["t"][edge_sel]
+        sky_sel = edge_info["sky"][edge_sel]
+        # Skip count_nonzero host sync — apply valid_out as a filter
+        # directly via boolean indexing. If all sat_output_indices are
+        # valid (common case), the filter is a no-op.
+        vo = valid_out
+        beam_idx_cp[t_sel[vo], sky_sel[vo], sat_out_sel[vo], slot_sel[vo]] = beam_id_sel[vo]
+        beam_alpha_cp[t_sel[vo], sky_sel[vo], sat_out_sel[vo], slot_sel[vo]] = alpha_sel[vo]
+        beam_beta_cp[t_sel[vo], sky_sel[vo], sat_out_sel[vo], slot_sel[vo]] = beta_sel[vo]
         if cell_slot_sat_cp is not None:
             cell_slot_sat_cp[t_sel, sky_sel, cell_sel, link_sel] = sat_sel
         if cell_slot_beam_slot_cp is not None:
             cell_slot_beam_slot_cp[t_sel, sky_sel, cell_sel, link_sel] = slot_sel
         return
 
-    t_sel = edge_info["t"][edge_sel].astype(cp.int32, copy=False)
-    if int(cp.count_nonzero(valid_out)) > 0:
-        beam_idx_cp[t_sel[valid_out], sat_out_sel[valid_out], slot_sel[valid_out]] = beam_id_sel[valid_out]
-        beam_alpha_cp[t_sel[valid_out], sat_out_sel[valid_out], slot_sel[valid_out]] = alpha_sel[valid_out]
-        beam_beta_cp[t_sel[valid_out], sat_out_sel[valid_out], slot_sel[valid_out]] = beta_sel[valid_out]
-    if cell_slot_sat_cp is not None:
-        cell_slot_sat_cp[t_sel, cell_sel, link_sel] = sat_sel
+    # Fused gather + scatter via RawModule: eliminates ~13 CuPy dispatches
+    # including the count_nonzero host sync.  Writes beam_idx/alpha/beta
+    # and cell_slot_sat in a single CUDA launch.
+    _sc_mod = _get_scatter_edges_kernel()
+    _sc_k = _sc_mod.get_function("scatter_selected_edges_3d")
+    _n_sel = int(selected_positions_cp.size)
+    _block = 256
+    _S_out = int(beam_idx_cp.shape[1])
+    _K = int(beam_idx_cp.shape[2])
+    _C = int(cell_slot_sat_cp.shape[1]) if cell_slot_sat_cp is not None else 0
+    _sc_k(
+        ((_n_sel + _block - 1) // _block,), (_block,),
+        (
+            edge_info["sat"],
+            edge_info["cell"],
+            edge_info["link"],
+            edge_info["t"],
+            edge_info["alpha"],
+            edge_info["beta"],
+            selected_positions_cp.astype(cp.int64, copy=False),
+            slot_cp.astype(cp.int32, copy=False),
+            sat_output_index_cp,
+            np.int32(n_links),
+            np.int32(_S_out), np.int32(_K),
+            beam_idx_cp, beam_alpha_cp, beam_beta_cp,
+            cell_slot_sat_cp if cell_slot_sat_cp is not None else cp.empty(1, dtype=cp.int32),
+            np.int32(1 if cell_slot_sat_cp is not None else 0),
+            np.int32(_C),
+            np.int32(_n_sel),
+        ),
+    )
     if cell_slot_beam_slot_cp is not None:
-        cell_slot_beam_slot_cp[t_sel, cell_sel, link_sel] = slot_sel
+        # Rare path (boresight only); fall back to CuPy indexing.
+        edge_sel = selected_positions_cp.astype(cp.int64, copy=False)
+        _t_fb = edge_info["t"][edge_sel]
+        _cell_fb = edge_info["cell"][edge_sel]
+        _link_fb = edge_info["link"][edge_sel]
+        cell_slot_beam_slot_cp[_t_fb, _cell_fb, _link_fb] = slot_cp.astype(cp.int32, copy=False)
 
 
 def _count_edges_per_satellite_group_cp(
@@ -7538,34 +8667,74 @@ def _finalize_ras_station_parallel_cp(
         if boresight_active
         else (time_count, sat_output_count, library.n_beam)
     )
-    beam_idx_cp = cp.full(beam_shape, -1, dtype=cp.int32)
-    beam_alpha_cp = cp.full(beam_shape, cp.nan, dtype=cp.float32)
-    beam_beta_cp = cp.full(beam_shape, cp.nan, dtype=cp.float32)
     sat_shape = (
         (time_count, sky_count, library.sat_count)
         if boresight_active
         else (time_count, library.sat_count)
     )
-    sat_slot_used_cp = cp.zeros(sat_shape, dtype=cp.int32)
     cell_slot_shape = (
         (time_count, sky_count, library.cell_count, library.n_links)
         if boresight_active
         else (time_count, library.cell_count, library.n_links)
     )
-    cell_slot_sat_cp = cp.full(cell_slot_shape, -1, dtype=cp.int32)
-    needs_repair_cp = cp.zeros(cell_slot_shape, dtype=cp.bool_)
-    reserved_alpha_cp = cp.full(sat_shape, cp.nan, dtype=cp.float32)
-    reserved_beta_cp = cp.full(sat_shape, cp.nan, dtype=cp.float32)
-    reserved_present_cp = cp.zeros(sat_shape, dtype=cp.bool_)
     count_shape = (time_count, sky_count) if boresight_active else (time_count,)
-    ras_retargeted_count_cp = cp.zeros(count_shape, dtype=cp.int32)
-    direct_kept_count_cp = cp.zeros(count_shape, dtype=cp.int32)
-    repaired_link_count_cp = cp.zeros(count_shape, dtype=cp.int32)
-    dropped_link_count_cp = cp.zeros(count_shape, dtype=cp.int32)
+
+    # Workspace pooling: reuse GPU arrays across finalize calls.
+    # On first call, allocate; on subsequent calls, reset to initial
+    # values (memset is ~10x cheaper than alloc+dealloc).
+    _ws = library._finalize_workspace
+    _ws_key = (beam_shape, sat_shape, cell_slot_shape, count_shape)
+    if _ws.get("_key") != _ws_key:
+        # Shape changed (first call or different batch geometry) — reallocate
+        _ws["beam_idx"] = cp.empty(beam_shape, dtype=cp.int32)
+        _ws["beam_alpha"] = cp.empty(beam_shape, dtype=cp.float32)
+        _ws["beam_beta"] = cp.empty(beam_shape, dtype=cp.float32)
+        _ws["sat_slot_used"] = cp.empty(sat_shape, dtype=cp.int32)
+        _ws["cell_slot_sat"] = cp.empty(cell_slot_shape, dtype=cp.int32)
+        _ws["needs_repair"] = cp.empty(cell_slot_shape, dtype=cp.bool_)
+        _ws["reserved_alpha"] = cp.empty(sat_shape, dtype=cp.float32)
+        _ws["reserved_beta"] = cp.empty(sat_shape, dtype=cp.float32)
+        _ws["reserved_present"] = cp.empty(sat_shape, dtype=cp.bool_)
+        _ws["ras_retargeted"] = cp.empty(count_shape, dtype=cp.int32)
+        _ws["direct_kept"] = cp.empty(count_shape, dtype=cp.int32)
+        _ws["repaired_link"] = cp.empty(count_shape, dtype=cp.int32)
+        _ws["dropped_link"] = cp.empty(count_shape, dtype=cp.int32)
+        _ws["_key"] = _ws_key
+
+    # Reset workspace arrays. cp.full writes the fill value in a single
+    # kernel launch; we reuse the existing allocation to avoid alloc churn.
+    beam_idx_cp = _ws["beam_idx"]
+    beam_alpha_cp = _ws["beam_alpha"]
+    beam_beta_cp = _ws["beam_beta"]
+    sat_slot_used_cp = _ws["sat_slot_used"]
+    cell_slot_sat_cp = _ws["cell_slot_sat"]
+    needs_repair_cp = _ws["needs_repair"]
+    reserved_alpha_cp = _ws["reserved_alpha"]
+    reserved_beta_cp = _ws["reserved_beta"]
+    reserved_present_cp = _ws["reserved_present"]
+    ras_retargeted_count_cp = _ws["ras_retargeted"]
+    direct_kept_count_cp = _ws["direct_kept"]
+    repaired_link_count_cp = _ws["repaired_link"]
+    dropped_link_count_cp = _ws["dropped_link"]
+    # Group resets by fill value to reduce kernel launch count:
+    # -1 fills (int32): beam_idx, cell_slot_sat
+    beam_idx_cp[...] = -1; cell_slot_sat_cp[...] = -1
+    # NaN fills (float32): beam_alpha, beam_beta, reserved_alpha, reserved_beta
+    beam_alpha_cp[...] = cp.nan; beam_beta_cp[...] = cp.nan
+    reserved_alpha_cp[...] = cp.nan; reserved_beta_cp[...] = cp.nan
+    # Zero fills (int32): sat_slot_used, counters
+    sat_slot_used_cp[...] = 0
+    ras_retargeted_count_cp[...] = 0; direct_kept_count_cp[...] = 0
+    repaired_link_count_cp[...] = 0; dropped_link_count_cp[...] = 0
+    # Bool zeros: needs_repair, reserved_present
+    needs_repair_cp[...] = False; reserved_present_cp[...] = False
 
     if boresight_active:
-        grid = (time_count, sky_count, 1)
-        _retarget_ras_row_boresight_kernel[grid, (1, 1, 1)](
+        # 32 sky cells per block → proper warp-level utilization.
+        _bore_sky_block = 32
+        _bore_sky_grid = (int(sky_count) + _bore_sky_block - 1) // _bore_sky_block
+        grid = (time_count, _bore_sky_grid, 1)
+        _retarget_ras_row_boresight_kernel[grid, (_bore_sky_block, 1, 1)](
             cuda.as_cuda_array(assignments_cp),
             cuda.as_cuda_array(direct_candidate_slab["row_ptr"]),
             cuda.as_cuda_array(direct_candidate_slab["candidate_sat"]),
@@ -7598,6 +8767,52 @@ def _finalize_ras_station_parallel_cp(
             cuda.as_cuda_array(ras_retargeted_count_cp),
             cuda.as_cuda_array(dropped_link_count_cp),
         )
+    elif getattr(library, '_use_parallel_finalize', False) and not boresight_active:
+        # ── Parallel finalize kernel: replaces retarget + CuPy edge
+        # pipeline + repair with a single Numba CUDA launch.
+        # One block per timestep, 128 threads per block. ──
+        _par_grid = (time_count, 1, 1)
+        _par_block = (GPU_FINALIZE_BLOCK_SIZE, 1, 1)
+        _finalize_direct_epfd_beam_tables_parallel_kernel[_par_grid, _par_block](
+            cuda.as_cuda_array(assignments_cp),
+            cuda.as_cuda_array(cone_ok_cp),
+            cuda.as_cuda_array(selected_alpha_rad_cp),
+            cuda.as_cuda_array(selected_beta_rad_cp),
+            cuda.as_cuda_array(direct_candidate_slab["row_ptr"]),
+            cuda.as_cuda_array(direct_candidate_slab["candidate_sat"]),
+            cuda.as_cuda_array(direct_candidate_slab["candidate_alpha_rad"]),
+            cuda.as_cuda_array(direct_candidate_slab["candidate_beta_rad"]),
+            cuda.as_cuda_array(ras_elevation_deg_cp),
+            cuda.as_cuda_array(ras_alpha_rad_cp),
+            cuda.as_cuda_array(ras_beta_rad_cp),
+            cuda.as_cuda_array(library.sat_min_elev_cp),
+            cuda.as_cuda_array(sat_beta_max_rad_cp),
+            int(ras_cell_index),
+            int(library.n_links),
+            int(library.n_beam),
+            bool(library.use_cone_check),
+            np.float32(beta_tol_rad),
+            bool(use_ras_guard),
+            np.float32(ras_guard_cos),
+            cuda.as_cuda_array(sat_output_index_cp),
+            bool(ras_sat_axis_is_compact),
+            cuda.as_cuda_array(cell_slot_sat_cp),
+            cuda.as_cuda_array(needs_repair_cp),
+            cuda.as_cuda_array(sat_slot_used_cp),
+            cuda.as_cuda_array(reserved_alpha_cp),
+            cuda.as_cuda_array(reserved_beta_cp),
+            cuda.as_cuda_array(reserved_present_cp),
+            cuda.as_cuda_array(beam_idx_cp),
+            cuda.as_cuda_array(beam_alpha_cp),
+            cuda.as_cuda_array(beam_beta_cp),
+            cuda.as_cuda_array(ras_retargeted_count_cp),
+            cuda.as_cuda_array(direct_kept_count_cp),
+            cuda.as_cuda_array(repaired_link_count_cp),
+            cuda.as_cuda_array(dropped_link_count_cp),
+        )
+        # Skip the CuPy edge pipeline — the parallel kernel did it all.
+        # Canonicalize beam slot ordering for deterministic output.
+        _canonicalize_direct_beam_slots_cp(beam_idx_cp, beam_alpha_cp, beam_beta_cp)
     else:
         grid = (time_count, 1, 1)
         _retarget_ras_row_kernel[grid, (1, 1, 1)](
@@ -7652,58 +8867,93 @@ def _finalize_ras_station_parallel_cp(
     kept_realized_count = 0
     repair_stats = {"impacted_row_count": 0, "impacted_candidate_edge_count": 0, "repair_launch_count": 0}
     if realized_count > 0:
-        feasible_mask = cp.asarray(edge_info["cone_ok"], dtype=cp.bool_)
-        if boresight_active:
-            forbidden_cp = _compute_realized_boresight_forbidden_cp(
-                edge_info,
-                boresight_sparse_slab=boresight_sparse_slab,
-                theta2_cell_mask_cp=theta2_cell_mask_cp,
-                sky_count=sky_count,
+        if not boresight_active and use_ras_guard:
+            # Fused feasibility kernel: cone_ok + RAS guard in one CUDA launch.
+            # Replaces ~18 CuPy dispatches with a single RawModule kernel.
+            _feas_mod = _get_edge_feasibility_kernel()
+            _feas_k = _feas_mod.get_function("compute_edge_feasibility")
+            _n_edges = int(edge_info["cone_ok"].size)
+            feasible_mask = cp.empty(_n_edges, dtype=cp.bool_)
+            _block = 256
+            _feas_k(
+                ((_n_edges + _block - 1) // _block,), (_block,),
+                (
+                    edge_info["cone_ok"],
+                    edge_info["t"].astype(cp.int32, copy=False),
+                    edge_info["sat"].astype(cp.int32, copy=False),
+                    edge_info["alpha"].astype(cp.float32, copy=False),
+                    edge_info["beta"].astype(cp.float32, copy=False),
+                    reserved_present_cp,
+                    reserved_alpha_cp,
+                    reserved_beta_cp,
+                    np.float32(ras_guard_cos),
+                    np.int32(1),
+                    np.int32(library.sat_count),
+                    np.int32(_n_edges),
+                    feasible_mask,
+                ),
             )
-            feasible_mask &= ~forbidden_cp
-        if use_ras_guard:
+        else:
+            feasible_mask = cp.asarray(edge_info["cone_ok"], dtype=cp.bool_)
             if boresight_active:
-                reserved_present_edge = reserved_present_cp[
-                    edge_info["t"],
-                    edge_info["sky"],
-                    edge_info["sat"],
-                ]
-                alpha_ras = reserved_alpha_cp[
-                    edge_info["t"],
-                    edge_info["sky"],
-                    edge_info["sat"],
-                ]
-                beta_ras = reserved_beta_cp[
-                    edge_info["t"],
-                    edge_info["sky"],
-                    edge_info["sat"],
-                ]
-            else:
-                reserved_present_edge = reserved_present_cp[
-                    edge_info["t"],
-                    edge_info["sat"],
-                ]
-                alpha_ras = reserved_alpha_cp[
-                    edge_info["t"],
-                    edge_info["sat"],
-                ]
-                beta_ras = reserved_beta_cp[
-                    edge_info["t"],
-                    edge_info["sat"],
-                ]
-            guard_valid = (
-                reserved_present_edge
-                & cp.isfinite(alpha_ras)
-                & cp.isfinite(beta_ras)
-                & cp.isfinite(edge_info["alpha"])
-                & cp.isfinite(edge_info["beta"])
-            )
-            if int(cp.count_nonzero(guard_valid)) > 0:
+                forbidden_cp = _compute_realized_boresight_forbidden_cp(
+                    edge_info,
+                    boresight_sparse_slab=boresight_sparse_slab,
+                    theta2_cell_mask_cp=theta2_cell_mask_cp,
+                    sky_count=sky_count,
+                )
+                feasible_mask &= ~forbidden_cp
+            if use_ras_guard:
+                if boresight_active:
+                    reserved_present_edge = reserved_present_cp[
+                        edge_info["t"],
+                        edge_info["sky"],
+                        edge_info["sat"],
+                    ]
+                    alpha_ras = reserved_alpha_cp[
+                        edge_info["t"],
+                        edge_info["sky"],
+                        edge_info["sat"],
+                    ]
+                    beta_ras = reserved_beta_cp[
+                        edge_info["t"],
+                        edge_info["sky"],
+                        edge_info["sat"],
+                    ]
+                else:
+                    reserved_present_edge = reserved_present_cp[
+                        edge_info["t"],
+                        edge_info["sat"],
+                    ]
+                    alpha_ras = reserved_alpha_cp[
+                        edge_info["t"],
+                        edge_info["sat"],
+                    ]
+                    beta_ras = reserved_beta_cp[
+                        edge_info["t"],
+                        edge_info["sat"],
+                    ]
+                guard_valid = (
+                    reserved_present_edge
+                    & cp.isfinite(alpha_ras)
+                    & cp.isfinite(beta_ras)
+                    & cp.isfinite(edge_info["alpha"])
+                    & cp.isfinite(edge_info["beta"])
+                )
                 cos_da = cp.cos(alpha_ras - edge_info["alpha"])
-                cos_gamma = cp.cos(beta_ras) * cp.cos(edge_info["beta"])
-                cos_gamma += cp.sin(beta_ras) * cp.sin(edge_info["beta"]) * cos_da
+                cos_gamma = (
+                    cp.cos(beta_ras) * cp.cos(edge_info["beta"])
+                    + cp.sin(beta_ras) * cp.sin(edge_info["beta"]) * cos_da
+                )
                 feasible_mask &= ~(guard_valid & (cos_gamma > np.float32(ras_guard_cos)))
 
+        # Pure-CuPy orchestration.  An earlier iteration tried a Cython
+        # wrapper around this block (``scepter._finalize_accel``) on the
+        # theory that eliminating Python dict lookups between CuPy calls
+        # would be a win.  Benchmarking showed 0.00 ms improvement
+        # (within noise): the dispatch loop is dominated by CUDA launch
+        # latency, not Python interpreter overhead.  The Cython module
+        # has been removed; see memory ``optimization_progress.md``.
         feasible_pos = cp.nonzero(feasible_mask)[0].astype(cp.int64, copy=False)
         feasible_realized_count = int(feasible_pos.size)
         kept_realized_mask = cp.zeros((realized_count,), dtype=cp.bool_)
@@ -7726,9 +8976,14 @@ def _finalize_ras_station_parallel_cp(
                 np.int32(0),
                 np.int32(int(library.n_beam)) - reserved_flat_cp,
             ).astype(cp.int32, copy=False)
+            _base_order = edge_info["edge_linear"][feasible_pos]
+            if getattr(library, '_load_balanced_beams', False):
+                _cap_remaining = group_limit_flat_cp[group_key_cp].astype(cp.int64, copy=False)
+                _penalty = (np.int64(int(library.n_beam)) - _cap_remaining) * np.int64(1_000_000)
+                _base_order = _base_order + _penalty
             keep_local_cp, keep_rank_cp = _select_group_limited_edges_cp(
                 group_key_cp=group_key_cp,
-                order_key_cp=edge_info["edge_linear"][feasible_pos],
+                order_key_cp=_base_order,
                 group_limit_flat_cp=group_limit_flat_cp,
             )
             kept_feasible_pos = feasible_pos[keep_local_cp].astype(cp.int64, copy=False)
@@ -9841,15 +11096,26 @@ def _sample_s1586_pointings_cp(
 _S1528_LUT_STEP_DEG = 0.0001
 _S1528_LUT_MAX_DEG = 180.0
 
-_s1528_lut_interp_kernel = None
+# 2-D LUT for asymmetric S.1528 Rec 1.4 (lt_m != lr_m). The analytical
+# u-formula depends on cos(phi)^2 and sin(phi)^2, giving a 4-fold symmetric
+# pattern in phi — we only sample phi in [0, 90] deg and fold arbitrary
+# phi into that quadrant at runtime. Theta is sampled at the same
+# resolution as the 1-D LUT would use near the main beam; phi at 0.5 deg.
+_S1528_LUT_2D_THETA_STEP_DEG = 0.01
+_S1528_LUT_2D_PHI_STEP_DEG = 0.5
+_S1528_LUT_2D_THETA_MAX_DEG = 180.0
+_S1528_LUT_2D_PHI_MAX_DEG = 90.0
+
+_s1528_lut_1d_interp_kernel = None
+_s1528_lut_1d_interp_fp16_kernel = None
 
 
-def _get_s1528_lut_interp_kernel():
+def _get_s1528_lut_1d_interp_kernel():
     """Return (and cache) a CuPy ElementwiseKernel for fast LUT interpolation."""
-    global _s1528_lut_interp_kernel
-    if _s1528_lut_interp_kernel is not None:
-        return _s1528_lut_interp_kernel
-    _s1528_lut_interp_kernel = cp.ElementwiseKernel(
+    global _s1528_lut_1d_interp_kernel
+    if _s1528_lut_1d_interp_kernel is not None:
+        return _s1528_lut_1d_interp_kernel
+    _s1528_lut_1d_interp_kernel = cp.ElementwiseKernel(
         "float32 theta_deg, raw float32 lut, float32 inv_step, float32 max_deg, int32 n_lut",
         "float32 gain_db",
         """
@@ -9863,15 +11129,62 @@ def _get_s1528_lut_interp_kernel():
         float frac = fidx - (float)idx0;
         gain_db = lut[idx0] + frac * (lut[idx1] - lut[idx0]);
         """,
-        "s1528_lut_interp",
+        "s1528_lut_1d_interp",
     )
-    return _s1528_lut_interp_kernel
+    return _s1528_lut_1d_interp_kernel
 
 
-def _ensure_s1528_gain_lut(
+def _get_s1528_lut_1d_interp_fp16_kernel():
+    """fp16-LUT variant of :func:`_get_s1528_lut_1d_interp_kernel`.
+
+    Identical body, only the ``raw`` LUT input is ``float16``; the two
+    corner loads cast ``__half → float`` implicitly before the linear
+    weight multiplies.  Halves the persistent 1-D LUT memory (720 KB fp32
+    → 360 KB fp16) when the session runs at ``pattern_dtype=float16``.
+    """
+    global _s1528_lut_1d_interp_fp16_kernel
+    if _s1528_lut_1d_interp_fp16_kernel is not None:
+        return _s1528_lut_1d_interp_fp16_kernel
+    _s1528_lut_1d_interp_fp16_kernel = cp.ElementwiseKernel(
+        "float32 theta_deg, raw float16 lut, float32 inv_step, float32 max_deg, int32 n_lut",
+        "float32 gain_db",
+        """
+        float t = fabsf(theta_deg);
+        if (t > max_deg) t = max_deg;
+        float fidx = t * inv_step;
+        int idx0 = __float2int_rd(fidx);
+        if (idx0 < 0) idx0 = 0;
+        int idx1 = idx0 + 1;
+        if (idx1 >= n_lut) { idx1 = n_lut - 1; idx0 = idx1 - 1; if (idx0 < 0) idx0 = 0; }
+        float frac = fidx - (float)idx0;
+        float v0 = (float)lut[idx0];
+        float v1 = (float)lut[idx1];
+        gain_db = v0 + frac * (v1 - v0);
+        """,
+        "s1528_lut_1d_interp_fp16",
+    )
+    return _s1528_lut_1d_interp_fp16_kernel
+
+
+def _ensure_s1528_gain_lut_1d(
     context: GpuS1528PatternContext | GpuS1528Rec12PatternContext,
 ) -> None:
-    """Build and cache a 1-D gain LUT on the GPU for fast pattern evaluation."""
+    """Build and cache a 1-D gain LUT on the GPU for fast pattern evaluation.
+
+    **Valid only for axisymmetric patterns** — Rec 1.2 is axisymmetric by
+    definition, and Rec 1.4 is axisymmetric when ``lt_m == lr_m``. For
+    asymmetric Rec 1.4 (``lt_m != lr_m``) a 2-D LUT in ``(theta, phi)``
+    is required; see ``_ensure_s1528_gain_lut_2d``.
+
+    For asymmetric Rec 1.4 contexts (``context.is_2d`` is ``True``), this
+    function transparently delegates to ``_ensure_s1528_gain_lut_2d``;
+    callers that directly invoke the 1-D LUT evaluators on an asymmetric
+    context hit an explicit ``NotImplementedError`` (see
+    ``_evaluate_s1528_pattern_cp_lut_1d``).
+    """
+    if getattr(context, "is_2d", False):
+        _ensure_s1528_gain_lut_2d(context)
+        return
     if context.d_gain_lut is not None:
         return
     step = float(_S1528_LUT_STEP_DEG)
@@ -9883,20 +11196,100 @@ def _ensure_s1528_gain_lut(
         gain_cp = _evaluate_s1528_rec12_pattern_cp(context, theta_cp)
     else:
         gain_cp = _evaluate_s1528_pattern_cp_analytical(context, theta_cp)
+    # Downcast the LUT to fp16 when the session's pattern stage runs at
+    # fp16.  Halves the persistent LUT memory (720 KB → 360 KB on the
+    # standard 0.0001° grid) with no extra eval cost — the fp16 kernel
+    # loads ``__half`` and promotes to fp32 inside the linear-in-dB
+    # interpolation, identical arithmetic to the fp32 path.
+    _session_pattern_dtype = getattr(
+        getattr(context, "session", None), "pattern_dtype", None,
+    )
+    if _session_pattern_dtype is not None and np.dtype(_session_pattern_dtype) == np.dtype(np.float16):
+        gain_cp = gain_cp.astype(cp.float16, copy=False)
     context.d_gain_lut = gain_cp
     context.gain_lut_step_deg = step
     context.gain_lut_max_deg = max_deg
     context.gain_lut_n = n
 
 
-def _evaluate_s1528_pattern_cp_lut(
+def _ensure_s1528_gain_lut_2d(context: GpuS1528PatternContext) -> None:
+    """Build and cache a 2-D gain LUT ``G(theta, phi)`` for asymmetric Rec 1.4.
+
+    The Rec 1.4 u-formula,
+
+        u(theta, phi) = (pi/lambda) * sqrt((lr * sin(theta) * cos(phi))^2
+                                         + (lt * sin(theta) * sin(phi))^2),
+
+    depends on ``cos^2(phi)`` and ``sin^2(phi)`` only, so the pattern has
+    4-fold symmetry in phi (period 180 deg, mirror-symmetric about 0 and
+    90 deg). The LUT therefore samples phi in ``[0, 90]`` deg and the
+    bilinear-lookup kernel (``_get_s1528_lut_2d_interp_kernel``) folds
+    arbitrary phi into that quadrant via
+    ``phi' = min(|phi mod 180|, 180 - |phi mod 180|)``.
+
+    Modelled on ``_ensure_m2101_element_lut_2d`` but parameterised in the
+    S.1528 ``(theta, phi)`` convention (not the M.2101 body-frame
+    ``(alpha, beta)``).
+    """
+    if context.d_gain_lut_2d is not None:
+        return
+    theta_step = float(_S1528_LUT_2D_THETA_STEP_DEG)
+    phi_step = float(_S1528_LUT_2D_PHI_STEP_DEG)
+    theta_max = float(_S1528_LUT_2D_THETA_MAX_DEG)
+    phi_max = float(_S1528_LUT_2D_PHI_MAX_DEG)
+    n_theta = int(round(theta_max / theta_step)) + 1
+    n_phi = int(round(phi_max / phi_step)) + 1
+    theta_1d = cp.arange(n_theta, dtype=cp.float32) * cp.float32(theta_step)
+    phi_1d = cp.arange(n_phi, dtype=cp.float32) * cp.float32(phi_step)
+    # (n_phi, n_theta) — phi is the slow axis so the row stride matches the
+    # bilinear-lookup convention used by the M.2101 2-D kernel.
+    theta_2d, phi_2d = cp.meshgrid(theta_1d, phi_1d, indexing="xy")
+    gain_flat = _evaluate_s1528_pattern_cp_analytical(
+        context, theta_2d.ravel(), phi_deg=phi_2d.ravel()
+    )
+    gain_2d_cp = gain_flat.reshape(n_phi, n_theta).astype(
+        cp.float32, copy=False
+    )
+    # Downcast the 2-D LUT to fp16 when the session's pattern stage runs
+    # at fp16.  Halves the persistent LUT memory (≈13 MB → 6.5 MB on the
+    # standard 0.01° × 0.5° grid) with no extra eval cost.
+    _session_pattern_dtype = getattr(
+        getattr(context, "session", None), "pattern_dtype", None,
+    )
+    if _session_pattern_dtype is not None and np.dtype(_session_pattern_dtype) == np.dtype(np.float16):
+        gain_2d_cp = gain_2d_cp.astype(cp.float16, copy=False)
+    context.d_gain_lut_2d = gain_2d_cp
+    context.gain_lut_2d_theta_step_deg = theta_step
+    context.gain_lut_2d_phi_step_deg = phi_step
+    context.gain_lut_2d_n_theta = n_theta
+    context.gain_lut_2d_n_phi = n_phi
+    context.gain_lut_2d_theta_max_deg = theta_max
+    context.gain_lut_2d_phi_max_deg = phi_max
+
+
+def _evaluate_s1528_pattern_cp_lut_1d(
     context: GpuS1528PatternContext,
     theta_deg: Any,
 ) -> Any:
-    """Fast S.1528 pattern evaluation using precomputed 1-D gain LUT."""
-    _ensure_s1528_gain_lut(context)
+    """Fast S.1528 pattern evaluation using precomputed 1-D gain LUT.
+
+    Axisymmetric path only (Rec 1.2, or Rec 1.4 with ``lt_m == lr_m``).
+    The dispatcher in ``_evaluate_s1528_pattern_cp`` must not route
+    asymmetric Rec 1.4 contexts here.
+    """
+    if getattr(context, "is_2d", False):
+        raise NotImplementedError(
+            "Asymmetric S.1528 Rec 1.4 context (lt_m != lr_m) routed "
+            "into the 1-D LUT evaluator; use the 2-D (theta, phi) path "
+            "via _evaluate_s1528_pattern_cp(theta, phi_deg=...) instead."
+        )
+    _ensure_s1528_gain_lut_1d(context)
     theta = _to_cupy_array(theta_deg, dtype=cp.float32)
-    kernel = _get_s1528_lut_interp_kernel()
+    kernel = (
+        _get_s1528_lut_1d_interp_fp16_kernel()
+        if context.d_gain_lut.dtype == cp.float16
+        else _get_s1528_lut_1d_interp_kernel()
+    )
     return kernel(
         theta,
         context.d_gain_lut,
@@ -9906,17 +11299,307 @@ def _evaluate_s1528_pattern_cp_lut(
     )
 
 
-_s1528_lut_to_linear_kernel = None
+_s1528_lut_2d_interp_kernel = None
+_s1528_lut_2d_interp_fp16_kernel = None
 
 
-def _get_s1528_lut_to_linear_kernel():
+def _get_s1528_lut_2d_interp_kernel():
+    """ElementwiseKernel: bilinear lookup of the asymmetric S.1528 Rec 1.4
+    gain LUT ``G(theta, phi)``.
+
+    The LUT is stored as ``(n_phi, n_theta)`` float32 dB. Phi is folded
+    into ``[0, phi_max]`` using the pattern's 4-fold symmetry
+    (``cos^2(phi)``/``sin^2(phi)`` dependence); theta is taken as
+    ``fabs(theta)`` and clamped to ``theta_max``.
+    """
+    global _s1528_lut_2d_interp_kernel
+    if _s1528_lut_2d_interp_kernel is not None:
+        return _s1528_lut_2d_interp_kernel
+    _s1528_lut_2d_interp_kernel = cp.ElementwiseKernel(
+        "float32 theta_deg, float32 phi_deg, raw float32 lut, "
+        "float32 inv_theta_step, float32 inv_phi_step, "
+        "float32 theta_max, float32 phi_max, "
+        "int32 n_theta, int32 n_phi",
+        "float32 gain_db",
+        """
+        /* theta folding: |theta|, clamp to [0, theta_max] */
+        float t = fabsf(theta_deg);
+        if (t > theta_max) t = theta_max;
+        /* phi folding: |phi| mod 180, then mirror about 90 deg so p in [0, 90] */
+        float p = fabsf(phi_deg);
+        p = fmodf(p, 180.0f);
+        if (p > 90.0f) p = 180.0f - p;
+        if (p > phi_max) p = phi_max;
+
+        float tf = t * inv_theta_step;
+        float pf = p * inv_phi_step;
+        int t0 = __float2int_rd(tf);
+        int p0 = __float2int_rd(pf);
+        if (t0 < 0) t0 = 0;
+        if (p0 < 0) p0 = 0;
+        int t1 = t0 + 1;
+        int p1 = p0 + 1;
+        if (t1 >= n_theta) { t1 = n_theta - 1; t0 = t1 > 0 ? t1 - 1 : 0; }
+        if (p1 >= n_phi)   { p1 = n_phi   - 1; p0 = p1 > 0 ? p1 - 1 : 0; }
+        float ft = tf - (float)t0;
+        float fp = pf - (float)p0;
+        float v00 = lut[p0 * n_theta + t0];
+        float v10 = lut[p0 * n_theta + t1];
+        float v01 = lut[p1 * n_theta + t0];
+        float v11 = lut[p1 * n_theta + t1];
+        gain_db = v00 * (1.0f - ft) * (1.0f - fp)
+                + v10 * ft * (1.0f - fp)
+                + v01 * (1.0f - ft) * fp
+                + v11 * ft * fp;
+        """,
+        "s1528_lut_2d_interp",
+    )
+    return _s1528_lut_2d_interp_kernel
+
+
+def _get_s1528_lut_2d_interp_fp16_kernel():
+    """fp16-LUT variant of :func:`_get_s1528_lut_2d_interp_kernel`.
+
+    Same bilinear body over the (n_phi, n_theta) LUT, only the ``raw``
+    LUT is ``float16``.  The four corner loads promote ``__half``→
+    ``float`` before the bilinear weighted sum, so the interpolation
+    remains in fp32 precision.  Halves the persistent 2-D LUT memory
+    (13 MB fp32 → 6.5 MB fp16) when the session runs at
+    ``pattern_dtype=float16``.
+    """
+    global _s1528_lut_2d_interp_fp16_kernel
+    if _s1528_lut_2d_interp_fp16_kernel is not None:
+        return _s1528_lut_2d_interp_fp16_kernel
+    _s1528_lut_2d_interp_fp16_kernel = cp.ElementwiseKernel(
+        "float32 theta_deg, float32 phi_deg, raw float16 lut, "
+        "float32 inv_theta_step, float32 inv_phi_step, "
+        "float32 theta_max, float32 phi_max, "
+        "int32 n_theta, int32 n_phi",
+        "float32 gain_db",
+        """
+        float t = fabsf(theta_deg);
+        if (t > theta_max) t = theta_max;
+        float p = fabsf(phi_deg);
+        p = fmodf(p, 180.0f);
+        if (p > 90.0f) p = 180.0f - p;
+        if (p > phi_max) p = phi_max;
+
+        float tf = t * inv_theta_step;
+        float pf = p * inv_phi_step;
+        int t0 = __float2int_rd(tf);
+        int p0 = __float2int_rd(pf);
+        if (t0 < 0) t0 = 0;
+        if (p0 < 0) p0 = 0;
+        int t1 = t0 + 1;
+        int p1 = p0 + 1;
+        if (t1 >= n_theta) { t1 = n_theta - 1; t0 = t1 > 0 ? t1 - 1 : 0; }
+        if (p1 >= n_phi)   { p1 = n_phi   - 1; p0 = p1 > 0 ? p1 - 1 : 0; }
+        float ft = tf - (float)t0;
+        float fp = pf - (float)p0;
+        float v00 = (float)lut[p0 * n_theta + t0];
+        float v10 = (float)lut[p0 * n_theta + t1];
+        float v01 = (float)lut[p1 * n_theta + t0];
+        float v11 = (float)lut[p1 * n_theta + t1];
+        gain_db = v00 * (1.0f - ft) * (1.0f - fp)
+                + v10 * ft * (1.0f - fp)
+                + v01 * (1.0f - ft) * fp
+                + v11 * ft * fp;
+        """,
+        "s1528_lut_2d_interp_fp16",
+    )
+    return _s1528_lut_2d_interp_fp16_kernel
+
+
+def _evaluate_s1528_pattern_cp_lut_2d(
+    context: GpuS1528PatternContext,
+    theta_deg: Any,
+    phi_deg: Any,
+) -> Any:
+    """Bilinear 2-D LUT evaluation of asymmetric S.1528 Rec 1.4.
+
+    Requires ``context.is_2d`` and a provided ``phi_deg``. The dispatcher
+    in ``_evaluate_s1528_pattern_cp`` is responsible for enforcing this.
+    """
+    _ensure_s1528_gain_lut_2d(context)
+    theta = _to_cupy_array(theta_deg, dtype=cp.float32)
+    phi = _to_cupy_array(phi_deg, dtype=cp.float32)
+    theta, phi = cp.broadcast_arrays(theta, phi)
+    kernel = (
+        _get_s1528_lut_2d_interp_fp16_kernel()
+        if context.d_gain_lut_2d.dtype == cp.float16
+        else _get_s1528_lut_2d_interp_kernel()
+    )
+    return kernel(
+        theta,
+        phi,
+        context.d_gain_lut_2d,
+        cp.float32(1.0 / context.gain_lut_2d_theta_step_deg),
+        cp.float32(1.0 / context.gain_lut_2d_phi_step_deg),
+        cp.float32(context.gain_lut_2d_theta_max_deg),
+        cp.float32(context.gain_lut_2d_phi_max_deg),
+        np.int32(context.gain_lut_2d_n_theta),
+        np.int32(context.gain_lut_2d_n_phi),
+    )
+
+
+_s1528_lut_2d_to_linear_kernel = None
+_s1528_lut_2d_to_linear_fp16_kernel = None
+
+
+def _get_s1528_lut_2d_to_linear_kernel():
+    """Fused 2-D bilinear LUT lookup + dB→linear + relative gain in one kernel.
+
+    Matches the 1-D fused kernel ``_get_s1528_lut_1d_to_linear_kernel`` and
+    the M.2101 fused kernel — collapses the old two-step "LUT → dB, then
+    ``cp.power(10, g/10) * inv_gmax`` two extra CuPy ops" path into a
+    single ElementwiseKernel launch.
+    """
+    global _s1528_lut_2d_to_linear_kernel
+    if _s1528_lut_2d_to_linear_kernel is not None:
+        return _s1528_lut_2d_to_linear_kernel
+    _s1528_lut_2d_to_linear_kernel = cp.ElementwiseKernel(
+        "float32 theta_deg, float32 phi_deg, raw float32 lut, "
+        "float32 inv_theta_step, float32 inv_phi_step, "
+        "float32 theta_max, float32 phi_max, "
+        "int32 n_theta, int32 n_phi, float32 inv_gmax_lin",
+        "float32 gain_rel_lin",
+        """
+        /* theta folding: |theta|, clamp to [0, theta_max] */
+        float t = fabsf(theta_deg);
+        if (t > theta_max) t = theta_max;
+        /* phi folding: |phi| mod 180, mirror about 90 so p in [0, 90] */
+        float p = fabsf(phi_deg);
+        p = fmodf(p, 180.0f);
+        if (p > 90.0f) p = 180.0f - p;
+        if (p > phi_max) p = phi_max;
+
+        float tf = t * inv_theta_step;
+        float pf = p * inv_phi_step;
+        int t0 = __float2int_rd(tf);
+        int p0 = __float2int_rd(pf);
+        if (t0 < 0) t0 = 0;
+        if (p0 < 0) p0 = 0;
+        int t1 = t0 + 1;
+        int p1 = p0 + 1;
+        if (t1 >= n_theta) { t1 = n_theta - 1; t0 = t1 > 0 ? t1 - 1 : 0; }
+        if (p1 >= n_phi)   { p1 = n_phi   - 1; p0 = p1 > 0 ? p1 - 1 : 0; }
+        float ft = tf - (float)t0;
+        float fp = pf - (float)p0;
+        float v00 = lut[p0 * n_theta + t0];
+        float v10 = lut[p0 * n_theta + t1];
+        float v01 = lut[p1 * n_theta + t0];
+        float v11 = lut[p1 * n_theta + t1];
+        float gain_db = v00 * (1.0f - ft) * (1.0f - fp)
+                      + v10 * ft * (1.0f - fp)
+                      + v01 * (1.0f - ft) * fp
+                      + v11 * ft * fp;
+        /* 10^(x/10) = exp(x * ln(10)/10) */
+        gain_rel_lin = __expf(gain_db * 0.23025850929f) * inv_gmax_lin;
+        """,
+        "s1528_lut_2d_to_linear",
+    )
+    return _s1528_lut_2d_to_linear_kernel
+
+
+def _get_s1528_lut_2d_to_linear_fp16_kernel():
+    """fp16-LUT variant of :func:`_get_s1528_lut_2d_to_linear_kernel`.
+
+    Same fused bilinear + dB→linear + relative-gain chain over the
+    asymmetric Rec 1.4 LUT, with ``raw float16`` storage.  Four
+    ``__half``→``float`` promotions at the corner loads keep the
+    bilinear interpolation and the subsequent ``__expf`` in fp32.
+    """
+    global _s1528_lut_2d_to_linear_fp16_kernel
+    if _s1528_lut_2d_to_linear_fp16_kernel is not None:
+        return _s1528_lut_2d_to_linear_fp16_kernel
+    _s1528_lut_2d_to_linear_fp16_kernel = cp.ElementwiseKernel(
+        "float32 theta_deg, float32 phi_deg, raw float16 lut, "
+        "float32 inv_theta_step, float32 inv_phi_step, "
+        "float32 theta_max, float32 phi_max, "
+        "int32 n_theta, int32 n_phi, float32 inv_gmax_lin",
+        "float32 gain_rel_lin",
+        """
+        float t = fabsf(theta_deg);
+        if (t > theta_max) t = theta_max;
+        float p = fabsf(phi_deg);
+        p = fmodf(p, 180.0f);
+        if (p > 90.0f) p = 180.0f - p;
+        if (p > phi_max) p = phi_max;
+
+        float tf = t * inv_theta_step;
+        float pf = p * inv_phi_step;
+        int t0 = __float2int_rd(tf);
+        int p0 = __float2int_rd(pf);
+        if (t0 < 0) t0 = 0;
+        if (p0 < 0) p0 = 0;
+        int t1 = t0 + 1;
+        int p1 = p0 + 1;
+        if (t1 >= n_theta) { t1 = n_theta - 1; t0 = t1 > 0 ? t1 - 1 : 0; }
+        if (p1 >= n_phi)   { p1 = n_phi   - 1; p0 = p1 > 0 ? p1 - 1 : 0; }
+        float ft = tf - (float)t0;
+        float fp = pf - (float)p0;
+        float v00 = (float)lut[p0 * n_theta + t0];
+        float v10 = (float)lut[p0 * n_theta + t1];
+        float v01 = (float)lut[p1 * n_theta + t0];
+        float v11 = (float)lut[p1 * n_theta + t1];
+        float gain_db = v00 * (1.0f - ft) * (1.0f - fp)
+                      + v10 * ft * (1.0f - fp)
+                      + v01 * (1.0f - ft) * fp
+                      + v11 * ft * fp;
+        gain_rel_lin = __expf(gain_db * 0.23025850929f) * inv_gmax_lin;
+        """,
+        "s1528_lut_2d_to_linear_fp16",
+    )
+    return _s1528_lut_2d_to_linear_fp16_kernel
+
+
+def _evaluate_s1528_pattern_cp_lut_2d_to_linear(
+    context: GpuS1528PatternContext,
+    theta_deg: Any,
+    phi_deg: Any,
+    inv_gmax_lin: float,
+) -> Any:
+    """Fused asymmetric 2-D LUT + dB→linear + relative-gain evaluation.
+
+    Mirrors ``_evaluate_s1528_pattern_cp_lut_1d_to_linear`` for the
+    asymmetric case.  Inputs: ``theta_deg`` (off-axis from boresight),
+    ``phi_deg`` (azimuth around boresight in the pattern frame).
+    Output: ``10^(gain_db/10) / gmax_lin`` = relative linear gain.
+    """
+    _ensure_s1528_gain_lut_2d(context)
+    theta = _to_cupy_array(theta_deg, dtype=cp.float32)
+    phi = _to_cupy_array(phi_deg, dtype=cp.float32)
+    theta, phi = cp.broadcast_arrays(theta, phi)
+    kernel = (
+        _get_s1528_lut_2d_to_linear_fp16_kernel()
+        if context.d_gain_lut_2d.dtype == cp.float16
+        else _get_s1528_lut_2d_to_linear_kernel()
+    )
+    return kernel(
+        theta, phi,
+        context.d_gain_lut_2d,
+        cp.float32(1.0 / context.gain_lut_2d_theta_step_deg),
+        cp.float32(1.0 / context.gain_lut_2d_phi_step_deg),
+        cp.float32(context.gain_lut_2d_theta_max_deg),
+        cp.float32(context.gain_lut_2d_phi_max_deg),
+        np.int32(context.gain_lut_2d_n_theta),
+        np.int32(context.gain_lut_2d_n_phi),
+        cp.float32(float(inv_gmax_lin)),
+    )
+
+
+_s1528_lut_1d_to_linear_kernel = None
+_s1528_lut_1d_to_linear_fp16_kernel = None
+
+
+def _get_s1528_lut_1d_to_linear_kernel():
     """Return (and cache) an ElementwiseKernel that reads the S.1528 LUT and
     outputs *linear relative gain* (``10^(gain_db/10) * inv_gmax_lin``) in a
     single kernel launch, avoiding two extra CuPy operations."""
-    global _s1528_lut_to_linear_kernel
-    if _s1528_lut_to_linear_kernel is not None:
-        return _s1528_lut_to_linear_kernel
-    _s1528_lut_to_linear_kernel = cp.ElementwiseKernel(
+    global _s1528_lut_1d_to_linear_kernel
+    if _s1528_lut_1d_to_linear_kernel is not None:
+        return _s1528_lut_1d_to_linear_kernel
+    _s1528_lut_1d_to_linear_kernel = cp.ElementwiseKernel(
         "float32 theta_deg, raw float32 lut, float32 inv_step, float32 max_deg, "
         "int32 n_lut, float32 inv_gmax_lin",
         "float32 gain_rel_lin",
@@ -9933,20 +11616,65 @@ def _get_s1528_lut_to_linear_kernel():
         /* 10^(x/10) = exp(x * ln(10)/10);  ln(10)/10 ≈ 0.23025850929 */
         gain_rel_lin = __expf(gain_db * 0.23025850929f) * inv_gmax_lin;
         """,
-        "s1528_lut_to_linear",
+        "s1528_lut_1d_to_linear",
     )
-    return _s1528_lut_to_linear_kernel
+    return _s1528_lut_1d_to_linear_kernel
 
 
-def _evaluate_s1528_pattern_cp_lut_to_linear(
+def _get_s1528_lut_1d_to_linear_fp16_kernel():
+    """fp16-LUT variant of :func:`_get_s1528_lut_1d_to_linear_kernel`.
+
+    Fused LUT → dB → linear → relative-gain chain, with the ``raw`` LUT
+    input now ``float16``.  The two corner loads promote ``__half``→
+    ``float`` before the linear-in-dB interpolation and subsequent
+    ``__expf`` remain in fp32 to avoid accumulating half-precision
+    error.  Used when the session's ``pattern_dtype`` is ``float16``.
+    """
+    global _s1528_lut_1d_to_linear_fp16_kernel
+    if _s1528_lut_1d_to_linear_fp16_kernel is not None:
+        return _s1528_lut_1d_to_linear_fp16_kernel
+    _s1528_lut_1d_to_linear_fp16_kernel = cp.ElementwiseKernel(
+        "float32 theta_deg, raw float16 lut, float32 inv_step, float32 max_deg, "
+        "int32 n_lut, float32 inv_gmax_lin",
+        "float32 gain_rel_lin",
+        """
+        float t = fabsf(theta_deg);
+        if (t > max_deg) t = max_deg;
+        float fidx = t * inv_step;
+        int idx0 = __float2int_rd(fidx);
+        if (idx0 < 0) idx0 = 0;
+        int idx1 = idx0 + 1;
+        if (idx1 >= n_lut) { idx1 = n_lut - 1; idx0 = idx1 - 1; if (idx0 < 0) idx0 = 0; }
+        float frac = fidx - (float)idx0;
+        float v0 = (float)lut[idx0];
+        float v1 = (float)lut[idx1];
+        float gain_db = v0 + frac * (v1 - v0);
+        gain_rel_lin = __expf(gain_db * 0.23025850929f) * inv_gmax_lin;
+        """,
+        "s1528_lut_1d_to_linear_fp16",
+    )
+    return _s1528_lut_1d_to_linear_fp16_kernel
+
+
+def _evaluate_s1528_pattern_cp_lut_1d_to_linear(
     context: GpuS1528PatternContext,
     theta_deg: Any,
     inv_gmax_lin: float,
 ) -> Any:
     """S.1528 LUT evaluation returning relative linear gain in a single kernel."""
-    _ensure_s1528_gain_lut(context)
+    if getattr(context, "is_2d", False):
+        raise NotImplementedError(
+            "Asymmetric S.1528 Rec 1.4 context (lt_m != lr_m) routed "
+            "into the 1-D LUT fused evaluator; use the 2-D (theta, phi) "
+            "path via _evaluate_s1528_pattern_cp(theta, phi_deg=...) instead."
+        )
+    _ensure_s1528_gain_lut_1d(context)
     theta = _to_cupy_array(theta_deg, dtype=cp.float32)
-    kernel = _get_s1528_lut_to_linear_kernel()
+    kernel = (
+        _get_s1528_lut_1d_to_linear_fp16_kernel()
+        if context.d_gain_lut.dtype == cp.float16
+        else _get_s1528_lut_1d_to_linear_kernel()
+    )
     return kernel(
         theta,
         context.d_gain_lut,
@@ -9997,11 +11725,42 @@ def _get_ras_pattern_to_linear_kernel():
 
 
 def _evaluate_ras_pattern_cp_to_linear(
-    context: GpuRasPatternContext,
-    phi_deg: Any,
+    context: Any,
+    theta_deg: Any,
+    phi_deg: Any = None,
 ) -> Any:
-    """RAS pattern evaluation returning linear gain in a single kernel launch."""
-    phi_cp = _to_cupy_array(phi_deg, dtype=cp.float32)
+    """RAS pattern evaluation returning linear gain in a single kernel launch.
+
+    Dispatches by context type:
+      * ``GpuRasPatternContext`` (RA.1631) → existing fused kernel.
+      * ``GpuCustomPattern1DContext`` → custom-1D LUT eval in dB → exp.
+      * ``GpuCustomPattern2DContext`` → Custom-2D (θ, φ) LUT eval, where
+        φ is the rotation around the RAS boresight (callers derive it
+        from the telescope pointing + satellite direction geometry).
+        Raises :class:`ValueError` if ``phi_deg`` is omitted.
+
+    ``theta_deg`` is the former ``phi_deg`` parameter (renamed for
+    clarity — it is the angle between RAS boresight and the target).
+    """
+    if isinstance(context, GpuCustomPattern1DContext):
+        # Absolute linear gain: fused kernel with inv_gmax_lin=1.0 gives
+        # ``10^(gain_db / 10)`` in a single launch, avoiding the extra
+        # ``cp.power(10, g/10)`` round-trip.
+        return _evaluate_custom_1d_pattern_cp_to_linear(
+            context, theta_deg, inv_gmax_lin=1.0,
+        )
+    if isinstance(context, GpuCustomPattern2DContext):
+        if phi_deg is None:
+            raise ValueError(
+                "Custom-2D RAS pattern requires a ``phi_deg`` argument — "
+                "the rotation around the RAS boresight. Callers must "
+                "derive it from the telescope pointing and satellite "
+                "direction before invoking the RAS evaluator."
+            )
+        return _evaluate_custom_2d_from_theta_phi_to_linear(
+            context, theta_deg, phi_deg, inv_gmax_lin=1.0,
+        )
+    phi_cp = _to_cupy_array(theta_deg, dtype=cp.float32)
     d_wlen = np.float32(context.diameter_m / context.wavelength_m)
     gmax = np.float32(10.0 * np.log10(context.eta_a_dimless * (np.pi * d_wlen) ** 2))
     g1 = np.float32(-1.0 + 15.0 * np.log10(d_wlen))
@@ -10055,11 +11814,11 @@ _tx_trig_geometry_kernel = None
 
 
 def _get_tx_trig_geometry_kernel():
-    """Fused kernel: compute beam sin/cos(β) and cos_gamma_tx from sat az/el
-    and beam α/β in a single kernel launch.
+    """Fused kernel: compute beam and satellite-frame trig plus cos_gamma_tx
+    from sat az/el and beam α/β in a single kernel launch.
 
-    Replaces ~12 separate CuPy operations (remainder, deg2rad, sin×4, cos×4,
-    where×2, multiply, clip) with one ElementwiseKernel.
+    Replaces ~14 separate CuPy operations (remainder, deg2rad, sin×4, cos×4,
+    sin, cos, where×2, multiply, clip) with one ElementwiseKernel.
 
     Inputs (broadcast from (T, S) sat angles and (T, S, K) beam angles):
       sat_az_deg  — satellite azimuth in degrees (T, S)
@@ -10069,9 +11828,20 @@ def _get_tx_trig_geometry_kernel():
       beam_idx    — beam validity flag (≥ 0 valid, -2 boresight)
 
     Outputs:
-      beam_sinb     — sin(beam_beta) for geometry stage
-      beam_cosb     — cos(beam_beta) for geometry stage
+      beam_sinb     — sin(beam_beta)
+      beam_cosb     — cos(beam_beta)
       cos_gamma_tx  — cosine of TX off-axis angle (clamped to [-1, 1])
+      sinb0         — sin(satellite elevation β₀)
+      cosb0         — cos(satellite elevation β₀)
+      sin_da        — sin(α₀ − α_beam), Δα in radians
+      cos_da        — cos(α₀ − α_beam)
+
+    The last four outputs let downstream consumers (asymmetric S.1528
+    Rec 1.4, future custom 2-D patterns) derive the azimuth around the
+    beam boresight without redoing the satellite-frame trig. Invalid
+    slots still produce deterministic values but the meaning of φ for
+    invalid slots is undefined — callers must respect the valid_beam
+    mask when consuming these outputs.
     """
     global _tx_trig_geometry_kernel
     if _tx_trig_geometry_kernel is not None:
@@ -10080,7 +11850,8 @@ def _get_tx_trig_geometry_kernel():
         "float32 sat_az_deg, float32 sat_el_deg, "
         "float32 beam_alpha_rad, float32 beam_beta_rad, "
         "int32 beam_idx",
-        "float32 beam_sinb, float32 beam_cosb, float32 cos_gamma_tx",
+        "float32 beam_sinb, float32 beam_cosb, float32 cos_gamma_tx, "
+        "float32 sinb0, float32 cosb0, float32 sin_da, float32 cos_da",
         """
         const float d2r = 0.017453292519943295f;
         const float two_pi = 6.283185307179586f;
@@ -10093,24 +11864,24 @@ def _get_tx_trig_geometry_kernel():
         beam_sinb = sinf(bb);
         beam_cosb = cosf(bb);
 
+        /* Satellite-frame trig — always computed so asymmetric consumers
+         * have β₀ and Δα trig without a second kernel. */
+        float a0 = fmodf(sat_az_deg * d2r, two_pi);
+        if (a0 < 0.0f) a0 += two_pi;
+        float b0 = sat_el_deg * d2r;
+        sinb0 = sinf(b0);
+        cosb0 = cosf(b0);
+        float ba = valid ? beam_alpha_rad : 0.0f;
+        float da = a0 - ba;
+        sin_da = sinf(da);
+        cos_da = cosf(da);
+
         if (boresight) {
             cos_gamma_tx = 1.0f;
         } else if (!valid) {
             cos_gamma_tx = -1.0f;
         } else {
-            /* Satellite angles → radians */
-            float a0 = fmodf(sat_az_deg * d2r, two_pi);
-            if (a0 < 0.0f) a0 += two_pi;
-            float b0 = sat_el_deg * d2r;
-            float sb0 = sinf(b0);
-            float cb0 = cosf(b0);
-
-            /* Beam alpha (already in radians) */
-            float ba = valid ? beam_alpha_rad : 0.0f;
-            float cos_da = cosf(a0 - ba);
-
-            float cg = cb0 * beam_cosb + sb0 * beam_sinb * cos_da;
-            /* Clamp to [-1, 1] */
+            float cg = cosb0 * beam_cosb + sinb0 * beam_sinb * cos_da;
             if (cg > 1.0f) cg = 1.0f;
             if (cg < -1.0f) cg = -1.0f;
             cos_gamma_tx = cg;
@@ -10167,6 +11938,203 @@ def _get_beam_geometry_kernel():
         "beam_geometry_fused",
     )
     return _beam_geometry_kernel
+
+
+_4d_trig_kernel = None
+
+
+def _get_4d_trig_kernel():
+    """Fused trig kernel for the 4-D boresight-avoidance power path.
+
+    Computes sin(β), cos(β), Δα, sin(Δα), cos(Δα), and cos(γ_tx) from
+    pre-gathered flat active-index arrays in a single launch.
+
+    Replaces 9 separate CuPy operations: sin, cos, subtract, sin, cos,
+    multiply×3, add, clip → 1 ElementwiseKernel.
+
+    The 3-D equivalent is ``_get_tx_trig_geometry_kernel()`` which takes
+    raw sat az/el in degrees. This kernel takes α₀, sinβ₀, cosβ₀ in
+    radians (already gathered per active index in the 4-D path).
+    """
+    global _4d_trig_kernel
+    if _4d_trig_kernel is not None:
+        return _4d_trig_kernel
+    _4d_trig_kernel = cp.ElementwiseKernel(
+        "float32 active_alpha, float32 active_beta, "
+        "float32 alpha0, float32 sinb0, float32 cosb0",
+        "float32 beam_sinb, float32 beam_cosb, "
+        "float32 cos_gamma_tx, float32 sin_da, float32 cos_da",
+        r"""
+        beam_sinb = sinf(active_beta);
+        beam_cosb = cosf(active_beta);
+
+        float da = alpha0 - active_alpha;
+        sin_da = sinf(da);
+        cos_da = cosf(da);
+
+        float cg = cosb0 * beam_cosb + sinb0 * beam_sinb * cos_da;
+        if (cg > 1.0f) cg = 1.0f;
+        if (cg < -1.0f) cg = -1.0f;
+        cos_gamma_tx = cg;
+        """,
+        "trig_4d_fused",
+    )
+    return _4d_trig_kernel
+
+
+_4d_eirp_kernel = None
+
+
+def _get_4d_eirp_kernel():
+    """Fused EIRP kernel for the 4-D boresight-avoidance power path.
+
+    Computes d_target, e_target_deg, valid_geom, and the boresight
+    EIRP (for both co-frequency and geometry-based modes) from orbit
+    radius, beam sin/cos(β), range, atmosphere factors, and the target
+    PFD in a single launch.
+
+    Replaces ~15 separate CuPy operations in the geometry + EIRP
+    block: multiply×2, subtract, compare×2, and, where+sqrt, clip,
+    divide, multiply, arccos, where+maximum, where, multiply×3, divide,
+    where → 1 ElementwiseKernel.
+
+    The atmosphere LUT lookup for target elevation must still be done
+    AFTER this kernel (as a separate call to ``_lookup_atmosphere_lut_cp``),
+    and the atmospheric correction is applied by dividing the geometry
+    EIRP by atm_target. This kernel outputs the raw (un-atm-corrected)
+    geometry EIRP for non-boresight slots.
+    """
+    global _4d_eirp_kernel
+    if _4d_eirp_kernel is not None:
+        return _4d_eirp_kernel
+    _4d_eirp_kernel = cp.ElementwiseKernel(
+        "float32 beam_sinb, float32 beam_cosb, "
+        "float32 orbit_r, float32 earth_r, "
+        "float32 atm_elev_min_deg, "
+        "float32 range_m, float32 atm_ras, "
+        "float32 target_pfd_4pi, "
+        "bool use_ras_alt_co, bool is_boresight_slot",
+        "float32 d_target, float32 e_target_deg, bool valid_geom, "
+        "float32 boresight_eirp",
+        r"""
+        float term = orbit_r * beam_cosb;
+        float disc = term * term - (orbit_r * orbit_r - earth_r * earth_r);
+        bool hit = (disc >= 0.0f);
+        bool cos_pos = (beam_cosb > 0.0f);
+        bool vg = hit && cos_pos;
+        valid_geom = vg;
+
+        float dt_m = 0.0f;
+        float et_deg = 0.0f;
+        if (vg) {
+            dt_m = term - sqrtf(disc);
+            float cos_e = (orbit_r / earth_r) * beam_sinb;
+            if (cos_e < 0.0f) cos_e = 0.0f;
+            if (cos_e > 1.0f) cos_e = 1.0f;
+            et_deg = acosf(cos_e) * 57.29577951308232f;
+            if (et_deg < atm_elev_min_deg) et_deg = atm_elev_min_deg;
+        }
+        d_target = dt_m;
+        e_target_deg = et_deg;
+
+        float eirp;
+        if (is_boresight_slot) {
+            float atm_co = use_ras_alt_co ? atm_ras : 1.0f;
+            eirp = target_pfd_4pi * range_m * range_m / atm_co;
+        } else if (vg) {
+            /* Raw geometry EIRP (atm_target applied after LUT lookup) */
+            eirp = target_pfd_4pi * dt_m * dt_m;
+        } else {
+            eirp = 0.0f;
+        }
+        boresight_eirp = eirp;
+        """,
+        "eirp_4d_fused",
+    )
+    return _4d_eirp_kernel
+
+
+_beam_geometry_fp64_kernel = None
+
+
+def _get_beam_geometry_fp64_kernel():
+    """Fused kernel: beam→ground geometry for fp64 power dtype.
+
+    Same computation as ``_get_beam_geometry_kernel()`` but in float64.
+    Computes d_target, e_target_deg, valid_geom from orbit radius,
+    beam sin/cos(β), beam validity, boresight mask, and Earth radius.
+
+    Replaces ~12 separate CuPy operations in the fp64 fallback path.
+    """
+    global _beam_geometry_fp64_kernel
+    if _beam_geometry_fp64_kernel is not None:
+        return _beam_geometry_fp64_kernel
+    _beam_geometry_fp64_kernel = cp.ElementwiseKernel(
+        "float64 beam_sinb, float64 beam_cosb, "
+        "float64 orbit_r, float64 earth_r, "
+        "bool valid_beam, bool mask_bore, float64 atm_elev_min_deg",
+        "float64 d_target, float64 e_target_deg, bool valid_geom",
+        r"""
+        double term = orbit_r * beam_cosb;
+        double disc = term * term - (orbit_r * orbit_r - earth_r * earth_r);
+        bool hit = (disc >= 0.0);
+        bool cos_pos = (beam_cosb > 0.0);
+        bool vg = valid_beam && (!mask_bore) && hit && cos_pos;
+        valid_geom = vg;
+
+        if (vg) {
+            d_target = term - sqrt(disc);
+            double cos_e = (orbit_r / earth_r) * beam_sinb;
+            if (cos_e < 0.0) cos_e = 0.0;
+            if (cos_e > 1.0) cos_e = 1.0;
+            double e_deg = acos(cos_e) * 57.29577951308232;
+            if (e_deg < atm_elev_min_deg) e_deg = atm_elev_min_deg;
+            e_target_deg = e_deg;
+        } else {
+            d_target = 0.0;
+            e_target_deg = 0.0;
+        }
+        """,
+        "beam_geometry_fp64_fused",
+    )
+    return _beam_geometry_fp64_kernel
+
+
+_rx_angular_distance_only_kernel = None
+
+
+def _get_rx_angular_distance_only_kernel():
+    """Fused kernel: compute angular distance γ (deg) between telescope
+    pointing and satellite direction.  Does NOT evaluate any pattern —
+    just the trig.  Used as the first step for Custom RAS patterns
+    where the pattern evaluation is a separate kernel.
+
+    Replaces ~14 sequential CuPy operations (sin×4, cos×4, multiply×3,
+    add, clip, arccos, multiply) with one ElementwiseKernel."""
+    global _rx_angular_distance_only_kernel
+    if _rx_angular_distance_only_kernel is not None:
+        return _rx_angular_distance_only_kernel
+    _rx_angular_distance_only_kernel = cp.ElementwiseKernel(
+        "float32 tel_az_deg, float32 tel_el_deg, "
+        "float32 sat_az_deg, float32 sat_el_deg",
+        "float32 gamma_deg",
+        r"""
+        const float d2r = 0.017453292519943295f;
+        const float r2d = 57.29577951308232f;
+        float t_az = tel_az_deg * d2r;
+        float t_el = tel_el_deg * d2r;
+        float s_az = sat_az_deg * d2r;
+        float s_el = sat_el_deg * d2r;
+        float cos_daz = cosf(t_az) * cosf(s_az) + sinf(t_az) * sinf(s_az);
+        float cos_gamma = sinf(t_el) * sinf(s_el)
+                        + cosf(t_el) * cosf(s_el) * cos_daz;
+        if (cos_gamma > 1.0f) cos_gamma = 1.0f;
+        if (cos_gamma < -1.0f) cos_gamma = -1.0f;
+        gamma_deg = acosf(cos_gamma) * r2d;
+        """,
+        "rx_angular_distance_only_fused",
+    )
+    return _rx_angular_distance_only_kernel
 
 
 _rx_angular_distance_ras_lin_kernel = None
@@ -10323,7 +12291,7 @@ def _evaluate_m2101_pattern_cp(
 #  M.2101 2-D element pattern LUT
 # ---------------------------------------------------------------------------
 
-_M2101_LUT_STEP_DEG = 0.5
+_M2101_LUT_STEP_DEG = 0.1
 _M2101_LUT_AZ_RANGE = (-180.0, 180.0)
 _M2101_LUT_EL_RANGE = (-90.0, 90.0)
 
@@ -10360,7 +12328,19 @@ def _ensure_m2101_element_lut_2d(context: GpuM2101PatternContext) -> None:
         cp.float32(context.theta_3db_deg),
         cp.float32(context.k),
     )
-    context.d_element_lut = lut_flat.reshape(n_el, n_az)
+    element_lut_cp = lut_flat.reshape(n_el, n_az)
+    # Downcast the LUT to fp16 when the session's pattern stage runs at
+    # fp16.  Halves the persistent LUT memory (26 MB → 13 MB on the
+    # standard 0.1° grid) with essentially no extra eval cost — the
+    # fp16 kernel loads ``__half`` and promotes to fp32 inside the
+    # bilinear interpolation, same trig / AF / exp chain as the fp32
+    # path.  For all other precision profiles the LUT stays fp32.
+    _session_pattern_dtype = getattr(
+        getattr(context, "session", None), "pattern_dtype", None,
+    )
+    if _session_pattern_dtype is not None and np.dtype(_session_pattern_dtype) == np.dtype(np.float16):
+        element_lut_cp = element_lut_cp.astype(cp.float16, copy=False)
+    context.d_element_lut = element_lut_cp
     context.element_lut_az_step_deg = step
     context.element_lut_el_step_deg = step
     context.element_lut_az_min_deg = az_min
@@ -10459,10 +12439,20 @@ def _get_m2101_lut_composite_kernel():
 
 
 _m2101_lut_to_linear_kernel = None
+_m2101_lut_to_linear_fp16_kernel = None
 
 
 def _get_m2101_lut_to_linear_kernel():
-    """Fused kernel: 2-D element LUT + analytical AF + dB→linear in one launch."""
+    """Fused kernel: 2-D element LUT + analytical AF + dB→linear in one launch.
+
+    Algebraic simplification: the previous version computed
+    ``AF_db = 10·log10(af_lin)`` then did ``10^((A_E + AF_db) / 10)``,
+    which is algebraically equal to ``10^(A_E/10) · af_lin``.  Dropping
+    the log/exp round-trip on the array-factor side saves one ``log10f``
+    and one branch per element; the element-pattern dB→linear step still
+    needs the ``__expf`` call.  The ``af_lin`` floor is now a simple
+    clamp that replaces the dB-floor branch.
+    """
     global _m2101_lut_to_linear_kernel
     if _m2101_lut_to_linear_kernel is not None:
         return _m2101_lut_to_linear_kernel
@@ -10514,15 +12504,90 @@ def _get_m2101_lut_to_linear_kernel():
         float den_v = (float)n_v * sinf(pi_d_v_dv);
         float af_v = (fabsf(den_v) > 1.0e-10f) ? (num_v / den_v) : 1.0f;
         float af_lin = af_h * af_h * af_v * af_v * (float)(n_h * n_v);
-        float AF_db = (af_lin > 1.0e-20f) ? 10.0f * log10f(af_lin) : -200.0f;
+        if (af_lin < 1.0e-20f) af_lin = 1.0e-20f;
 
-        float gain_db = A_E + AF_db;
-        /* 10^(x/10) = exp(x * ln(10)/10) */
-        gain_rel_lin = __expf(gain_db * 0.23025850929f) * inv_gmax_lin;
+        /* dB→linear on A_E only, then multiply by af_lin.  The old path
+         * built AF_db = 10·log10(af_lin) and then 10^((A_E + AF_db)/10);
+         * algebraically equal to this cheaper form. */
+        float A_E_lin = __expf(A_E * 0.23025850929f);
+        gain_rel_lin = A_E_lin * af_lin * inv_gmax_lin;
         """,
         "m2101_lut_to_linear",
     )
     return _m2101_lut_to_linear_kernel
+
+
+def _get_m2101_lut_to_linear_fp16_kernel():
+    """fp16-LUT variant of :func:`_get_m2101_lut_to_linear_kernel`.
+
+    Identical body + same 9-op bilinear + analytical AF + dB→linear +
+    inv_gmax chain, only the ``raw`` LUT input is ``float16``.  The 4
+    corner loads cast ``__half → float`` implicitly before the bilinear
+    weights multiply.  Halves the persistent M.2101 element-LUT memory
+    (26 MB fp32 → 13 MB fp16) when the session runs at pattern_dtype
+    fp16; no extra intermediate allocation or promotion kernels needed.
+    The ULP-level difference from fp16 storage is well inside the
+    precision already granted by the ``pattern_dtype=float16`` profile.
+    """
+    global _m2101_lut_to_linear_fp16_kernel
+    if _m2101_lut_to_linear_fp16_kernel is not None:
+        return _m2101_lut_to_linear_fp16_kernel
+    _m2101_lut_to_linear_fp16_kernel = cp.ElementwiseKernel(
+        "float32 az_deg, float32 el_deg, float32 az_i_deg, float32 el_i_deg, "
+        "raw float16 lut, float32 az_min, float32 el_min, "
+        "float32 inv_az_step, float32 inv_el_step, "
+        "int32 n_az, int32 n_el, "
+        "float32 d_h, float32 d_v, int32 n_h, int32 n_v, "
+        "float32 inv_gmax_lin",
+        "float32 gain_rel_lin",
+        """
+        float az_f = (az_deg - az_min) * inv_az_step;
+        float el_f = (el_deg - el_min) * inv_el_step;
+        int az0 = __float2int_rd(az_f);
+        int el0 = __float2int_rd(el_f);
+        if (az0 < 0) az0 = 0;
+        if (el0 < 0) el0 = 0;
+        int az1 = az0 + 1;
+        int el1 = el0 + 1;
+        if (az1 >= n_az) { az1 = n_az - 1; az0 = az1 > 0 ? az1 - 1 : 0; }
+        if (el1 >= n_el) { el1 = n_el - 1; el0 = el1 > 0 ? el1 - 1 : 0; }
+        float fa = az_f - (float)az0;
+        float fe = el_f - (float)el0;
+        /* Cast fp16 → fp32 at read; bilinear done in fp32 to avoid
+         * accumulating half-precision error across 4 weighted taps. */
+        float v00 = (float)lut[el0 * n_az + az0];
+        float v10 = (float)lut[el0 * n_az + az1];
+        float v01 = (float)lut[el1 * n_az + az0];
+        float v11 = (float)lut[el1 * n_az + az1];
+        float A_E = v00 * (1.0f - fa) * (1.0f - fe)
+                  + v10 * fa * (1.0f - fe)
+                  + v01 * (1.0f - fa) * fe
+                  + v11 * fa * fe;
+
+        const float d2r = 0.017453292519943295f;
+        float az = az_deg * d2r;
+        float el = el_deg * d2r;
+        float az_i = az_i_deg * d2r;
+        float el_i = el_i_deg * d2r;
+        float du = sinf(az) * cosf(el) - sinf(az_i) * cosf(el_i);
+        float dv = sinf(el) - sinf(el_i);
+        float pi_d_h_du = 3.14159265f * d_h * du;
+        float num_h = sinf((float)n_h * pi_d_h_du);
+        float den_h = (float)n_h * sinf(pi_d_h_du);
+        float af_h = (fabsf(den_h) > 1.0e-10f) ? (num_h / den_h) : 1.0f;
+        float pi_d_v_dv = 3.14159265f * d_v * dv;
+        float num_v = sinf((float)n_v * pi_d_v_dv);
+        float den_v = (float)n_v * sinf(pi_d_v_dv);
+        float af_v = (fabsf(den_v) > 1.0e-10f) ? (num_v / den_v) : 1.0f;
+        float af_lin = af_h * af_h * af_v * af_v * (float)(n_h * n_v);
+        if (af_lin < 1.0e-20f) af_lin = 1.0e-20f;
+
+        float A_E_lin = __expf(A_E * 0.23025850929f);
+        gain_rel_lin = A_E_lin * af_lin * inv_gmax_lin;
+        """,
+        "m2101_lut_to_linear_fp16",
+    )
+    return _m2101_lut_to_linear_fp16_kernel
 
 
 def _evaluate_m2101_pattern_cp_lut(
@@ -10562,9 +12627,18 @@ def _evaluate_m2101_pattern_cp_lut_to_linear(
     el_i_deg: Any,
     inv_gmax_lin: float,
 ) -> Any:
-    """M.2101 fused LUT evaluation returning relative linear gain."""
+    """M.2101 fused LUT evaluation returning relative linear gain.
+
+    Dispatches to the fp16-LUT kernel when the element LUT is stored as
+    fp16 (mixed-precision profiles) — same fused bilinear + AF + dB→linear
+    body, just with a 13 MB vs 26 MB persistent LUT footprint.
+    """
     _ensure_m2101_element_lut_2d(context)
-    kernel = _get_m2101_lut_to_linear_kernel()
+    kernel = (
+        _get_m2101_lut_to_linear_fp16_kernel()
+        if context.d_element_lut.dtype == cp.float16
+        else _get_m2101_lut_to_linear_kernel()
+    )
     return kernel(
         _to_cupy_array(az_deg, dtype=cp.float32),
         _to_cupy_array(el_deg, dtype=cp.float32),
@@ -10683,12 +12757,112 @@ def _get_ras_pattern_kernel():
     return _ras_pattern_kernel
 
 
-def _evaluate_ras_pattern_cp(
-    context: GpuRasPatternContext,
-    phi_deg: Any,
+_ras_boresight_phi_kernel = None
+
+
+def _get_ras_boresight_phi_kernel():
+    """Fused kernel: compute φ angle (deg) of a target about the RAS
+    boresight in one launch.  Replaces ~10 separate CuPy operations
+    (sin×3, cos×3, multiply×3, subtract, arctan2, multiply)."""
+    global _ras_boresight_phi_kernel
+    if _ras_boresight_phi_kernel is not None:
+        return _ras_boresight_phi_kernel
+    _ras_boresight_phi_kernel = cp.ElementwiseKernel(
+        "float32 tel_az_rad, float32 tel_el_rad, "
+        "float32 sat_az_rad, float32 sat_el_rad",
+        "float32 phi_deg",
+        r"""
+        float daz = sat_az_rad - tel_az_rad;
+        float cos_sat_el = cosf(sat_el_rad);
+        float u = cos_sat_el * sinf(daz);
+        float v = cos_sat_el * sinf(tel_el_rad) * cosf(daz)
+                - sinf(sat_el_rad) * cosf(tel_el_rad);
+        phi_deg = atan2f(v, u) * 57.29577951308232f;
+        """,
+        "ras_boresight_phi_fused",
+    )
+    return _ras_boresight_phi_kernel
+
+
+def _ras_boresight_frame_phi_deg(
+    tel_az_rad: Any,
+    tel_el_rad: Any,
+    sat_az_rad: Any,
+    sat_el_rad: Any,
 ) -> Any:
+    """Return the φ angle (deg) of a target about the RAS boresight.
+
+    ``φ = 0°`` is defined as the horizontal-right direction when
+    looking down the telescope boresight — i.e. the unit vector
+    ``ê₁ = (cos(az_tel), −sin(az_tel), 0)``. ``φ`` increases
+    counter-clockwise (right-handed) around the boresight, with
+    ``ê₂ = p̂ × ê₁`` the "up-in-boresight-frame" axis pointing toward
+    the zenith-side of the pointing.
+
+    Consumed only by Custom-2D RAS patterns — derivation is
+    intentionally isolated from the hot-path ``cos γ`` computation so
+    the 1-D fast-paths incur zero extra trig. All inputs are CuPy
+    arrays of matching shape (broadcasts naturally). The derivation
+    uses the closed-form simplification:
+
+    .. math::
+
+        u &= \\cos(e_s) \\sin(a_s - a_t) \\\\
+        v &= \\cos(e_s) \\sin(e_t) \\cos(a_s - a_t) - \\sin(e_s) \\cos(e_t) \\\\
+        \\varphi &= \\operatorname{atan2}(v, u)
+    """
+    # Use fused kernel for fp32 inputs (the common GPU path).
+    _tel_az = _to_cupy_array(tel_az_rad)
+    _tel_el = _to_cupy_array(tel_el_rad)
+    _sat_az = _to_cupy_array(sat_az_rad)
+    _sat_el = _to_cupy_array(sat_el_rad)
+    if _tel_az.dtype == cp.float32:
+        return _get_ras_boresight_phi_kernel()(
+            _tel_az, _tel_el, _sat_az, _sat_el,
+        )
+    # Fallback for non-fp32 dtypes.
+    daz = _sat_az - _tel_az
+    sin_daz = cp.sin(daz)
+    cos_daz = cp.cos(daz)
+    sin_tel_el = cp.sin(_tel_el)
+    cos_tel_el = cp.cos(_tel_el)
+    sin_sat_el = cp.sin(_sat_el)
+    cos_sat_el = cp.cos(_sat_el)
+    u = cos_sat_el * sin_daz
+    v = cos_sat_el * sin_tel_el * cos_daz - sin_sat_el * cos_tel_el
+    return cp.arctan2(v, u) * cp.float32(180.0 / np.pi)
+
+
+def _evaluate_ras_pattern_cp(
+    context: Any,
+    theta_deg: Any,
+    phi_deg: Any = None,
+) -> Any:
+    """Evaluate the RAS antenna pattern in dBi.
+
+    ``theta_deg`` is the angle between the telescope boresight and
+    the target (previously named ``phi_deg``). ``phi_deg`` is the
+    rotation around the boresight and is only consumed by Custom-2D
+    patterns — other context types ignore it.
+
+    Dispatches by context type — RA.1631 takes the existing fused
+    kernel, user-supplied custom patterns take the LUT-interp path
+    (same context types as the satellite side, so a user can load
+    the same file on either axis if desired).
+    """
+    if isinstance(context, GpuCustomPattern1DContext):
+        return _evaluate_custom_1d_pattern_cp(context, theta_deg)
+    if isinstance(context, GpuCustomPattern2DContext):
+        if phi_deg is None:
+            raise ValueError(
+                "Custom-2D RAS pattern requires a ``phi_deg`` argument — "
+                "the rotation around the RAS boresight. Callers must "
+                "derive it from the telescope pointing and satellite "
+                "direction before invoking the RAS evaluator."
+            )
+        return _evaluate_custom_2d_from_theta_phi(context, theta_deg, phi_deg)
     # Use fused single-kernel evaluation instead of 6 separate cp.where calls
-    phi_cp = _to_cupy_array(phi_deg, dtype=cp.float32)
+    phi_cp = _to_cupy_array(theta_deg, dtype=cp.float32)
     d_wlen = np.float32(context.diameter_m / context.wavelength_m)
     gmax = np.float32(10.0 * np.log10(context.eta_a_dimless * (np.pi * d_wlen) ** 2))
     g1 = np.float32(-1.0 + 15.0 * np.log10(d_wlen))
@@ -10744,22 +12918,26 @@ def _evaluate_s1528_pattern_cp_analytical(
     return gain.astype(cp.float32, copy=False)
 
 
-# Module-level pattern evaluation mode.  Set to "analytical" to bypass
-# the LUT fast path and use the exact Bessel/product formulation.
-_s1528_pattern_eval_mode = "lut"
+# Module-level pattern evaluation mode.  Controls whether the TX
+# antenna pattern is evaluated via a precomputed LUT (fast, default)
+# or the exact analytical formula (Bessel/product for S.1528,
+# composite element+array for M.2101).  Applies to all analytical
+# pattern types — S.1528 Rec 1.2/1.4, M.2101.  RA.1631 is always
+# analytical regardless of this flag.
+_pattern_eval_mode = "lut"
 
 
 def set_pattern_eval_mode(mode: str) -> None:
-    """Set the S.1528 pattern evaluation mode ('lut' or 'analytical')."""
-    global _s1528_pattern_eval_mode
+    """Set the antenna pattern evaluation mode ('lut' or 'analytical')."""
+    global _pattern_eval_mode
     if mode not in ("lut", "analytical"):
         raise ValueError(f"pattern_eval_mode must be 'lut' or 'analytical'; got {mode!r}.")
-    _s1528_pattern_eval_mode = str(mode)
+    _pattern_eval_mode = str(mode)
 
 
 def get_pattern_eval_mode() -> str:
-    """Return the current S.1528 pattern evaluation mode."""
-    return _s1528_pattern_eval_mode
+    """Return the current antenna pattern evaluation mode."""
+    return _pattern_eval_mode
 
 
 def _evaluate_isotropic_pattern_cp(
@@ -10778,6 +12956,1343 @@ def _evaluate_isotropic_pattern_cp(
     return cp.zeros_like(theta_cp)
 
 
+# ---------------------------------------------------------------------------
+# Custom 1-D (axisymmetric) pattern evaluation
+# ---------------------------------------------------------------------------
+
+# Regular-grid resolution used when resampling a user-supplied
+# CustomAntennaPattern onto the device LUT. 0.001° × 180° → 180001
+# entries × float32 ≈ 720 KB per context — fine for any realistic
+# user-authored pattern (real-world LUTs are coarser than 0.001°), and
+# much cheaper than the 0.0001° that S.1528 Rec 1.2 uses internally for
+# its analytical narrow-beam envelope.
+_CUSTOM_1D_LUT_STEP_DEG: float = 0.001
+_CUSTOM_1D_LUT_MAX_DEG: float = 180.0
+
+
+# ---------------------------------------------------------------------------
+# Custom 2-D pattern evaluation — generic bilinear LUT with per-axis
+# wrap-or-clip policy.
+# ---------------------------------------------------------------------------
+
+# Default resample resolutions, chosen to fit comfortably under any
+# realistic user-authored source density while staying under a few
+# tens of MB per context at 16-bit / 32-bit storage.
+_CUSTOM_2D_AZEL_AZ_STEP_DEG: float = 0.1      # 3601 samples over [-180, 180]
+_CUSTOM_2D_AZEL_EL_STEP_DEG: float = 0.1      # 1801 samples over [-90, 90]
+_CUSTOM_2D_THETAPHI_THETA_STEP_DEG: float = 0.05  # 3601 samples over [0, 180]
+_CUSTOM_2D_THETAPHI_PHI_STEP_DEG: float = 0.1     # 3601 samples over [-180, 180]
+
+# Safety cap on LUT element count. 16M float32 = 64 MB — covers the
+# Ultimate density tier (3601 × 3601 ≈ 13M for θ/φ, 3601 × 1801 ≈
+# 6.5M for az/el) while preventing pathologically fine grids from
+# blowing VRAM (e.g. 0.01° × 0.01° over full az/el = 648M elements).
+_CUSTOM_2D_MAX_LUT_ELEMENTS: int = 16_000_000
+
+
+# LRU budget for the session's custom-pattern context cache, expressed
+# per registered system. Each cached context pins a device-side LUT
+# (≈720 KB for a 1-D context at 0.001°, a few MB for a typical 2-D
+# context), and the mutation-friendly content-hash key means a user
+# interactively tweaking a pattern creates a new entry on every change.
+# Capping at 5 slots per system lets the last handful of edits stay
+# warm while preventing unbounded growth across long GUI sessions.
+# Multi-system aware: the effective cap is scaled by the number of
+# registered systems so each system's working set gets its own budget.
+_CUSTOM_PATTERN_CACHE_SLOTS_PER_SYSTEM: int = 5
+
+
+_custom_2d_lut_interp_kernel = None
+_custom_2d_lut_interp_fp16_kernel = None
+
+
+def _get_custom_2d_lut_interp_kernel():
+    """Return (and cache) the generic 2-D LUT bilinear-interp kernel.
+
+    Matches the bilinear layout used by the M.2101 element LUT and the
+    S.1528 2-D (θ, φ) LUT but without either pattern's axis symmetries —
+    the schema allows arbitrary user-defined gain surfaces so we cannot
+    fold into a canonical sub-quadrant. Per-axis wrap-vs-clip behaviour
+    is selected at call time by the ``axis*_wraps`` flags.
+    """
+    global _custom_2d_lut_interp_kernel
+    if _custom_2d_lut_interp_kernel is not None:
+        return _custom_2d_lut_interp_kernel
+    _custom_2d_lut_interp_kernel = cp.ElementwiseKernel(
+        "float32 a0, float32 a1, raw float32 lut, "
+        "float32 a0_min, float32 a0_range, float32 a0_inv_step, "
+        "int32 a0_n, int32 a0_wraps, "
+        "float32 a1_min, float32 a1_range, float32 a1_inv_step, "
+        "int32 a1_n, int32 a1_wraps",
+        "float32 gain_db",
+        """
+        /* Axis 0 wrap-or-clip. For wrap mode we fold ``x - min`` into
+         * ``[0, range)`` via floorf; for clip we saturate to the grid
+         * endpoints. ``range`` is ``(n-1) * step``, so after folding
+         * the query always lies in the half-open interval covered by
+         * cells ``[0 .. n-2]``. */
+        float a0q = a0;
+        if (a0_wraps != 0) {
+            float rel = a0q - a0_min;
+            rel = rel - floorf(rel / a0_range) * a0_range;
+            if (rel < 0.0f) rel += a0_range;
+            if (rel >= a0_range) rel -= a0_range;
+            a0q = a0_min + rel;
+        } else {
+            float a0_max = a0_min + a0_range;
+            if (a0q < a0_min) a0q = a0_min;
+            if (a0q > a0_max) a0q = a0_max;
+        }
+
+        float a1q = a1;
+        if (a1_wraps != 0) {
+            float rel = a1q - a1_min;
+            rel = rel - floorf(rel / a1_range) * a1_range;
+            if (rel < 0.0f) rel += a1_range;
+            if (rel >= a1_range) rel -= a1_range;
+            a1q = a1_min + rel;
+        } else {
+            float a1_max = a1_min + a1_range;
+            if (a1q < a1_min) a1q = a1_min;
+            if (a1q > a1_max) a1q = a1_max;
+        }
+
+        float fidx0 = (a0q - a0_min) * a0_inv_step;
+        float fidx1 = (a1q - a1_min) * a1_inv_step;
+        int i0 = __float2int_rd(fidx0);
+        int j0 = __float2int_rd(fidx1);
+        if (i0 < 0) i0 = 0;
+        if (j0 < 0) j0 = 0;
+        if (i0 > a0_n - 2) i0 = a0_n - 2;
+        if (j0 > a1_n - 2) j0 = a1_n - 2;
+        int i1 = i0 + 1;
+        int j1 = j0 + 1;
+        float f0 = fidx0 - (float)i0;
+        float f1 = fidx1 - (float)j0;
+        if (f0 < 0.0f) f0 = 0.0f;
+        if (f0 > 1.0f) f0 = 1.0f;
+        if (f1 < 0.0f) f1 = 0.0f;
+        if (f1 > 1.0f) f1 = 1.0f;
+
+        float v00 = lut[i0 * a1_n + j0];
+        float v10 = lut[i1 * a1_n + j0];
+        float v01 = lut[i0 * a1_n + j1];
+        float v11 = lut[i1 * a1_n + j1];
+        gain_db = v00 * (1.0f - f0) * (1.0f - f1)
+                + v10 * f0 * (1.0f - f1)
+                + v01 * (1.0f - f0) * f1
+                + v11 * f0 * f1;
+        """,
+        "custom_2d_lut_interp",
+    )
+    return _custom_2d_lut_interp_kernel
+
+
+def _get_custom_2d_lut_interp_fp16_kernel():
+    """fp16-LUT variant of :func:`_get_custom_2d_lut_interp_kernel`.
+
+    Same wrap-or-clip + bilinear body, with the ``raw`` LUT input now
+    ``float16``. Halves the persistent Custom-2D LUT memory (typical
+    user pattern ≈ 3-13 MB fp32 → 1.5-6.5 MB fp16; capped at 32 MB
+    fp16 under the 16 M element safety cap) when the session runs
+    at ``pattern_dtype=float16``.
+    """
+    global _custom_2d_lut_interp_fp16_kernel
+    if _custom_2d_lut_interp_fp16_kernel is not None:
+        return _custom_2d_lut_interp_fp16_kernel
+    _custom_2d_lut_interp_fp16_kernel = cp.ElementwiseKernel(
+        "float32 a0, float32 a1, raw float16 lut, "
+        "float32 a0_min, float32 a0_range, float32 a0_inv_step, "
+        "int32 a0_n, int32 a0_wraps, "
+        "float32 a1_min, float32 a1_range, float32 a1_inv_step, "
+        "int32 a1_n, int32 a1_wraps",
+        "float32 gain_db",
+        """
+        float a0q = a0;
+        if (a0_wraps != 0) {
+            float rel = a0q - a0_min;
+            rel = rel - floorf(rel / a0_range) * a0_range;
+            if (rel < 0.0f) rel += a0_range;
+            if (rel >= a0_range) rel -= a0_range;
+            a0q = a0_min + rel;
+        } else {
+            float a0_max = a0_min + a0_range;
+            if (a0q < a0_min) a0q = a0_min;
+            if (a0q > a0_max) a0q = a0_max;
+        }
+
+        float a1q = a1;
+        if (a1_wraps != 0) {
+            float rel = a1q - a1_min;
+            rel = rel - floorf(rel / a1_range) * a1_range;
+            if (rel < 0.0f) rel += a1_range;
+            if (rel >= a1_range) rel -= a1_range;
+            a1q = a1_min + rel;
+        } else {
+            float a1_max = a1_min + a1_range;
+            if (a1q < a1_min) a1q = a1_min;
+            if (a1q > a1_max) a1q = a1_max;
+        }
+
+        float fidx0 = (a0q - a0_min) * a0_inv_step;
+        float fidx1 = (a1q - a1_min) * a1_inv_step;
+        int i0 = __float2int_rd(fidx0);
+        int j0 = __float2int_rd(fidx1);
+        if (i0 < 0) i0 = 0;
+        if (j0 < 0) j0 = 0;
+        if (i0 > a0_n - 2) i0 = a0_n - 2;
+        if (j0 > a1_n - 2) j0 = a1_n - 2;
+        int i1 = i0 + 1;
+        int j1 = j0 + 1;
+        float f0 = fidx0 - (float)i0;
+        float f1 = fidx1 - (float)j0;
+        if (f0 < 0.0f) f0 = 0.0f;
+        if (f0 > 1.0f) f0 = 1.0f;
+        if (f1 < 0.0f) f1 = 0.0f;
+        if (f1 > 1.0f) f1 = 1.0f;
+
+        float v00 = (float)lut[i0 * a1_n + j0];
+        float v10 = (float)lut[i1 * a1_n + j0];
+        float v01 = (float)lut[i0 * a1_n + j1];
+        float v11 = (float)lut[i1 * a1_n + j1];
+        gain_db = v00 * (1.0f - f0) * (1.0f - f1)
+                + v10 * f0 * (1.0f - f1)
+                + v01 * (1.0f - f0) * f1
+                + v11 * f0 * f1;
+        """,
+        "custom_2d_lut_interp_fp16",
+    )
+    return _custom_2d_lut_interp_fp16_kernel
+
+
+def _evaluate_custom_2d_pattern_cp(
+    context: GpuCustomPattern2DContext,
+    axis0_deg: Any,
+    axis1_deg: Any,
+) -> Any:
+    """Evaluate a user-supplied 2-D custom pattern on GPU via bilinear LUT.
+
+    The two input axes map to ``(az, el)`` when
+    ``context.grid_mode == "az_el"`` and to ``(θ, φ)`` when
+    ``grid_mode == "theta_phi"`` — matching the
+    :func:`scepter.custom_antenna.evaluate_pattern_2d` convention so
+    callers can switch between CPU and GPU paths with identical
+    argument semantics.
+    """
+    a0 = _to_cupy_array(axis0_deg, dtype=cp.float32)
+    a1 = _to_cupy_array(axis1_deg, dtype=cp.float32)
+    a0, a1 = cp.broadcast_arrays(a0, a1)
+    kernel = (
+        _get_custom_2d_lut_interp_fp16_kernel()
+        if context.d_gain_lut.dtype == cp.float16
+        else _get_custom_2d_lut_interp_kernel()
+    )
+    return kernel(
+        a0, a1,
+        context.d_gain_lut,
+        cp.float32(context.axis0_min_deg),
+        cp.float32(context.axis0_range_deg),
+        cp.float32(1.0 / context.axis0_step_deg),
+        np.int32(context.axis0_n),
+        np.int32(1 if context.axis0_wraps else 0),
+        cp.float32(context.axis1_min_deg),
+        cp.float32(context.axis1_range_deg),
+        cp.float32(1.0 / context.axis1_step_deg),
+        np.int32(context.axis1_n),
+        np.int32(1 if context.axis1_wraps else 0),
+    )
+
+
+_custom_2d_lut_to_linear_kernel = None
+_custom_2d_lut_to_linear_fp16_kernel = None
+
+
+def _get_custom_2d_lut_to_linear_kernel():
+    """Fused Custom-2D LUT bilinear + dB→linear + relative gain in one launch.
+
+    Matches the fused pattern used by S.1528 1-D / 2-D and M.2101 —
+    collapses the two-step ``LUT → dB → cp.power(10, g/10) * inv_gmax``
+    call chain into a single ElementwiseKernel.  Saves 1 ``log10f``,
+    1 branch, and 1-2 extra CuPy launches per evaluation.
+    """
+    global _custom_2d_lut_to_linear_kernel
+    if _custom_2d_lut_to_linear_kernel is not None:
+        return _custom_2d_lut_to_linear_kernel
+    _custom_2d_lut_to_linear_kernel = cp.ElementwiseKernel(
+        "float32 a0, float32 a1, raw float32 lut, "
+        "float32 a0_min, float32 a0_range, float32 a0_inv_step, "
+        "int32 a0_n, int32 a0_wraps, "
+        "float32 a1_min, float32 a1_range, float32 a1_inv_step, "
+        "int32 a1_n, int32 a1_wraps, "
+        "float32 inv_gmax_lin",
+        "float32 gain_rel_lin",
+        """
+        float a0q = a0;
+        if (a0_wraps != 0) {
+            float rel = a0q - a0_min;
+            rel = rel - floorf(rel / a0_range) * a0_range;
+            if (rel < 0.0f) rel += a0_range;
+            if (rel >= a0_range) rel -= a0_range;
+            a0q = a0_min + rel;
+        } else {
+            float a0_max = a0_min + a0_range;
+            if (a0q < a0_min) a0q = a0_min;
+            if (a0q > a0_max) a0q = a0_max;
+        }
+        float a1q = a1;
+        if (a1_wraps != 0) {
+            float rel = a1q - a1_min;
+            rel = rel - floorf(rel / a1_range) * a1_range;
+            if (rel < 0.0f) rel += a1_range;
+            if (rel >= a1_range) rel -= a1_range;
+            a1q = a1_min + rel;
+        } else {
+            float a1_max = a1_min + a1_range;
+            if (a1q < a1_min) a1q = a1_min;
+            if (a1q > a1_max) a1q = a1_max;
+        }
+        float fidx0 = (a0q - a0_min) * a0_inv_step;
+        float fidx1 = (a1q - a1_min) * a1_inv_step;
+        int i0 = __float2int_rd(fidx0);
+        int j0 = __float2int_rd(fidx1);
+        if (i0 < 0) i0 = 0;
+        if (j0 < 0) j0 = 0;
+        if (i0 > a0_n - 2) i0 = a0_n - 2;
+        if (j0 > a1_n - 2) j0 = a1_n - 2;
+        int i1 = i0 + 1;
+        int j1 = j0 + 1;
+        float f0 = fidx0 - (float)i0;
+        float f1 = fidx1 - (float)j0;
+        if (f0 < 0.0f) f0 = 0.0f;
+        if (f0 > 1.0f) f0 = 1.0f;
+        if (f1 < 0.0f) f1 = 0.0f;
+        if (f1 > 1.0f) f1 = 1.0f;
+        float v00 = lut[i0 * a1_n + j0];
+        float v10 = lut[i1 * a1_n + j0];
+        float v01 = lut[i0 * a1_n + j1];
+        float v11 = lut[i1 * a1_n + j1];
+        float gain_db = v00 * (1.0f - f0) * (1.0f - f1)
+                      + v10 * f0 * (1.0f - f1)
+                      + v01 * (1.0f - f0) * f1
+                      + v11 * f0 * f1;
+        /* 10^(x/10) = exp(x * ln(10)/10) */
+        gain_rel_lin = __expf(gain_db * 0.23025850929f) * inv_gmax_lin;
+        """,
+        "custom_2d_lut_to_linear",
+    )
+    return _custom_2d_lut_to_linear_kernel
+
+
+def _get_custom_2d_lut_to_linear_fp16_kernel():
+    """fp16-LUT variant of :func:`_get_custom_2d_lut_to_linear_kernel`.
+
+    Fused wrap-or-clip + bilinear + dB→linear + relative-gain chain
+    over a ``raw float16`` LUT.  Matches the S.1528 2-D fp16 path:
+    corner loads promote to fp32, interpolation and ``__expf`` stay
+    in fp32.
+    """
+    global _custom_2d_lut_to_linear_fp16_kernel
+    if _custom_2d_lut_to_linear_fp16_kernel is not None:
+        return _custom_2d_lut_to_linear_fp16_kernel
+    _custom_2d_lut_to_linear_fp16_kernel = cp.ElementwiseKernel(
+        "float32 a0, float32 a1, raw float16 lut, "
+        "float32 a0_min, float32 a0_range, float32 a0_inv_step, "
+        "int32 a0_n, int32 a0_wraps, "
+        "float32 a1_min, float32 a1_range, float32 a1_inv_step, "
+        "int32 a1_n, int32 a1_wraps, "
+        "float32 inv_gmax_lin",
+        "float32 gain_rel_lin",
+        """
+        float a0q = a0;
+        if (a0_wraps != 0) {
+            float rel = a0q - a0_min;
+            rel = rel - floorf(rel / a0_range) * a0_range;
+            if (rel < 0.0f) rel += a0_range;
+            if (rel >= a0_range) rel -= a0_range;
+            a0q = a0_min + rel;
+        } else {
+            float a0_max = a0_min + a0_range;
+            if (a0q < a0_min) a0q = a0_min;
+            if (a0q > a0_max) a0q = a0_max;
+        }
+        float a1q = a1;
+        if (a1_wraps != 0) {
+            float rel = a1q - a1_min;
+            rel = rel - floorf(rel / a1_range) * a1_range;
+            if (rel < 0.0f) rel += a1_range;
+            if (rel >= a1_range) rel -= a1_range;
+            a1q = a1_min + rel;
+        } else {
+            float a1_max = a1_min + a1_range;
+            if (a1q < a1_min) a1q = a1_min;
+            if (a1q > a1_max) a1q = a1_max;
+        }
+        float fidx0 = (a0q - a0_min) * a0_inv_step;
+        float fidx1 = (a1q - a1_min) * a1_inv_step;
+        int i0 = __float2int_rd(fidx0);
+        int j0 = __float2int_rd(fidx1);
+        if (i0 < 0) i0 = 0;
+        if (j0 < 0) j0 = 0;
+        if (i0 > a0_n - 2) i0 = a0_n - 2;
+        if (j0 > a1_n - 2) j0 = a1_n - 2;
+        int i1 = i0 + 1;
+        int j1 = j0 + 1;
+        float f0 = fidx0 - (float)i0;
+        float f1 = fidx1 - (float)j0;
+        if (f0 < 0.0f) f0 = 0.0f;
+        if (f0 > 1.0f) f0 = 1.0f;
+        if (f1 < 0.0f) f1 = 0.0f;
+        if (f1 > 1.0f) f1 = 1.0f;
+        float v00 = (float)lut[i0 * a1_n + j0];
+        float v10 = (float)lut[i1 * a1_n + j0];
+        float v01 = (float)lut[i0 * a1_n + j1];
+        float v11 = (float)lut[i1 * a1_n + j1];
+        float gain_db = v00 * (1.0f - f0) * (1.0f - f1)
+                      + v10 * f0 * (1.0f - f1)
+                      + v01 * (1.0f - f0) * f1
+                      + v11 * f0 * f1;
+        gain_rel_lin = __expf(gain_db * 0.23025850929f) * inv_gmax_lin;
+        """,
+        "custom_2d_lut_to_linear_fp16",
+    )
+    return _custom_2d_lut_to_linear_fp16_kernel
+
+
+def _evaluate_custom_2d_pattern_cp_to_linear(
+    context: GpuCustomPattern2DContext,
+    axis0_deg: Any,
+    axis1_deg: Any,
+    inv_gmax_lin: float,
+) -> Any:
+    """Fused Custom-2D LUT evaluation returning relative linear gain.
+
+    Mirrors :func:`_evaluate_s1528_pattern_cp_lut_2d_to_linear` and the
+    M.2101 fused path.  Inputs: ``(axis0_deg, axis1_deg)`` in the
+    pattern's native grid basis (``(az, el)`` or ``(θ, φ)`` depending on
+    ``context.grid_mode``).  Output: ``10^(gain_db/10) / gmax_lin``.
+    """
+    a0 = _to_cupy_array(axis0_deg, dtype=cp.float32)
+    a1 = _to_cupy_array(axis1_deg, dtype=cp.float32)
+    a0, a1 = cp.broadcast_arrays(a0, a1)
+    kernel = (
+        _get_custom_2d_lut_to_linear_fp16_kernel()
+        if context.d_gain_lut.dtype == cp.float16
+        else _get_custom_2d_lut_to_linear_kernel()
+    )
+    return kernel(
+        a0, a1,
+        context.d_gain_lut,
+        cp.float32(context.axis0_min_deg),
+        cp.float32(context.axis0_range_deg),
+        cp.float32(1.0 / context.axis0_step_deg),
+        np.int32(context.axis0_n),
+        np.int32(1 if context.axis0_wraps else 0),
+        cp.float32(context.axis1_min_deg),
+        cp.float32(context.axis1_range_deg),
+        cp.float32(1.0 / context.axis1_step_deg),
+        np.int32(context.axis1_n),
+        np.int32(1 if context.axis1_wraps else 0),
+        cp.float32(float(inv_gmax_lin)),
+    )
+
+
+_theta_phi_to_azel_kernel = None
+
+
+def _get_theta_phi_to_azel_kernel():
+    """Fused (θ, φ) → (az, el) coordinate conversion for Custom-2D az_el
+    grid mode.  Replaces 6 separate CuPy operations (sin×2, cos×2,
+    arctan2, arcsin) with one ElementwiseKernel launch."""
+    global _theta_phi_to_azel_kernel
+    if _theta_phi_to_azel_kernel is not None:
+        return _theta_phi_to_azel_kernel
+    _theta_phi_to_azel_kernel = cp.ElementwiseKernel(
+        "float32 theta_deg, float32 phi_deg",
+        "float32 az_deg, float32 el_deg",
+        r"""
+        const float d2r = 0.017453292519943295f;
+        const float r2d = 57.29577951308232f;
+        float th = theta_deg * d2r;
+        float ph = phi_deg * d2r;
+        float sin_th = sinf(th);
+        float cos_th = cosf(th);
+        float sin_ph = sinf(ph);
+        float cos_ph = cosf(ph);
+        az_deg = atan2f(sin_th * cos_ph, cos_th) * r2d;
+        float sp = sin_th * sin_ph;
+        if (sp > 1.0f) sp = 1.0f;
+        if (sp < -1.0f) sp = -1.0f;
+        el_deg = asinf(sp) * r2d;
+        """,
+        "theta_phi_to_azel_fused",
+    )
+    return _theta_phi_to_azel_kernel
+
+
+def _evaluate_custom_2d_from_theta_phi(
+    context: GpuCustomPattern2DContext,
+    theta_deg: Any,
+    phi_deg: Any,
+) -> Any:
+    """Evaluate a Custom-2D pattern given boresight-relative ``(θ, φ)``.
+
+    The power path carries ``(θ, φ)`` around the beam boresight (Stage 5
+    derivation). Custom-2D patterns may be authored in either
+    ``grid_mode="theta_phi"`` (direct match) or ``grid_mode="az_el"``
+    (schema's datasheet-style, boresight at the (0, 0) origin). This
+    helper absorbs the conversion so every hot-path call site can feed
+    ``(θ, φ)`` without knowing which authoring mode the user chose.
+
+    Conversion (schema doc, "Conversion between the two 2-D modes"):
+
+    - ``az = atan2(sin(θ)·cos(φ), cos(θ))`` — signed, ``[-180°, 180°]``
+    - ``el = arcsin(sin(θ)·sin(φ))`` — signed, ``[-90°, 90°]``
+    """
+    theta = _to_cupy_array(theta_deg, dtype=cp.float32)
+    phi = _to_cupy_array(phi_deg, dtype=cp.float32)
+    if context.grid_mode == "theta_phi":
+        return _evaluate_custom_2d_pattern_cp(context, theta, phi)
+    if context.grid_mode == "az_el":
+        # Fused coordinate conversion (6 ops → 1 kernel) + LUT lookup.
+        _conv_kernel = _get_theta_phi_to_azel_kernel()
+        az, el = _conv_kernel(theta, phi)
+        return _evaluate_custom_2d_pattern_cp(context, az, el)
+    raise ValueError(f"Unsupported Custom-2D grid_mode={context.grid_mode!r}.")
+
+
+def _evaluate_custom_2d_from_theta_phi_to_linear(
+    context: GpuCustomPattern2DContext,
+    theta_deg: Any,
+    phi_deg: Any,
+    inv_gmax_lin: float,
+) -> Any:
+    """Fused Custom-2D ``(θ, φ)`` evaluation returning relative linear gain.
+
+    Mirrors :func:`_evaluate_custom_2d_from_theta_phi` but returns the
+    fused-kernel linear output (saves the ``cp.power(10, g/10) * inv_gmax``
+    round-trip that every hot-path caller would otherwise add).
+
+    **Preferred hot-path entry point:** for az_el-authored patterns
+    the caller should compute body-frame ``(az, el)`` from the beam
+    trig components it already has and call
+    :func:`_evaluate_custom_2d_from_azel_to_linear` directly — that
+    skips the θ/φ intermediate entirely.  This helper is kept as a
+    fallback for callers that already have (θ, φ) in hand and would
+    need to redo the geometry to get (az, el); it converts on the
+    GPU via ``_theta_phi_to_azel_fused`` then dispatches.
+    """
+    theta = _to_cupy_array(theta_deg, dtype=cp.float32)
+    phi = _to_cupy_array(phi_deg, dtype=cp.float32)
+    if context.grid_mode == "theta_phi":
+        return _evaluate_custom_2d_pattern_cp_to_linear(
+            context, theta, phi, inv_gmax_lin=inv_gmax_lin,
+        )
+    if context.grid_mode == "az_el":
+        _conv_kernel = _get_theta_phi_to_azel_kernel()
+        az, el = _conv_kernel(theta, phi)
+        return _evaluate_custom_2d_pattern_cp_to_linear(
+            context, az, el, inv_gmax_lin=inv_gmax_lin,
+        )
+    raise ValueError(f"Unsupported Custom-2D grid_mode={context.grid_mode!r}.")
+
+
+# Fused body-frame → pattern-eval kernels.  2 modes × 2 LUT dtypes ×
+# 2 compute dtypes = 8 kernel variants.  The LUT storage dtype tracks
+# the context's ``d_gain_lut`` (fp32 default, fp16 when
+# ``pattern_dtype == fp16``).  The compute dtype tracks the session's
+# ``pwr_dt`` (fp32 default, fp64 for ``float64`` / ``float64/float32``
+# precision profiles).  fp16 compute is NOT offered — FSPL values
+# underflow fp16 downstream, so power always runs at fp32+.
+_custom_2d_body_to_lin_kernel_cache: dict[tuple[str, str, str], Any] = {}
+
+
+def _build_custom_2d_body_kernel(
+    *, mode: str, lut_dtype: str, compute_dtype: str,
+) -> "cp.ElementwiseKernel":
+    """Build the fused body-frame → (az, el) or (θ, φ) → LUT lookup
+    → dB→linear → inv_gmax kernel.
+
+    Takes beam body-frame unit-vector components ``(x_body, y_body,
+    z_body)`` (already computed in the 3-D / 4-D power kernels) and
+    produces relative linear gain in one CUDA launch — no
+    intermediate ``(az, el)`` / ``(θ, φ)`` tensors, no per-axis
+    conversion kernel, no dB→linear follow-up.
+
+    Parameters
+    ----------
+    mode : {"az_el", "theta_phi"}
+        Pattern grid mode — decides the coord formulas at the top
+        of the kernel.
+    lut_dtype : {"float32", "float16"}
+        Storage dtype of the LUT on device.  fp16 corner loads
+        promote to fp32.
+    compute_dtype : {"float32", "float64"}
+        Input (body-frame) + output (gain_rel_lin) precision.
+        Interior arithmetic stays fp32 (LUT is fp32/fp16 anyway; no
+        fp64 benefit in the interp itself), but at fp64 the output
+        is promoted so downstream FSPL × gain at ``pwr_dt=fp64``
+        carries full precision.  fp16 NOT supported for compute —
+        FSPL underflows fp16 downstream.
+    """
+    if compute_dtype not in ("float32", "float64"):
+        raise ValueError(
+            f"compute_dtype must be float32 or float64; got {compute_dtype!r}."
+        )
+
+    # Coord conversion block. Uses fp32 sinf/atan2f/asinf regardless of
+    # compute dtype because angular precision at one-cell resolution is
+    # dominated by the LUT's bin step (0.05°-5°), not float precision.
+    # fp64 callers cast to fp32 for the transcendentals then back for
+    # the output path.  Matches how analytical mega-kernel does trig.
+    if mode == "az_el":
+        coord_block = r"""
+        float a0 = atan2f((float)x_body, (float)z_body) * 57.29577951308232f;
+        float y_clip = (float)y_body;
+        if (y_clip >  1.0f) y_clip =  1.0f;
+        if (y_clip < -1.0f) y_clip = -1.0f;
+        float a1 = asinf(y_clip) * 57.29577951308232f;
+        """
+    elif mode == "theta_phi":
+        coord_block = r"""
+        float z_clip = (float)z_body;
+        if (z_clip >  1.0f) z_clip =  1.0f;
+        if (z_clip < -1.0f) z_clip = -1.0f;
+        float a0 = acosf(z_clip) * 57.29577951308232f;
+        float a1 = atan2f((float)y_body, (float)x_body) * 57.29577951308232f;
+        """
+    else:
+        raise ValueError(f"Unknown grid mode: {mode!r}")
+
+    corner_cast = "(float)" if lut_dtype == "float16" else ""
+    out_cast = (
+        "" if compute_dtype == "float32"
+        else "(double)"  # promote final product to fp64 for fp64 output
+    )
+
+    body = coord_block + r"""
+        /* Wrap-or-clip axis 0. */
+        float a0q = a0;
+        if (a0_wraps != 0) {
+            float rel = a0q - a0_min;
+            rel = rel - floorf(rel / a0_range) * a0_range;
+            if (rel < 0.0f) rel += a0_range;
+            if (rel >= a0_range) rel -= a0_range;
+            a0q = a0_min + rel;
+        } else {
+            float a0_max = a0_min + a0_range;
+            if (a0q < a0_min) a0q = a0_min;
+            if (a0q > a0_max) a0q = a0_max;
+        }
+        /* Wrap-or-clip axis 1. */
+        float a1q = a1;
+        if (a1_wraps != 0) {
+            float rel = a1q - a1_min;
+            rel = rel - floorf(rel / a1_range) * a1_range;
+            if (rel < 0.0f) rel += a1_range;
+            if (rel >= a1_range) rel -= a1_range;
+            a1q = a1_min + rel;
+        } else {
+            float a1_max = a1_min + a1_range;
+            if (a1q < a1_min) a1q = a1_min;
+            if (a1q > a1_max) a1q = a1_max;
+        }
+        float fidx0 = (a0q - a0_min) * a0_inv_step;
+        float fidx1 = (a1q - a1_min) * a1_inv_step;
+        int i0 = __float2int_rd(fidx0);
+        int j0 = __float2int_rd(fidx1);
+        if (i0 < 0) i0 = 0;
+        if (j0 < 0) j0 = 0;
+        if (i0 > a0_n - 2) i0 = a0_n - 2;
+        if (j0 > a1_n - 2) j0 = a1_n - 2;
+        int i1 = i0 + 1;
+        int j1 = j0 + 1;
+        float f0 = fidx0 - (float)i0;
+        float f1 = fidx1 - (float)j0;
+        if (f0 < 0.0f) f0 = 0.0f;
+        if (f0 > 1.0f) f0 = 1.0f;
+        if (f1 < 0.0f) f1 = 0.0f;
+        if (f1 > 1.0f) f1 = 1.0f;
+        float v00 = """ + corner_cast + r"""lut[i0 * a1_n + j0];
+        float v10 = """ + corner_cast + r"""lut[i1 * a1_n + j0];
+        float v01 = """ + corner_cast + r"""lut[i0 * a1_n + j1];
+        float v11 = """ + corner_cast + r"""lut[i1 * a1_n + j1];
+        float gain_db = v00 * (1.0f - f0) * (1.0f - f1)
+                      + v10 * f0 * (1.0f - f1)
+                      + v01 * (1.0f - f0) * f1
+                      + v11 * f0 * f1;
+        gain_rel_lin = """ + out_cast + r"""(__expf(gain_db * 0.23025850929f) * (float)inv_gmax_lin);
+        """
+
+    lut_in = (
+        "raw float16 lut" if lut_dtype == "float16" else "raw float32 lut"
+    )
+    compute_in = "float64" if compute_dtype == "float64" else "float32"
+    kernel_name = (
+        f"custom_2d_body_{mode}_to_lin_"
+        f"{'fp64' if compute_dtype == 'float64' else 'fp32'}_"
+        f"{'fp16' if lut_dtype == 'float16' else 'fp32'}lut"
+    )
+    return cp.ElementwiseKernel(
+        f"{compute_in} x_body, {compute_in} y_body, {compute_in} z_body, "
+        f"{lut_in}, "
+        "float32 a0_min, float32 a0_range, float32 a0_inv_step, "
+        "int32 a0_n, int32 a0_wraps, "
+        "float32 a1_min, float32 a1_range, float32 a1_inv_step, "
+        "int32 a1_n, int32 a1_wraps, "
+        f"{compute_in} inv_gmax_lin",
+        f"{compute_in} gain_rel_lin",
+        body,
+        kernel_name,
+    )
+
+
+def _get_custom_2d_body_kernel(
+    *, mode: str, lut_is_fp16: bool, compute_is_fp64: bool,
+) -> "cp.ElementwiseKernel":
+    key = (
+        mode,
+        "float16" if lut_is_fp16 else "float32",
+        "float64" if compute_is_fp64 else "float32",
+    )
+    kernel = _custom_2d_body_to_lin_kernel_cache.get(key)
+    if kernel is None:
+        kernel = _build_custom_2d_body_kernel(
+            mode=key[0], lut_dtype=key[1], compute_dtype=key[2],
+        )
+        _custom_2d_body_to_lin_kernel_cache[key] = kernel
+    return kernel
+
+
+# Lever #2: mega pattern-eval kernel — takes raw beam trig (the
+# outputs of _get_tx_trig_geometry_kernel / _get_4d_trig_kernel) and
+# emits BOTH rel and abs linear gain in one launch.  Compared to the
+# split "body-frame kernel + x_body/y_body compute + gmax multiply"
+# path, fuses 3-5 launches into 1.  Mirrors the analytical mega
+# pattern where upstream trig → pattern eval is a single launch.
+_custom_2d_trig_to_gain_kernel_cache: dict[tuple[str, str, str], Any] = {}
+
+
+def _build_custom_2d_trig_to_gain_kernel(
+    *, mode: str, lut_dtype: str, compute_dtype: str,
+) -> "cp.ElementwiseKernel":
+    """Build the mega kernel: raw beam trig → body-frame coords →
+    pattern eval → dB→linear → inv_gmax → emit rel AND abs linear gain.
+
+    Inputs per thread:
+      beam_sinb, beam_cosb, sin_da, cos_da, sinb0, cosb0, cos_gamma_tx
+    Outputs per thread:
+      gtx_rel_lin = pattern(coord) / gmax
+      gtx_abs_lin = pattern(coord)        (= gtx_rel_lin × gmax)
+
+    Parameters mirror :func:`_build_custom_2d_body_kernel`.
+    """
+    if compute_dtype not in ("float32", "float64"):
+        raise ValueError(f"compute_dtype must be float32 or float64; got {compute_dtype!r}.")
+
+    if mode == "az_el":
+        coord_block = r"""
+        /* Body-frame components from raw beam trig -- what
+         * _convert_surface_between_grids / _accumulate_*_cp used to
+         * do in 2-3 separate CuPy launches.  x_body = beam_cosb * sin_da,
+         * y_body = cosb0 * beam_sinb - sinb0 * beam_cosb * cos_da,
+         * z_body = cos_gamma_tx. */
+        float xb = (float)beam_cosb * (float)sin_da;
+        float yb = (float)cosb0 * (float)beam_sinb
+                 - (float)sinb0 * (float)beam_cosb * (float)cos_da;
+        float zb = (float)cos_gamma_tx;
+        float a0 = atan2f(xb, zb) * 57.29577951308232f;
+        if (yb >  1.0f) yb =  1.0f;
+        if (yb < -1.0f) yb = -1.0f;
+        float a1 = asinf(yb) * 57.29577951308232f;
+        """
+    elif mode == "theta_phi":
+        coord_block = r"""
+        float xb = (float)beam_cosb * (float)sin_da;
+        float yb = (float)cosb0 * (float)beam_sinb
+                 - (float)sinb0 * (float)beam_cosb * (float)cos_da;
+        float zb = (float)cos_gamma_tx;
+        if (zb >  1.0f) zb =  1.0f;
+        if (zb < -1.0f) zb = -1.0f;
+        float a0 = acosf(zb) * 57.29577951308232f;
+        float a1 = atan2f(yb, xb) * 57.29577951308232f;
+        """
+    else:
+        raise ValueError(f"Unknown grid mode: {mode!r}")
+
+    corner_cast = "(float)" if lut_dtype == "float16" else ""
+    out_type = "double" if compute_dtype == "float64" else "float"
+
+    body = coord_block + r"""
+        float a0q = a0;
+        if (a0_wraps != 0) {
+            float rel = a0q - a0_min;
+            rel = rel - floorf(rel / a0_range) * a0_range;
+            if (rel < 0.0f) rel += a0_range;
+            if (rel >= a0_range) rel -= a0_range;
+            a0q = a0_min + rel;
+        } else {
+            float a0_max = a0_min + a0_range;
+            if (a0q < a0_min) a0q = a0_min;
+            if (a0q > a0_max) a0q = a0_max;
+        }
+        float a1q = a1;
+        if (a1_wraps != 0) {
+            float rel = a1q - a1_min;
+            rel = rel - floorf(rel / a1_range) * a1_range;
+            if (rel < 0.0f) rel += a1_range;
+            if (rel >= a1_range) rel -= a1_range;
+            a1q = a1_min + rel;
+        } else {
+            float a1_max = a1_min + a1_range;
+            if (a1q < a1_min) a1q = a1_min;
+            if (a1q > a1_max) a1q = a1_max;
+        }
+        float fidx0 = (a0q - a0_min) * a0_inv_step;
+        float fidx1 = (a1q - a1_min) * a1_inv_step;
+        int i0 = __float2int_rd(fidx0);
+        int j0 = __float2int_rd(fidx1);
+        if (i0 < 0) i0 = 0;
+        if (j0 < 0) j0 = 0;
+        if (i0 > a0_n - 2) i0 = a0_n - 2;
+        if (j0 > a1_n - 2) j0 = a1_n - 2;
+        int i1 = i0 + 1;
+        int j1 = j0 + 1;
+        float f0 = fidx0 - (float)i0;
+        float f1 = fidx1 - (float)j0;
+        if (f0 < 0.0f) f0 = 0.0f;
+        if (f0 > 1.0f) f0 = 1.0f;
+        if (f1 < 0.0f) f1 = 0.0f;
+        if (f1 > 1.0f) f1 = 1.0f;
+        float v00 = """ + corner_cast + r"""lut[i0 * a1_n + j0];
+        float v10 = """ + corner_cast + r"""lut[i1 * a1_n + j0];
+        float v01 = """ + corner_cast + r"""lut[i0 * a1_n + j1];
+        float v11 = """ + corner_cast + r"""lut[i1 * a1_n + j1];
+        float gain_db = v00 * (1.0f - f0) * (1.0f - f1)
+                      + v10 * f0 * (1.0f - f1)
+                      + v01 * (1.0f - f0) * f1
+                      + v11 * f0 * f1;
+        float abs_lin_f = __expf(gain_db * 0.23025850929f);
+        gtx_abs_lin = (""" + out_type + r""")abs_lin_f;
+        gtx_rel_lin = (""" + out_type + r""")(abs_lin_f * (float)inv_gmax_lin);
+        """
+
+    lut_in = "raw float16 lut" if lut_dtype == "float16" else "raw float32 lut"
+    compute_in = "float64" if compute_dtype == "float64" else "float32"
+    kernel_name = (
+        f"custom_2d_trig_to_gain_{mode}_"
+        f"{'fp64' if compute_dtype == 'float64' else 'fp32'}_"
+        f"{'fp16' if lut_dtype == 'float16' else 'fp32'}lut"
+    )
+    return cp.ElementwiseKernel(
+        f"{compute_in} beam_sinb, {compute_in} beam_cosb, "
+        f"{compute_in} sin_da, {compute_in} cos_da, "
+        f"{compute_in} sinb0, {compute_in} cosb0, "
+        f"{compute_in} cos_gamma_tx, "
+        f"{lut_in}, "
+        "float32 a0_min, float32 a0_range, float32 a0_inv_step, "
+        "int32 a0_n, int32 a0_wraps, "
+        "float32 a1_min, float32 a1_range, float32 a1_inv_step, "
+        "int32 a1_n, int32 a1_wraps, "
+        f"{compute_in} inv_gmax_lin",
+        f"{compute_in} gtx_rel_lin, {compute_in} gtx_abs_lin",
+        body,
+        kernel_name,
+    )
+
+
+def _get_custom_2d_trig_to_gain_kernel(
+    *, mode: str, lut_is_fp16: bool, compute_is_fp64: bool,
+) -> "cp.ElementwiseKernel":
+    key = (
+        mode,
+        "float16" if lut_is_fp16 else "float32",
+        "float64" if compute_is_fp64 else "float32",
+    )
+    kernel = _custom_2d_trig_to_gain_kernel_cache.get(key)
+    if kernel is None:
+        kernel = _build_custom_2d_trig_to_gain_kernel(
+            mode=key[0], lut_dtype=key[1], compute_dtype=key[2],
+        )
+        _custom_2d_trig_to_gain_kernel_cache[key] = kernel
+    return kernel
+
+
+def _evaluate_custom_2d_from_beam_trig_to_rel_abs_linear(
+    context: GpuCustomPattern2DContext,
+    beam_sinb: Any,
+    beam_cosb: Any,
+    sin_da: Any,
+    cos_da: Any,
+    sinb0: Any,
+    cosb0: Any,
+    cos_gamma_tx: Any,
+    inv_gmax_lin: float,
+    *,
+    compute_dtype: Any = None,
+) -> tuple[Any, Any]:
+    """Mega pattern-eval entry point: raw beam trig → (gtx_rel_lin,
+    gtx_abs_lin) in a single CUDA launch.
+
+    Replaces 3-5 launches from the previous path (x_body compute,
+    y_body compute, body-frame kernel, gmax multiply) with one.
+    Mirrors the analytical path where fused TX trig + fused pattern
+    LUT feed K1 with minimal intermediate materialisation.
+
+    Both outputs are emitted by the same kernel pass — no second
+    CuPy multiply for gtx_abs_lin = gtx_rel_lin × gmax.
+    """
+    if compute_dtype is None:
+        compute_dtype = cp.float32
+    is_fp64 = np.dtype(compute_dtype) == np.dtype(np.float64)
+    elem_dt = cp.float64 if is_fp64 else cp.float32
+    bs = _to_cupy_array(beam_sinb, dtype=elem_dt)
+    bc = _to_cupy_array(beam_cosb, dtype=elem_dt)
+    sa = _to_cupy_array(sin_da, dtype=elem_dt)
+    ca = _to_cupy_array(cos_da, dtype=elem_dt)
+    sb0 = _to_cupy_array(sinb0, dtype=elem_dt)
+    cb0 = _to_cupy_array(cosb0, dtype=elem_dt)
+    cgt = _to_cupy_array(cos_gamma_tx, dtype=elem_dt)
+    bs, bc, sa, ca, sb0, cb0, cgt = cp.broadcast_arrays(bs, bc, sa, ca, sb0, cb0, cgt)
+    lut_is_fp16 = context.d_gain_lut.dtype == cp.float16
+    kernel = _get_custom_2d_trig_to_gain_kernel(
+        mode=context.grid_mode,
+        lut_is_fp16=lut_is_fp16,
+        compute_is_fp64=is_fp64,
+    )
+    return kernel(
+        bs, bc, sa, ca, sb0, cb0, cgt,
+        context.d_gain_lut,
+        cp.float32(context.axis0_min_deg),
+        cp.float32(context.axis0_range_deg),
+        cp.float32(1.0 / context.axis0_step_deg),
+        np.int32(context.axis0_n),
+        np.int32(1 if context.axis0_wraps else 0),
+        cp.float32(context.axis1_min_deg),
+        cp.float32(context.axis1_range_deg),
+        cp.float32(1.0 / context.axis1_step_deg),
+        np.int32(context.axis1_n),
+        np.int32(1 if context.axis1_wraps else 0),
+        elem_dt(float(inv_gmax_lin)),
+    )
+
+
+def _evaluate_custom_2d_from_body_frame_to_linear(
+    context: GpuCustomPattern2DContext,
+    x_body: Any,
+    y_body: Any,
+    z_body: Any,
+    inv_gmax_lin: float,
+    *,
+    compute_dtype: Any = None,
+) -> Any:
+    """Fused body-frame → pattern-eval-to-linear in **one kernel launch**.
+
+    Preferred hot-path entry point.  Takes the beam body-frame unit
+    vector components the upstream trig already has
+    (``x_body = beam_cosb * sin_da``,
+    ``y_body = cosb0 * beam_sinb - sinb0 * beam_cosb * cos_da``,
+    ``z_body = cos_gamma_tx``) and produces the relative linear gain
+    in one ElementwiseKernel launch — no intermediate ``(az, el)``
+    or ``(θ, φ)`` tensors, no per-axis conversion kernels.
+
+    Dispatches to the az_el or theta_phi kernel variant based on
+    ``context.grid_mode``, to fp32 or fp64 compute variant based on
+    the caller's ``compute_dtype`` (pass ``cp.float64`` for the
+    ``float64`` or ``float64/float32`` precision profiles), and to
+    the fp16 or fp32 LUT variant based on
+    ``context.d_gain_lut.dtype``.
+    """
+    if compute_dtype is None:
+        compute_dtype = cp.float32
+    is_fp64 = np.dtype(compute_dtype) == np.dtype(np.float64)
+    elem_dt = cp.float64 if is_fp64 else cp.float32
+    xb = _to_cupy_array(x_body, dtype=elem_dt)
+    yb = _to_cupy_array(y_body, dtype=elem_dt)
+    zb = _to_cupy_array(z_body, dtype=elem_dt)
+    xb, yb, zb = cp.broadcast_arrays(xb, yb, zb)
+    lut_is_fp16 = context.d_gain_lut.dtype == cp.float16
+    kernel = _get_custom_2d_body_kernel(
+        mode=context.grid_mode,
+        lut_is_fp16=lut_is_fp16,
+        compute_is_fp64=is_fp64,
+    )
+    return kernel(
+        xb, yb, zb,
+        context.d_gain_lut,
+        cp.float32(context.axis0_min_deg),
+        cp.float32(context.axis0_range_deg),
+        cp.float32(1.0 / context.axis0_step_deg),
+        np.int32(context.axis0_n),
+        np.int32(1 if context.axis0_wraps else 0),
+        cp.float32(context.axis1_min_deg),
+        cp.float32(context.axis1_range_deg),
+        cp.float32(1.0 / context.axis1_step_deg),
+        np.int32(context.axis1_n),
+        np.int32(1 if context.axis1_wraps else 0),
+        elem_dt(float(inv_gmax_lin)),
+    )
+
+
+def _evaluate_custom_2d_from_azel_to_linear(
+    context: GpuCustomPattern2DContext,
+    az_deg: Any,
+    el_deg: Any,
+    inv_gmax_lin: float,
+) -> Any:
+    """Custom-2D evaluation with ``(az, el)`` already in hand.
+
+    Preferred hot-path entry point for az_el-authored patterns.  The
+    beam body-frame trig already produces the components needed to
+    compute ``(az, el)`` directly (``az = atan2(x_body, z_body)``,
+    ``el = asin(y_body)``), so callers can skip the ``(θ, φ)``
+    intermediate plus the on-GPU conversion kernel entirely.
+
+    Architecture note: this function is the "geometry owns the
+    coordinate system" entry point.  Upstream call sites that know
+    they're feeding an az_el-authored pattern should compute
+    ``(az, el)`` directly from ``cos_bi``, ``sin_bi``, ``cos_bo``,
+    ``sin_bo``, ``cos_da``, ``sin_da`` rather than computing
+    ``(θ, φ)`` and converting.  Saves one kernel launch + one
+    intermediate allocation + avoids the extra trig pass.
+
+    For theta_phi-authored patterns this helper raises — callers
+    should use :func:`_evaluate_custom_2d_from_theta_phi_to_linear`
+    with the ``(θ, φ)`` they already have.
+    """
+    if context.grid_mode != "az_el":
+        raise ValueError(
+            "_evaluate_custom_2d_from_azel_to_linear requires "
+            f"grid_mode='az_el'; got {context.grid_mode!r}. Use "
+            "_evaluate_custom_2d_from_theta_phi_to_linear for "
+            "theta_phi-authored patterns."
+        )
+    az = _to_cupy_array(az_deg, dtype=cp.float32)
+    el = _to_cupy_array(el_deg, dtype=cp.float32)
+    return _evaluate_custom_2d_pattern_cp_to_linear(
+        context, az, el, inv_gmax_lin=inv_gmax_lin,
+    )
+
+
+def _evaluate_custom_1d_pattern_cp(
+    context: GpuCustomPattern1DContext,
+    theta_deg: Any,
+    phi_deg: Any | None = None,
+) -> Any:
+    """Evaluate a user-supplied 1-D custom pattern on GPU via regular LUT.
+
+    Reuses the same ``s1528_lut_1d_interp`` ElementwiseKernel as the
+    S.1528 1-D path — the kernel is pattern-agnostic (linear-in-dB
+    interpolation on a regular grid). ``phi_deg`` is accepted for
+    call-site symmetry but ignored (axisymmetric pattern).
+
+    Returns absolute dBi, matching the semantics of
+    :func:`scepter.custom_antenna.evaluate_pattern_1d` (relative-mode
+    patterns have the peak shift baked into the device LUT at build
+    time, so callers see one uniform basis regardless of how the
+    source file was normalised).
+    """
+    del phi_deg
+    theta = _to_cupy_array(theta_deg, dtype=cp.float32)
+    kernel = (
+        _get_s1528_lut_1d_interp_fp16_kernel()
+        if context.d_gain_lut.dtype == cp.float16
+        else _get_s1528_lut_1d_interp_kernel()
+    )
+    return kernel(
+        theta,
+        context.d_gain_lut,
+        cp.float32(1.0 / context.gain_lut_step_deg),
+        cp.float32(context.gain_lut_max_deg),
+        np.int32(context.gain_lut_n),
+    )
+
+
+def _evaluate_custom_1d_pattern_cp_to_linear(
+    context: GpuCustomPattern1DContext,
+    theta_deg: Any,
+    inv_gmax_lin: float,
+) -> Any:
+    """Fused Custom-1D LUT evaluation returning relative linear gain.
+
+    Reuses the same fused ``s1528_lut_1d_to_linear`` kernel as the S.1528
+    1-D path — both are pattern-agnostic regular-grid LUTs in dB.
+    Collapses ``LUT → dB → cp.power(10, g/10) * inv_gmax`` into a single
+    ElementwiseKernel launch.  Mirrors the 2-D / M.2101 fused path.
+    """
+    theta = _to_cupy_array(theta_deg, dtype=cp.float32)
+    kernel = (
+        _get_s1528_lut_1d_to_linear_fp16_kernel()
+        if context.d_gain_lut.dtype == cp.float16
+        else _get_s1528_lut_1d_to_linear_kernel()
+    )
+    return kernel(
+        theta,
+        context.d_gain_lut,
+        cp.float32(1.0 / context.gain_lut_step_deg),
+        cp.float32(context.gain_lut_max_deg),
+        np.int32(context.gain_lut_n),
+        cp.float32(float(inv_gmax_lin)),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Stage-9 audit — axisymmetry assumptions across every ``pattern_context``
+# consumer in this module.
+#
+# The dispatcher below is the central entry point; every downstream kernel
+# in ``gpu_accel.py`` that evaluates a transmit pattern funnels through it
+# (directly, or via ``_evaluate_s1528_pattern_cp_lut_1d_to_linear`` /
+# ``_evaluate_normalised_pattern_cp`` / ``_evaluate_m2101_pattern_cp_lut_to_linear``).
+# Catalogue of every consumer, keyed on whether it assumes axisymmetry
+# (θ-only), consumes full (α, β) / (θ, φ) geometry, or is pattern-free:
+#
+# +----------------------------------------------+---------+-----------------+
+# | Consumer                                     | Handles | How             |
+# |                                              | 2-D?    |                 |
+# +----------------------------------------------+---------+-----------------+
+# | ``_evaluate_s1528_pattern_cp``               | YES     | Dispatches on   |
+# |   (this dispatcher)                          |         | ``is_2d`` +     |
+# |                                              |         | ``phi_deg``.    |
+# +----------------------------------------------+---------+-----------------+
+# | ``_accumulate_ras_power_cp`` 3-D path        | YES     | ``is_2d``       |
+# |   (non-boresight-avoidance)                  |         | branch computes |
+# |                                              |         | φ from reused   |
+# |                                              |         | fused-kernel    |
+# |                                              |         | trig outputs    |
+# |                                              |         | (sinb0/cosb0/   |
+# |                                              |         | sin_da/cos_da). |
+# +----------------------------------------------+---------+-----------------+
+# | ``_accumulate_ras_power_cp`` 4-D path        | YES     | Same formula    |
+# |   (boresight-avoidance)                      |         | on compacted    |
+# |                                              |         | active-beam     |
+# |                                              |         | trig.           |
+# +----------------------------------------------+---------+-----------------+
+# | ``_accumulate_uemr_power_cp``                | N/A     | Isotropic       |
+# |                                              |         | (0 dBi         |
+# |                                              |         | everywhere).   |
+# +----------------------------------------------+---------+-----------------+
+# | ``_accumulate_beamforming_collapsed_power_cp``| N/A    | No TX pattern — |
+# |                                              |         | cos(θ)-envelope |
+# |                                              |         | collapsed EIRP. |
+# +----------------------------------------------+---------+-----------------+
+# | ``_build_peak_pfd_k_lut_cp`` (1-D builder)   | NO      | Rejects         |
+# |                                              |         | asymmetric at   |
+# |                                              |         | entry; routes   |
+# |                                              |         | to the 2-D /    |
+# |                                              |         | asym builders.  |
+# +----------------------------------------------+---------+-----------------+
+# | ``_build_peak_pfd_k_lut_2d_cp`` (M.2101)     | YES     | Full (az, el)   |
+# |                                              |         | K(α, β) sweep.  |
+# +----------------------------------------------+---------+-----------------+
+# | ``_build_peak_pfd_k_lut_asym_s1528_cp``      | YES     | 2-D (ψ, φ)      |
+# |                                              |         | observation     |
+# |                                              |         | sweep per β_i;  |
+# |                                              |         | K is            |
+# |                                              |         | α-invariant so  |
+# |                                              |         | output is 1-D   |
+# |                                              |         | K(β).           |
+# +----------------------------------------------+---------+-----------------+
+# | ``_lookup_peak_pfd_k_any_cp``                | YES     | Dispatches 1-D  |
+# |                                              |         | vs 2-D lookup   |
+# |                                              |         | on              |
+# |                                              |         | ``lut_context.  |
+# |                                              |         | is_2d``.        |
+# +----------------------------------------------+---------+-----------------+
+# | ``_compute_aggregate_surface_pfd_cap_cp``    | YES     | Three-way       |
+# |                                              |         | dispatch:       |
+# |                                              |         | M.2101 → 2-D    |
+# |                                              |         | element LUT;    |
+# |                                              |         | asymmetric      |
+# |                                              |         | S.1528 → 2-D    |
+# |                                              |         | (θ, φ) LUT with |
+# |                                              |         | φ derived from  |
+# |                                              |         | the same        |
+# |                                              |         | spherical-      |
+# |                                              |         | azimuth formula |
+# |                                              |         | as the main     |
+# |                                              |         | power path;     |
+# |                                              |         | symmetric       |
+# |                                              |         | S.1528 /        |
+# |                                              |         | Rec 1.2 / iso → |
+# |                                              |         | the 1-D         |
+# |                                              |         | normalised path.|
+# +----------------------------------------------+---------+-----------------+
+#
+# Naming convention reminder: the *context* flag is
+# ``GpuS1528PatternContext.is_2d`` (asymmetric Rec 1.4), the *LUT-context*
+# flag is ``GpuPeakPfdLutContext.is_2d`` (2-D K(α, β)). They are distinct —
+# the first is set whenever ``lt_m != lr_m``, the second is set only for
+# M.2101 because S.1528 Rec 1.4's K(β) is α-invariant (aperture rotates
+# with the beam; see ``_build_peak_pfd_k_lut_asym_s1528_cp`` docstring).
+# ---------------------------------------------------------------------------
+#
+# Stage-10 decision — how each consumer will absorb the Custom-1D /
+# Custom-2D pattern contexts planned for Phase 4 (Stages 12-17) of the
+# 30-stage custom-antenna plan. No code changes in this stage — it
+# records the design decisions so Phase 4 work has a single source of
+# truth.
+#
+# Two new context types are planned:
+#   * ``GpuCustomPattern1DContext`` — user-supplied LUT ``G(γ)``,
+#     axisymmetric. Feeds the same θ-only path that S.1528 Rec 1.2 /
+#     symmetric Rec 1.4 / RA.1631 use today.
+#   * ``GpuCustomPattern2DContext`` — user-supplied LUT in either
+#     ``(az, el)`` relative to boresight (``grid_mode="az_el"``) or
+#     ``(θ, φ)`` around boresight (``grid_mode="theta_phi"``). The
+#     schema stores boresight-relative angles either way, so the
+#     aperture rotates with the beam — *same* aperture-rotates-with-
+#     beam property as asymmetric S.1528, NOT the body-frame-fixed
+#     element pattern of M.2101.
+#
+# Per-consumer decision (status refers to the Custom-2D rollout only;
+# Custom-1D uniformly lands in the existing 1-D paths):
+#
+# +----------------------------------------------+---------+-----------------+
+# | Consumer                                     | Decision| Phase-4 work    |
+# +----------------------------------------------+---------+-----------------+
+# | ``_evaluate_s1528_pattern_cp`` (dispatcher)  | NEEDS   | Stage 13 will   |
+# |                                              | UPGRADE | add a Custom-2D |
+# |                                              |         | branch *or*     |
+# |                                              |         | introduce a     |
+# |                                              |         | separate        |
+# |                                              |         | top-level       |
+# |                                              |         | ``_evaluate_    |
+# |                                              |         | transmit_       |
+# |                                              |         | pattern_cp``    |
+# |                                              |         | dispatcher that |
+# |                                              |         | routes by       |
+# |                                              |         | context type.   |
+# |                                              |         | Leaning toward  |
+# |                                              |         | the latter —    |
+# |                                              |         | keeps S.1528    |
+# |                                              |         | and custom      |
+# |                                              |         | paths decoupled.|
+# +----------------------------------------------+---------+-----------------+
+# | ``_accumulate_ras_power_cp`` (3-D and 4-D)   | NEEDS   | Stage 15 — the  |
+# |                                              | UPGRADE | θ/φ geometry    |
+# |                                              |         | derivation in   |
+# |                                              |         | the ``is_2d``   |
+# |                                              |         | branches of     |
+# |                                              |         | both paths is   |
+# |                                              |         | pattern-        |
+# |                                              |         | agnostic and    |
+# |                                              |         | *reusable* for  |
+# |                                              |         | Custom-2D. Only |
+# |                                              |         | the pattern-    |
+# |                                              |         | evaluator call  |
+# |                                              |         | changes.        |
+# +----------------------------------------------+---------+-----------------+
+# | ``_accumulate_uemr_power_cp``                | STAYS   | Isotropic-only  |
+# |                                              | 1-D     | by design.      |
+# |                                              |         | Custom contexts |
+# |                                              |         | are rejected at |
+# |                                              |         | the scenario-   |
+# |                                              |         | level validator |
+# |                                              |         | (UEMR mode is   |
+# |                                              |         | mutually        |
+# |                                              |         | exclusive with  |
+# |                                              |         | directive       |
+# |                                              |         | patterns).      |
+# +----------------------------------------------+---------+-----------------+
+# | ``_accumulate_beamforming_collapsed_power_cp``| STAYS  | Collapsed OOBE  |
+# |                                              | PATTERN-| uses a          |
+# |                                              | FREE    | cos(θ)-envelope |
+# |                                              |         | scalar — no     |
+# |                                              |         | antenna context |
+# |                                              |         | enters this     |
+# |                                              |         | path.           |
+# +----------------------------------------------+---------+-----------------+
+# | ``_compute_aggregate_surface_pfd_cap_cp``    | NEEDS   | Stage 15.       |
+# |                                              | UPGRADE | Geometry block  |
+# |                                              |         | is reusable     |
+# |                                              |         | (already        |
+# |                                              |         | computes        |
+# |                                              |         | (θ, φ) per      |
+# |                                              |         | (candidate,     |
+# |                                              |         | beam) pair for  |
+# |                                              |         | asymmetric      |
+# |                                              |         | S.1528 in       |
+# |                                              |         | Stage 9b). Swap |
+# |                                              |         | the pattern     |
+# |                                              |         | evaluator for   |
+# |                                              |         | Custom-2D.      |
+# +----------------------------------------------+---------+-----------------+
+# | ``_build_peak_pfd_k_lut_cp`` (axisymmetric)  | ALREADY | Accepts         |
+# |                                              | HANDLES | Custom-1D via   |
+# |                                              | 1-D     | ``_evaluate_    |
+# |                                              |         | normalised_     |
+# |                                              |         | pattern_cp``    |
+# |                                              |         | isinstance      |
+# |                                              |         | extension       |
+# |                                              |         | (one-line add). |
+# +----------------------------------------------+---------+-----------------+
+# | ``_build_peak_pfd_k_lut_2d_cp`` (M.2101)     | STAYS   | M.2101-specific |
+# |                                              | M.2101  | — Custom-2D     |
+# |                                              | ONLY    | does *not*      |
+# |                                              |         | reuse this      |
+# |                                              |         | builder because |
+# |                                              |         | Custom-2D's     |
+# |                                              |         | asymmetry       |
+# |                                              |         | rotates with    |
+# |                                              |         | the beam,       |
+# |                                              |         | whereas M.2101  |
+# |                                              |         | is body-frame-  |
+# |                                              |         | fixed. Their    |
+# |                                              |         | K-LUT           |
+# |                                              |         | dimensionality  |
+# |                                              |         | differs for a   |
+# |                                              |         | physical reason.|
+# +----------------------------------------------+---------+-----------------+
+# | ``_build_peak_pfd_k_lut_asym_s1528_cp`` +    | DONE    | Stage 17        |
+# | ``_build_peak_pfd_k_lut_custom2d_cp``        | (both)  | shipped the     |
+# |                                              |         | Custom-2D       |
+# |                                              |         | sibling —       |
+# |                                              |         | structurally    |
+# |                                              |         | identical to    |
+# |                                              |         | the asym-S.1528 |
+# |                                              |         | builder, only   |
+# |                                              |         | the pattern     |
+# |                                              |         | evaluator       |
+# |                                              |         | differs. Both   |
+# |                                              |         | produce 1-D     |
+# |                                              |         | K(β) output via |
+# |                                              |         | a 2-D (ψ, φ)    |
+# |                                              |         | sweep; K is     |
+# |                                              |         | α-invariant     |
+# |                                              |         | because the     |
+# |                                              |         | aperture        |
+# |                                              |         | rotates with    |
+# |                                              |         | the beam in     |
+# |                                              |         | both cases.     |
+# +----------------------------------------------+---------+-----------------+
+# | ``_lookup_peak_pfd_k_any_cp``                | ALREADY | Dispatches on   |
+# |                                              | HANDLES | ``lut_context.  |
+# |                                              | BOTH    | is_2d``. As     |
+# |                                              |         | long as         |
+# |                                              |         | Custom-1D /     |
+# |                                              |         | Custom-2D       |
+# |                                              |         | builders        |
+# |                                              |         | produce a       |
+# |                                              |         | ``GpuPeakPfd-   |
+# |                                              |         | LutContext``    |
+# |                                              |         | with the right  |
+# |                                              |         | ``is_2d`` flag  |
+# |                                              |         | (Custom-2D      |
+# |                                              |         | produces 1-D    |
+# |                                              |         | per above),     |
+# |                                              |         | the runtime     |
+# |                                              |         | lookup needs    |
+# |                                              |         | no change.      |
+# +----------------------------------------------+---------+-----------------+
+#
+# Net Phase-4 surface: four code touches (dispatcher, directive power
+# kernel, aggregate cap, Custom-2D K-LUT builder) and one isinstance
+# extension (1-D K-LUT builder's normalised-pattern evaluator). Every
+# other consumer either stays as-is or inherits the Phase-4 changes
+# transparently.
+# ---------------------------------------------------------------------------
+
+
 def _evaluate_s1528_pattern_cp(
     context: GpuS1528PatternContext | GpuS1528Rec12PatternContext | GpuIsotropicPatternContext,
     theta_deg: Any,
@@ -10789,11 +14304,26 @@ def _evaluate_s1528_pattern_cp(
     if isinstance(context, GpuS1528Rec12PatternContext):
         # Rec 1.2: use LUT if available, else direct piecewise kernel
         if context.d_gain_lut is not None:
-            return _evaluate_s1528_pattern_cp_lut(context, theta_deg)
+            return _evaluate_s1528_pattern_cp_lut_1d(context, theta_deg)
         return _evaluate_s1528_rec12_pattern_cp(context, theta_deg)
-    # Rec 1.4: LUT or analytical Bessel/Taylor
-    if phi_deg is None and _s1528_pattern_eval_mode == "lut":
-        return _evaluate_s1528_pattern_cp_lut(context, theta_deg)
+    # Rec 1.4 asymmetric (lt_m != lr_m) depends on phi — the phi=None fast
+    # path would collapse to the phi=0 slice and silently drop all
+    # dependence on lt_m. Callers in the main power path thread phi via
+    # the azimuth-around-boresight geometry (see `_accumulate_ras_power_cp`);
+    # any other entry point that reaches here without phi is a bug.
+    if getattr(context, "is_2d", False) and phi_deg is None:
+        raise NotImplementedError(
+            "Asymmetric S.1528 Rec 1.4 context (lt_m != lr_m) requires phi_deg; "
+            "the phi=None fast path would silently collapse to the phi=0 slice."
+        )
+    # Rec 1.4 asymmetric with phi: use 2-D LUT in 'lut' mode, analytical otherwise.
+    if getattr(context, "is_2d", False):
+        if _pattern_eval_mode == "lut":
+            return _evaluate_s1528_pattern_cp_lut_2d(context, theta_deg, phi_deg)
+        return _evaluate_s1528_pattern_cp_analytical(context, theta_deg, phi_deg=phi_deg)
+    # Rec 1.4 symmetric: LUT or analytical Bessel/Taylor
+    if phi_deg is None and _pattern_eval_mode == "lut":
+        return _evaluate_s1528_pattern_cp_lut_1d(context, theta_deg)
     return _evaluate_s1528_pattern_cp_analytical(context, theta_deg, phi_deg=phi_deg)
 
 
@@ -10882,6 +14412,16 @@ def _pattern_peak_gain_linear(pattern_context: Any) -> float:
         return float(10.0 ** (gm_db / 10.0))
     if isinstance(pattern_context, GpuIsotropicPatternContext):
         return 1.0
+    if isinstance(
+        pattern_context,
+        (GpuCustomPattern1DContext, GpuCustomPattern2DContext),
+    ):
+        # Custom contexts store the authoritative peak verbatim from
+        # the schema's ``peak_gain_dbi`` / ``peak_gain_source=explicit``
+        # field — no peak re-computation, matching the schema doc's
+        # "peak-gain semantics" rule (the LUT is allowed to sit below
+        # the declared peak for ITU regulatory masks).
+        return float(10.0 ** (float(pattern_context.peak_gain_dbi) / 10.0))
     raise TypeError(
         f"Unsupported transmit pattern for peak-gain lookup: {type(pattern_context).__name__}"
     )
@@ -10894,26 +14434,44 @@ def _evaluate_normalised_pattern_cp(
 ) -> Any:
     """Evaluate ``p(θ) / p_max`` on GPU for a supported pattern context.
 
-    Dispatches on the module-level ``_s1528_pattern_eval_mode`` so the LUT
+    Dispatches on the module-level ``_pattern_eval_mode`` so the LUT
     build path mirrors whatever the Review & Run "Pattern evaluation"
     setting selected for the main power kernel (``lut`` or ``analytical``).
     """
-    use_lut = (_s1528_pattern_eval_mode == "lut")
+    use_lut = (_pattern_eval_mode == "lut")
     if isinstance(pattern_context, GpuS1528PatternContext):
         if use_lut:
-            return _evaluate_s1528_pattern_cp_lut_to_linear(
+            return _evaluate_s1528_pattern_cp_lut_1d_to_linear(
                 pattern_context, theta_deg_cp, inv_gmax_lin=float(inv_gmax_lin),
             )
         gain_db_cp = _evaluate_s1528_pattern_cp_analytical(pattern_context, theta_deg_cp)
         lin_cp = cp.power(cp.float32(10.0), gain_db_cp.astype(cp.float32, copy=False) * cp.float32(0.1))
         return lin_cp * cp.float32(float(inv_gmax_lin))
     if isinstance(pattern_context, GpuS1528Rec12PatternContext):
-        gain_db_cp = _evaluate_s1528_rec12_pattern_cp(pattern_context, theta_deg_cp)
-        lin_cp = cp.power(cp.float32(10.0), gain_db_cp.astype(cp.float32, copy=False) * cp.float32(0.1))
-        return lin_cp * cp.float32(float(inv_gmax_lin))
+        # Rec 1.2 also builds a 1-D regular-grid LUT (via
+        # ``_ensure_s1528_gain_lut_1d`` which dispatches to the Rec 1.2
+        # piecewise analytical evaluator at build time), so the same
+        # fused ``LUT → dB → linear`` kernel can be reused here.
+        return _evaluate_s1528_pattern_cp_lut_1d_to_linear(
+            pattern_context, theta_deg_cp, inv_gmax_lin=float(inv_gmax_lin),
+        )
     if isinstance(pattern_context, GpuIsotropicPatternContext):
         theta_cp = _to_cupy_array(theta_deg_cp, dtype=cp.float32)
         return cp.full(theta_cp.shape, cp.float32(float(inv_gmax_lin)), dtype=cp.float32)
+    if isinstance(pattern_context, GpuCustomPattern1DContext):
+        # Custom 1-D: same regular-grid LUT structure as Rec 1.2 / Rec 1.4
+        # symmetric, so the same fused kernel applies.
+        return _evaluate_custom_1d_pattern_cp_to_linear(
+            pattern_context, theta_deg_cp, inv_gmax_lin=float(inv_gmax_lin),
+        )
+    if isinstance(pattern_context, GpuCustomPattern2DContext):
+        raise NotImplementedError(
+            "Custom 2-D pattern routed into the 1-D normalised evaluator — "
+            "callers with a phi-aware geometry (aggregate surface-PFD cap, "
+            "main power path) must take the Custom-2D branch explicitly. "
+            "θ-only aggregate PFD with a 2-D custom pattern is not "
+            "physically meaningful."
+        )
     raise TypeError(
         f"Unsupported transmit pattern for normalised evaluation: {type(pattern_context).__name__}"
     )
@@ -10970,13 +14528,31 @@ def _build_peak_pfd_k_lut_cp(
             "_build_peak_pfd_k_lut_cp expects an axisymmetric pattern; "
             "route M.2101 contexts through _build_peak_pfd_k_lut_2d_cp."
         )
+    if isinstance(pattern_context, GpuS1528PatternContext) and pattern_context.is_2d:
+        raise TypeError(
+            "_build_peak_pfd_k_lut_cp expects an axisymmetric pattern; "
+            "route asymmetric S.1528 Rec 1.4 contexts (lt_m != lr_m) "
+            "through _build_peak_pfd_k_lut_asym_s1528_cp."
+        )
+    if isinstance(pattern_context, GpuCustomPattern2DContext):
+        raise TypeError(
+            "_build_peak_pfd_k_lut_cp expects an axisymmetric pattern; "
+            "route Custom-2D pattern contexts through the dedicated "
+            "Custom-2D builder (Stage 17)."
+        )
     if not isinstance(
         pattern_context,
-        (GpuS1528PatternContext, GpuS1528Rec12PatternContext, GpuIsotropicPatternContext),
+        (
+            GpuS1528PatternContext,
+            GpuS1528Rec12PatternContext,
+            GpuIsotropicPatternContext,
+            GpuCustomPattern1DContext,
+        ),
     ):
         raise TypeError(
             "Surface-PFD cap LUT requires an S.1528 / S.1528 Rec 1.2 / "
-            f"isotropic pattern context; got {type(pattern_context).__name__}."
+            "isotropic / Custom-1D pattern context; "
+            f"got {type(pattern_context).__name__}."
         )
 
     earth_r = float(earth_radius_m)
@@ -11299,6 +14875,324 @@ def _build_peak_pfd_k_lut_2d_cp(
     )
 
 
+def _build_peak_pfd_k_lut_asym_s1528_cp(
+    *,
+    pattern_context: "GpuS1528PatternContext",
+    orbit_radius_m: float,
+    earth_radius_m: float,
+    atmosphere_lut_context: "GpuAtmosphereLutContext | None",
+    target_alt_km: float,
+    beta_step_deg: float = 0.01,
+    beta_extra_margin_deg: float = 10.0,
+    psi_step_deg: float = 0.005,
+    phi_step_deg: float = 2.0,
+    beta_chunk: int = 64,
+) -> tuple[Any, float, float, int, float]:
+    """Build ``K(β)`` for an asymmetric S.1528 Rec 1.4 pattern.
+
+    Produces a 1-D LUT with the same shape and semantics as the
+    axisymmetric 1-D builder. The asymmetric pattern has the elegant
+    property that the on-surface peak PFD is α-invariant: the aperture
+    axes rotate with the beam, so sweeping observation over the full
+    360° around nadir gives the same max for any steering azimuth.
+
+    Unlike the axisymmetric 1-D builder, this function sweeps a 2-D
+    observation grid ``(ψ, φ)`` — because the asymmetric pattern gain
+    depends on both the off-boresight angle ``θ`` AND the azimuth
+    around boresight, a 1-D ``|ψ − β|`` sweep would miss the true max
+    whenever the main-lobe peak sits at a non-symmetric φ.
+
+    With ``α_i = 0`` (WLOG by α-invariance), per steering ``β_i`` the
+    observation direction is ``(α_o=φ, β_o=ψ)``; θ and φ (relative to
+    boresight) are derived via standard spherical geometry. The max
+    over observation candidates gives ``K(β_i)``.
+    """
+    if not (
+        isinstance(pattern_context, GpuS1528PatternContext)
+        and pattern_context.is_2d
+    ):
+        raise TypeError(
+            "_build_peak_pfd_k_lut_asym_s1528_cp requires an asymmetric "
+            "GpuS1528PatternContext (is_2d=True); got "
+            f"{type(pattern_context).__name__}."
+        )
+
+    earth_r = float(earth_radius_m)
+    r_orbit = float(orbit_radius_m)
+    if not np.isfinite(r_orbit) or r_orbit <= earth_r:
+        raise ValueError(
+            f"orbit_radius_m ({r_orbit!r}) must be finite and greater than "
+            f"earth_radius_m ({earth_r!r})."
+        )
+    if not np.isfinite(beta_step_deg) or beta_step_deg <= 0.0:
+        raise ValueError("beta_step_deg must be positive.")
+    if not np.isfinite(psi_step_deg) or psi_step_deg <= 0.0:
+        raise ValueError("psi_step_deg must be positive.")
+    if not np.isfinite(phi_step_deg) or phi_step_deg <= 0.0:
+        raise ValueError("phi_step_deg must be positive.")
+
+    sin_horizon = earth_r / r_orbit
+    psi_horizon_rad = float(np.arcsin(sin_horizon))
+    psi_horizon_deg = float(np.degrees(psi_horizon_rad))
+
+    beta_max_deg = float(min(psi_horizon_deg + float(beta_extra_margin_deg), 89.99))
+    n_beta = int(math.floor(beta_max_deg / float(beta_step_deg))) + 1
+    beta_grid_host = np.arange(n_beta, dtype=np.float32) * np.float32(beta_step_deg)
+    beta_max_deg = float(beta_grid_host[-1])
+
+    # 2-D observation grid: ψ ∈ [0, psi_horizon], φ ∈ [0, 360).
+    n_psi = int(math.floor(psi_horizon_deg / float(psi_step_deg))) + 1
+    if n_psi < 2:
+        raise ValueError(
+            f"ψ grid too coarse: psi_horizon={psi_horizon_deg:.3f}° with step "
+            f"{psi_step_deg!r}° only yields {n_psi} samples."
+        )
+    psi_grid_host = np.arange(n_psi, dtype=np.float32) * np.float32(psi_step_deg)
+    n_phi = int(math.floor(360.0 / float(phi_step_deg)))
+    if n_phi < 4:
+        raise ValueError(
+            f"φ grid too coarse: step {phi_step_deg!r}° only yields {n_phi} samples."
+        )
+    phi_grid_host = np.arange(n_phi, dtype=np.float32) * np.float32(phi_step_deg)
+    n_cand = int(n_psi) * int(n_phi)
+
+    psi_cp = cp.asarray(psi_grid_host, dtype=cp.float32)
+    phi_cp = cp.asarray(phi_grid_host, dtype=cp.float32)
+    psi_flat_cp = cp.broadcast_to(psi_cp[:, None], (n_psi, n_phi)).reshape(-1)
+    phi_flat_cp = cp.broadcast_to(phi_cp[None, :], (n_psi, n_phi)).reshape(-1)
+
+    # Per-candidate slant range + atmosphere (depends only on β_o = ψ).
+    d2r = cp.float32(np.pi / 180.0)
+    r2d = cp.float32(180.0 / np.pi)
+    r_orbit_f32 = cp.float32(r_orbit)
+    psi_rad_cp = psi_flat_cp * d2r
+    cos_psi_cp = cp.cos(psi_rad_cp)
+    sin_psi_cp = cp.sin(psi_rad_cp)
+    term_cp = r_orbit_f32 * cos_psi_cp
+    disc_cp = term_cp * term_cp - cp.float32(r_orbit * r_orbit - earth_r * earth_r)
+    disc_cp = cp.maximum(disc_cp, cp.float32(0.0))
+    d_cp = term_cp - cp.sqrt(disc_cp)
+    d_cp = cp.maximum(d_cp, cp.float32(1.0))
+
+    if atmosphere_lut_context is not None:
+        cos_e_ground_cp = cp.clip(
+            cp.float32(r_orbit / earth_r) * cp.abs(sin_psi_cp),
+            cp.float32(0.0), cp.float32(1.0),
+        )
+        e_ground_deg_cp = cp.arccos(cos_e_ground_cp) * cp.float32(180.0 / np.pi)
+        e_ground_deg_cp = cp.maximum(
+            e_ground_deg_cp, cp.float32(atmosphere_lut_context.elev_min_deg),
+        )
+        atm_cp = _lookup_atmosphere_lut_cp(
+            atmosphere_lut_context, e_ground_deg_cp, altitude_km=float(target_alt_km),
+        ).astype(cp.float32, copy=False)
+        atm_cp = cp.clip(atm_cp, cp.float32(0.0), cp.float32(1.0))
+    else:
+        atm_cp = cp.ones((n_cand,), dtype=cp.float32)
+
+    four_pi_f32 = cp.float32(4.0 * np.pi)
+    geom_factor_cp = atm_cp / (four_pi_f32 * d_cp * d_cp)           # (n_cand,)
+
+    gmax_lin = _pattern_peak_gain_linear(pattern_context)
+    inv_gmax_lin = cp.float32(1.0 / gmax_lin if gmax_lin > 0.0 else 1.0)
+
+    # Observation trig (α_i = 0, so Δα = α_o itself).
+    sin_bo_1d = sin_psi_cp                                          # (n_cand,)
+    cos_bo_1d = cos_psi_cp
+    delta_a_1d = phi_flat_cp * d2r                                  # α_i = 0
+    cos_da_1d = cp.cos(delta_a_1d)
+    sin_da_1d = cp.sin(delta_a_1d)
+
+    beta_grid_cp = cp.asarray(beta_grid_host, dtype=cp.float32)
+    k_out_cp = cp.empty((n_beta,), dtype=cp.float32)
+
+    chunk = max(1, int(beta_chunk))
+    for chunk_start in range(0, n_beta, chunk):
+        chunk_end = min(chunk_start + chunk, n_beta)
+        beta_i = beta_grid_cp[chunk_start:chunk_end, None] * d2r    # (chunk, 1)
+        sin_bi = cp.sin(beta_i)
+        cos_bi = cp.cos(beta_i)
+
+        # θ, φ of observation relative to beam boresight.
+        cos_theta = cos_bi * cos_bo_1d[None, :] * cos_da_1d[None, :] + sin_bi * sin_bo_1d[None, :]
+        cos_theta = cp.clip(cos_theta, cp.float32(-1.0), cp.float32(1.0))
+        theta_deg = cp.arccos(cos_theta) * r2d
+
+        phi_rad = cp.arctan2(
+            cos_bi * sin_bo_1d[None, :] - sin_bi * cos_bo_1d[None, :] * cos_da_1d[None, :],
+            cos_bo_1d[None, :] * sin_da_1d[None, :],
+        )
+        phi_deg = phi_rad * r2d
+
+        # Fused 2-D LUT + dB→linear + inv_gmax in one kernel.
+        p_rel = _evaluate_s1528_pattern_cp_lut_2d_to_linear(
+            pattern_context,
+            theta_deg.ravel(), phi_deg.ravel(),
+            inv_gmax_lin=float(inv_gmax_lin),
+        ).reshape(theta_deg.shape)
+
+        pfd_norm = p_rel * geom_factor_cp[None, :]
+        k_out_cp[chunk_start:chunk_end] = cp.max(pfd_norm, axis=1)
+
+    return k_out_cp, float(beta_step_deg), float(beta_max_deg), int(n_beta), float(psi_horizon_deg)
+
+
+def _build_peak_pfd_k_lut_custom2d_cp(
+    *,
+    pattern_context: "GpuCustomPattern2DContext",
+    orbit_radius_m: float,
+    earth_radius_m: float,
+    atmosphere_lut_context: "GpuAtmosphereLutContext | None",
+    target_alt_km: float,
+    beta_step_deg: float = 0.01,
+    beta_extra_margin_deg: float = 10.0,
+    psi_step_deg: float = 0.005,
+    phi_step_deg: float = 2.0,
+    beta_chunk: int = 64,
+) -> tuple[Any, float, float, int, float]:
+    """Build ``K(β)`` for a Custom-2D pattern — 1-D LUT output.
+
+    Stage 17 of the 30-stage custom-antenna plan. *Design correction
+    from the original plan* (see Stage-10 decision doc): Custom-2D
+    patterns are authored in boresight-relative angles (either
+    ``(az, el)`` with boresight at the origin or ``(θ, φ)`` around
+    boresight), so the aperture rotates with the beam — just like
+    asymmetric S.1528 Rec 1.4. That makes K α-invariant and a 1-D
+    ``K(β)`` table correct and much cheaper than a 2-D ``K(α, β)``.
+    Only M.2101's body-frame-fixed element pattern justifies a 2-D
+    K-LUT.
+
+    Structurally identical to :func:`_build_peak_pfd_k_lut_asym_s1528_cp`
+    — same 2-D ``(ψ, φ)`` observation sweep per steering ``β_i``,
+    same α_i=0 WLOG trick, same free-space-PFD integrand. Only the
+    pattern evaluator differs: ``_evaluate_custom_2d_from_theta_phi``
+    dispatches the user's chosen ``grid_mode`` (``theta_phi`` → direct;
+    ``az_el`` → schema ``(θ, φ) → (az, el)`` conversion) so this
+    builder stays grid-mode-agnostic.
+    """
+    if not isinstance(pattern_context, GpuCustomPattern2DContext):
+        raise TypeError(
+            "_build_peak_pfd_k_lut_custom2d_cp requires a "
+            "GpuCustomPattern2DContext; "
+            f"got {type(pattern_context).__name__}."
+        )
+
+    earth_r = float(earth_radius_m)
+    r_orbit = float(orbit_radius_m)
+    if not np.isfinite(r_orbit) or r_orbit <= earth_r:
+        raise ValueError(
+            f"orbit_radius_m ({r_orbit!r}) must be finite and greater than "
+            f"earth_radius_m ({earth_r!r})."
+        )
+    if not np.isfinite(beta_step_deg) or beta_step_deg <= 0.0:
+        raise ValueError("beta_step_deg must be positive.")
+    if not np.isfinite(psi_step_deg) or psi_step_deg <= 0.0:
+        raise ValueError("psi_step_deg must be positive.")
+    if not np.isfinite(phi_step_deg) or phi_step_deg <= 0.0:
+        raise ValueError("phi_step_deg must be positive.")
+
+    sin_horizon = earth_r / r_orbit
+    psi_horizon_rad = float(np.arcsin(sin_horizon))
+    psi_horizon_deg = float(np.degrees(psi_horizon_rad))
+
+    beta_max_deg = float(min(psi_horizon_deg + float(beta_extra_margin_deg), 89.99))
+    n_beta = int(math.floor(beta_max_deg / float(beta_step_deg))) + 1
+    beta_grid_host = np.arange(n_beta, dtype=np.float32) * np.float32(beta_step_deg)
+    beta_max_deg = float(beta_grid_host[-1])
+
+    n_psi = int(math.floor(psi_horizon_deg / float(psi_step_deg))) + 1
+    if n_psi < 2:
+        raise ValueError(
+            f"ψ grid too coarse: psi_horizon={psi_horizon_deg:.3f}° with step "
+            f"{psi_step_deg!r}° only yields {n_psi} samples."
+        )
+    psi_grid_host = np.arange(n_psi, dtype=np.float32) * np.float32(psi_step_deg)
+    n_phi = int(math.floor(360.0 / float(phi_step_deg)))
+    if n_phi < 4:
+        raise ValueError(
+            f"φ grid too coarse: step {phi_step_deg!r}° only yields {n_phi} samples."
+        )
+    phi_grid_host = np.arange(n_phi, dtype=np.float32) * np.float32(phi_step_deg)
+    n_cand = int(n_psi) * int(n_phi)
+
+    psi_cp = cp.asarray(psi_grid_host, dtype=cp.float32)
+    phi_cp = cp.asarray(phi_grid_host, dtype=cp.float32)
+    psi_flat_cp = cp.broadcast_to(psi_cp[:, None], (n_psi, n_phi)).reshape(-1)
+    phi_flat_cp = cp.broadcast_to(phi_cp[None, :], (n_psi, n_phi)).reshape(-1)
+
+    d2r = cp.float32(np.pi / 180.0)
+    r2d = cp.float32(180.0 / np.pi)
+    r_orbit_f32 = cp.float32(r_orbit)
+    psi_rad_cp = psi_flat_cp * d2r
+    cos_psi_cp = cp.cos(psi_rad_cp)
+    sin_psi_cp = cp.sin(psi_rad_cp)
+    term_cp = r_orbit_f32 * cos_psi_cp
+    disc_cp = term_cp * term_cp - cp.float32(r_orbit * r_orbit - earth_r * earth_r)
+    disc_cp = cp.maximum(disc_cp, cp.float32(0.0))
+    d_cp = term_cp - cp.sqrt(disc_cp)
+    d_cp = cp.maximum(d_cp, cp.float32(1.0))
+
+    if atmosphere_lut_context is not None:
+        cos_e_ground_cp = cp.clip(
+            cp.float32(r_orbit / earth_r) * cp.abs(sin_psi_cp),
+            cp.float32(0.0), cp.float32(1.0),
+        )
+        e_ground_deg_cp = cp.arccos(cos_e_ground_cp) * cp.float32(180.0 / np.pi)
+        e_ground_deg_cp = cp.maximum(
+            e_ground_deg_cp, cp.float32(atmosphere_lut_context.elev_min_deg),
+        )
+        atm_cp = _lookup_atmosphere_lut_cp(
+            atmosphere_lut_context, e_ground_deg_cp, altitude_km=float(target_alt_km),
+        ).astype(cp.float32, copy=False)
+        atm_cp = cp.clip(atm_cp, cp.float32(0.0), cp.float32(1.0))
+    else:
+        atm_cp = cp.ones((n_cand,), dtype=cp.float32)
+
+    four_pi_f32 = cp.float32(4.0 * np.pi)
+    geom_factor_cp = atm_cp / (four_pi_f32 * d_cp * d_cp)
+
+    gmax_lin = _pattern_peak_gain_linear(pattern_context)
+    inv_gmax_lin = cp.float32(1.0 / gmax_lin if gmax_lin > 0.0 else 1.0)
+
+    sin_bo_1d = sin_psi_cp
+    cos_bo_1d = cos_psi_cp
+    delta_a_1d = phi_flat_cp * d2r
+    cos_da_1d = cp.cos(delta_a_1d)
+    sin_da_1d = cp.sin(delta_a_1d)
+
+    beta_grid_cp = cp.asarray(beta_grid_host, dtype=cp.float32)
+    k_out_cp = cp.empty((n_beta,), dtype=cp.float32)
+
+    chunk = max(1, int(beta_chunk))
+    for chunk_start in range(0, n_beta, chunk):
+        chunk_end = min(chunk_start + chunk, n_beta)
+        beta_i = beta_grid_cp[chunk_start:chunk_end, None] * d2r
+        sin_bi = cp.sin(beta_i)
+        cos_bi = cp.cos(beta_i)
+
+        cos_theta = cos_bi * cos_bo_1d[None, :] * cos_da_1d[None, :] + sin_bi * sin_bo_1d[None, :]
+        cos_theta = cp.clip(cos_theta, cp.float32(-1.0), cp.float32(1.0))
+        theta_deg = cp.arccos(cos_theta) * r2d
+
+        phi_rad = cp.arctan2(
+            cos_bi * sin_bo_1d[None, :] - sin_bi * cos_bo_1d[None, :] * cos_da_1d[None, :],
+            cos_bo_1d[None, :] * sin_da_1d[None, :],
+        )
+        phi_deg = phi_rad * r2d
+
+        # Fused Custom-2D LUT + dB→linear + inv_gmax in one kernel.
+        p_rel = _evaluate_custom_2d_from_theta_phi_to_linear(
+            pattern_context,
+            theta_deg.ravel(), phi_deg.ravel(),
+            inv_gmax_lin=float(inv_gmax_lin),
+        ).reshape(theta_deg.shape)
+
+        pfd_norm = p_rel * geom_factor_cp[None, :]
+        k_out_cp[chunk_start:chunk_end] = cp.max(pfd_norm, axis=1)
+
+    return k_out_cp, float(beta_step_deg), float(beta_max_deg), int(n_beta), float(psi_horizon_deg)
+
+
 def _lookup_peak_pfd_k_cp(
     lut_context: GpuPeakPfdLutContext,
     beta_rad_cp: Any,
@@ -11516,12 +15410,19 @@ def _compute_aggregate_surface_pfd_cap_cp(
 
     _require_cupy()
     is_m2101 = isinstance(pattern_context, GpuM2101PatternContext)
-    if not is_m2101 and not isinstance(
-        pattern_context, (GpuS1528PatternContext, GpuS1528Rec12PatternContext),
+    is_custom2d = isinstance(pattern_context, GpuCustomPattern2DContext)
+    if not is_m2101 and not is_custom2d and not isinstance(
+        pattern_context,
+        (
+            GpuS1528PatternContext,
+            GpuS1528Rec12PatternContext,
+            GpuCustomPattern1DContext,
+        ),
     ):
         raise TypeError(
-            "Aggregate surface-PFD cap requires an S.1528 / S.1528 Rec 1.2 "
-            f"or M.2101 pattern context; got {type(pattern_context).__name__}."
+            "Aggregate surface-PFD cap requires an S.1528 / S.1528 Rec 1.2 / "
+            "M.2101 / Custom-1D / Custom-2D pattern context; got "
+            f"{type(pattern_context).__name__}."
         )
 
     leading_shape = tuple(int(x) for x in beam_alpha_cp.shape[:-1])
@@ -11672,133 +15573,205 @@ def _compute_aggregate_surface_pfd_cap_cp(
     # Build candidate directions for the WHOLE n_groups in a single pass
     # (no Python loop).  Memory footprint: (n_groups, n_cand_total, K_act)
     # float32 for cos_theta/theta_deg/p_rel ≈
-    # ``n_groups · n_cand · K_act · 4 B``.  With active compaction this
-    # is bounded for realistic batches.  If the caller passes a
-    # ``chunk_memory_budget_bytes`` that would be exceeded, we raise a
-    # clear error asking them to shrink ``bulk_timesteps`` — there is no
-    # Python-level loop fallback on purpose.
-    est_bytes_per_group = int(n_cand_total) * int(K_act) * 4 * 3  # cos_theta, theta_deg, p_rel
+    # ``n_groups · n_cand · K_act · 4 B``.  For small-to-medium batches
+    # this fits in the transient budget (≤ 1 GB).  For larger n_groups
+    # (4-D boresight with many sky cells × visible sats) we chunk over
+    # the n_groups axis: each group is independent, so chunking does
+    # not change the physics — only the transient memory footprint.
+    est_bytes_per_group = int(n_cand_total) * int(K_act) * 4 * 3
+    est_bytes_per_group = max(est_bytes_per_group, 1)
     total_bytes = int(n_groups) * est_bytes_per_group
     if total_bytes > int(chunk_memory_budget_bytes):
-        raise MemoryError(
-            "Aggregate surface-PFD cap would need "
-            f"{total_bytes / 1024**2:.0f} MB for the candidate tensor at "
-            f"n_groups={n_groups}, n_cand={n_cand_total}, K_act={K_act}, "
-            f"exceeding chunk_memory_budget_bytes="
-            f"{int(chunk_memory_budget_bytes) / 1024**2:.0f} MB. Reduce "
-            "bulk_timesteps or raise the budget via chunk_memory_budget_bytes."
-        )
+        chunk_size = max(1, int(chunk_memory_budget_bytes) // est_bytes_per_group)
+    else:
+        chunk_size = int(n_groups)
 
-    # Footprints: v_beams itself, (n_groups, K_act, 3)
-    # Nadir: (1, 1, 3) broadcast → (n_groups, 1, 3)
-    nadir_slice = cp.broadcast_to(nadir_vec[None, None, :], (n_groups, 1, 3))
-    # Pair midpoints: (n_groups, n_pair, 3) — only populated when
-    # ``include_pair_midpoints`` is True (see K_act cutoff above).
     if include_pair_midpoints and n_pair > 0:
         i_pair_host, j_pair_host = np.triu_indices(K_act, k=1)
         i_pair_cp = cp.asarray(i_pair_host, dtype=cp.int32)
         j_pair_cp = cp.asarray(j_pair_host, dtype=cp.int32)
-        v_i = v_beams[:, i_pair_cp, :]
-        v_j = v_beams[:, j_pair_cp, :]
-        pair_sum = v_i + v_j
-        pair_norm = cp.linalg.norm(pair_sum, axis=-1, keepdims=True)
-        pair_mid = pair_sum / cp.maximum(pair_norm, cp.float32(1.0e-30))
     else:
-        pair_mid = cp.empty((n_groups, 0, 3), dtype=cp.float32)
-    # Beam↔nadir midpoints: (n_groups, K_act, 3)
-    bn_sum = v_beams + nadir_vec[None, None, :]
-    bn_norm = cp.linalg.norm(bn_sum, axis=-1, keepdims=True)
-    bn_mid = bn_sum / cp.maximum(bn_norm, cp.float32(1.0e-30))
+        i_pair_cp = None
+        j_pair_cp = None
 
-    candidates = cp.concatenate([v_beams, nadir_slice, pair_mid, bn_mid], axis=1)
-    # candidates shape: (n_groups, n_cand_total, 3)
+    peak_pfd_flat_cp = cp.zeros((n_groups,), dtype=cp.float32)
 
-    # ψ_c = arccos(v_c.z); use cos/sin directly to avoid an arccos
-    cos_psi_c = cp.clip(candidates[:, :, 2], cp.float32(-1.0), cp.float32(1.0))
-    sin_psi_c = cp.sqrt(cp.maximum(cp.float32(1.0) - cos_psi_c * cos_psi_c, cp.float32(0.0)))
+    def _process_slice(start: int, stop: int) -> None:
+        chunk = int(stop) - int(start)
+        if chunk <= 0:
+            return
+        v_beams_s = v_beams[start:stop]
+        eirp_c_s = eirp_c[start:stop]
+        orbit_flat_s = orbit_flat[start:stop]
+        beam_alpha_c_s = beam_alpha_c[start:stop]
+        beam_beta_c_s = beam_beta_c[start:stop]
+        sin_beta_c_s = sin_beta_c[start:stop]
+        cos_beta_c_s = cos_beta_c[start:stop]
 
-    # d(ψ) — near-intersection of candidate ray with Earth sphere
-    r_exp = orbit_flat[:, None]                          # (n_groups, 1)
-    term = r_exp * cos_psi_c                             # (n_groups, n_cand)
-    disc = term * term - (r_exp * r_exp - cp.float32(earth_r_m * earth_r_m))
-    disc = cp.maximum(disc, cp.float32(0.0))
-    d_c = term - cp.sqrt(disc)
-    d_c = cp.maximum(d_c, cp.float32(1.0))
+        # Nadir: (1, 1, 3) broadcast → (chunk, 1, 3)
+        nadir_slice_s = cp.broadcast_to(nadir_vec[None, None, :], (chunk, 1, 3))
+        # Pair midpoints for this chunk
+        if include_pair_midpoints and n_pair > 0:
+            v_i = v_beams_s[:, i_pair_cp, :]
+            v_j = v_beams_s[:, j_pair_cp, :]
+            pair_sum = v_i + v_j
+            pair_norm = cp.linalg.norm(pair_sum, axis=-1, keepdims=True)
+            pair_mid_s = pair_sum / cp.maximum(pair_norm, cp.float32(1.0e-30))
+        else:
+            pair_mid_s = cp.empty((chunk, 0, 3), dtype=cp.float32)
+        # Beam↔nadir midpoints: (chunk, K_act, 3)
+        bn_sum = v_beams_s + nadir_vec[None, None, :]
+        bn_norm = cp.linalg.norm(bn_sum, axis=-1, keepdims=True)
+        bn_mid_s = bn_sum / cp.maximum(bn_norm, cp.float32(1.0e-30))
 
-    # Atmosphere — mirror the hot power kernel exactly
-    if atmosphere_lut_context is not None:
-        cos_e_ground = cp.clip(
-            (r_exp / cp.float32(earth_r_m)) * cp.abs(sin_psi_c),
-            cp.float32(0.0), cp.float32(1.0),
+        candidates_s = cp.concatenate(
+            [v_beams_s, nadir_slice_s, pair_mid_s, bn_mid_s], axis=1,
+        )  # (chunk, n_cand_total, 3)
+
+        # ψ_c = arccos(v_c.z); use cos/sin directly to avoid an arccos
+        cos_psi_c = cp.clip(candidates_s[:, :, 2], cp.float32(-1.0), cp.float32(1.0))
+        sin_psi_c = cp.sqrt(
+            cp.maximum(cp.float32(1.0) - cos_psi_c * cos_psi_c, cp.float32(0.0))
         )
-        e_ground_deg = cp.arccos(cos_e_ground) * cp.float32(180.0 / np.pi)
-        e_ground_deg = cp.maximum(
-            e_ground_deg, cp.float32(atmosphere_lut_context.elev_min_deg)
-        )
-        atm_c = _lookup_atmosphere_lut_cp(
-            atmosphere_lut_context, e_ground_deg, altitude_km=float(target_alt_km),
-        ).astype(cp.float32, copy=False)
-        atm_c = cp.clip(atm_c, cp.float32(0.0), cp.float32(1.0))
-    else:
-        atm_c = cp.ones_like(d_c)
 
-    geom_factor = atm_c / (four_pi * d_c * d_c)          # (n_groups, n_cand)
+        r_exp = orbit_flat_s[:, None]
+        term = r_exp * cos_psi_c
+        disc = term * term - (r_exp * r_exp - cp.float32(earth_r_m * earth_r_m))
+        disc = cp.maximum(disc, cp.float32(0.0))
+        d_c = term - cp.sqrt(disc)
+        d_c = cp.maximum(d_c, cp.float32(1.0))
 
-    if is_m2101:
-        # M.2101: pattern is 2-D in sat-body (az, el).  Mirror the hot-path
-        # convention exactly — ``beam_alpha_rad * 180/π`` is fed to the
-        # M.2101 kernel as ``az_i`` and ``beam_beta_rad * 180/π`` as
-        # ``el_i``.  We recover the same coordinates for each candidate by
-        # inverting the ``v = (sin β cos α, sin β sin α, cos β)`` spherical
-        # parameterization used above to build ``candidates``.
-        cand_cos_beta = cp.clip(candidates[..., 2], cp.float32(-1.0), cp.float32(1.0))
-        cand_beta_rad = cp.arccos(cand_cos_beta)
-        cand_alpha_rad = cp.arctan2(candidates[..., 1], candidates[..., 0])
-        deg_per_rad = cp.float32(180.0 / np.pi)
-        cand_az_deg = cand_alpha_rad * deg_per_rad             # (n_groups, n_cand)
-        cand_el_deg = cand_beta_rad * deg_per_rad              # (n_groups, n_cand)
-        beam_az_deg = beam_alpha_c * deg_per_rad               # (n_groups, K_act)
-        beam_el_deg = beam_beta_c * deg_per_rad                # (n_groups, K_act)
+        if atmosphere_lut_context is not None:
+            cos_e_ground = cp.clip(
+                (r_exp / cp.float32(earth_r_m)) * cp.abs(sin_psi_c),
+                cp.float32(0.0), cp.float32(1.0),
+            )
+            e_ground_deg = cp.arccos(cos_e_ground) * cp.float32(180.0 / np.pi)
+            e_ground_deg = cp.maximum(
+                e_ground_deg, cp.float32(atmosphere_lut_context.elev_min_deg)
+            )
+            atm_c = _lookup_atmosphere_lut_cp(
+                atmosphere_lut_context, e_ground_deg,
+                altitude_km=float(target_alt_km),
+            ).astype(cp.float32, copy=False)
+            atm_c = cp.clip(atm_c, cp.float32(0.0), cp.float32(1.0))
+        else:
+            atm_c = cp.ones_like(d_c)
 
-        # Broadcast to (n_groups, n_cand, K_act) and flatten for the
-        # elementwise kernel.
-        az_o_b = cp.broadcast_to(
-            cand_az_deg[:, :, None], (n_groups, n_cand_total, K_act),
-        )
-        el_o_b = cp.broadcast_to(
-            cand_el_deg[:, :, None], (n_groups, n_cand_total, K_act),
-        )
-        az_i_b = cp.broadcast_to(
-            beam_az_deg[:, None, :], (n_groups, n_cand_total, K_act),
-        )
-        el_i_b = cp.broadcast_to(
-            beam_el_deg[:, None, :], (n_groups, n_cand_total, K_act),
-        )
-        p_rel_flat = _evaluate_m2101_pattern_cp_lut_to_linear(
-            pattern_context,
-            az_o_b.reshape(-1), el_o_b.reshape(-1),
-            az_i_b.reshape(-1), el_i_b.reshape(-1),
-            inv_gmax_lin=float(inv_gmax_lin),
-        )
-        p_rel = p_rel_flat.reshape((n_groups, n_cand_total, K_act))
-    else:
-        # cos(angle) between every (candidate, beam) pair via batched matmul.
-        # candidates: (n_groups, n_cand, 3); v_beams: (n_groups, K_act, 3)
-        # Output: (n_groups, n_cand, K_act)
-        cos_theta = cp.matmul(candidates, v_beams.transpose(0, 2, 1))
-        cos_theta = cp.clip(cos_theta, cp.float32(-1.0), cp.float32(1.0))
-        theta_deg = cp.arccos(cos_theta) * cp.float32(180.0 / np.pi)
+        geom_factor_s = atm_c / (four_pi * d_c * d_c)
 
-        p_rel_flat = _evaluate_normalised_pattern_cp(
-            pattern_context, theta_deg.reshape(-1), inv_gmax_lin=inv_gmax_lin,
-        )
-        p_rel = p_rel_flat.reshape(theta_deg.shape)          # (n_groups, n_cand, K_act)
+        if is_m2101:
+            cand_cos_beta = cp.clip(candidates_s[..., 2], cp.float32(-1.0), cp.float32(1.0))
+            cand_beta_rad = cp.arccos(cand_cos_beta)
+            cand_alpha_rad = cp.arctan2(candidates_s[..., 1], candidates_s[..., 0])
+            deg_per_rad = cp.float32(180.0 / np.pi)
+            cand_az_deg = cand_alpha_rad * deg_per_rad
+            cand_el_deg = cand_beta_rad * deg_per_rad
+            beam_az_deg = beam_alpha_c_s * deg_per_rad
+            beam_el_deg = beam_beta_c_s * deg_per_rad
+            az_o_b = cp.broadcast_to(cand_az_deg[:, :, None], (chunk, n_cand_total, K_act))
+            el_o_b = cp.broadcast_to(cand_el_deg[:, :, None], (chunk, n_cand_total, K_act))
+            az_i_b = cp.broadcast_to(beam_az_deg[:, None, :], (chunk, n_cand_total, K_act))
+            el_i_b = cp.broadcast_to(beam_el_deg[:, None, :], (chunk, n_cand_total, K_act))
+            p_rel_flat = _evaluate_m2101_pattern_cp_lut_to_linear(
+                pattern_context,
+                az_o_b.reshape(-1), el_o_b.reshape(-1),
+                az_i_b.reshape(-1), el_i_b.reshape(-1),
+                inv_gmax_lin=float(inv_gmax_lin),
+            )
+            p_rel_s = p_rel_flat.reshape((chunk, n_cand_total, K_act))
+        else:
+            cos_theta = cp.matmul(candidates_s, v_beams_s.transpose(0, 2, 1))
+            cos_theta = cp.clip(cos_theta, cp.float32(-1.0), cp.float32(1.0))
+            theta_deg = cp.arccos(cos_theta) * cp.float32(180.0 / np.pi)
 
-    # Aggregate sum across beam axis, then max across candidates
-    pfd_per_beam = eirp_c[:, None, :] * p_rel * geom_factor[:, :, None]
-    pfd_agg = cp.sum(pfd_per_beam, axis=-1)              # (n_groups, n_cand)
-    peak_pfd_flat_cp = cp.max(pfd_agg, axis=-1)          # (n_groups,)
+            if getattr(pattern_context, "is_2d", False):
+                cand_cos_beta = cp.clip(candidates_s[..., 2], cp.float32(-1.0), cp.float32(1.0))
+                cand_sin_beta = cp.sqrt(
+                    cp.maximum(cp.float32(1.0) - cand_cos_beta * cand_cos_beta, cp.float32(0.0))
+                )
+                cand_alpha = cp.arctan2(candidates_s[..., 1], candidates_s[..., 0])
+                delta_a = beam_alpha_c_s[:, None, :] - cand_alpha[:, :, None]
+                cos_da = cp.cos(delta_a)
+                sin_da = cp.sin(delta_a)
+                phi_rad = cp.arctan2(
+                    cos_beta_c_s[:, None, :] * cand_sin_beta[:, :, None]
+                    - sin_beta_c_s[:, None, :] * cand_cos_beta[:, :, None] * cos_da,
+                    cand_cos_beta[:, :, None] * sin_da,
+                )
+                phi_deg = phi_rad * cp.float32(180.0 / np.pi)
+                p_rel_flat = _evaluate_s1528_pattern_cp_lut_2d_to_linear(
+                    pattern_context,
+                    theta_deg.reshape(-1), phi_deg.reshape(-1),
+                    inv_gmax_lin=float(inv_gmax_lin),
+                )
+            elif is_custom2d:
+                # Body-frame native routing (lever #1 extended to
+                # aggregate-cap path).  Compute x_body / y_body / z_body
+                # components of the candidate direction in the BEAM's
+                # body frame, then hand them to the single-launch fused
+                # kernel.  Eliminates arccos(cos_theta) for theta_deg,
+                # the phi atan2 + rad→deg multiply, AND the separate
+                # θ/φ → az/el conversion kernel that
+                # ``_evaluate_custom_2d_from_theta_phi_to_linear`` would
+                # otherwise invoke for az_el-authored Custom-2D
+                # patterns.  Reuses the exact trig components the
+                # analytical-S.1528 2-D branch above also computes,
+                # so the only extra arithmetic per call is the two
+                # body-frame formulas below.
+                cand_cos_beta = cp.clip(candidates_s[..., 2], cp.float32(-1.0), cp.float32(1.0))
+                cand_sin_beta = cp.sqrt(
+                    cp.maximum(cp.float32(1.0) - cand_cos_beta * cand_cos_beta, cp.float32(0.0))
+                )
+                cand_alpha = cp.arctan2(candidates_s[..., 1], candidates_s[..., 0])
+                delta_a = beam_alpha_c_s[:, None, :] - cand_alpha[:, :, None]
+                cos_da = cp.cos(delta_a)
+                sin_da = cp.sin(delta_a)
+                # Body-frame unit-vector components of the candidate in
+                # the beam's local frame (beam boresight along +Z):
+                #   x_body = cand_cos_beta * sin_da
+                #   y_body = cos_beta_c * cand_sin_beta
+                #          - sin_beta_c * cand_cos_beta * cos_da
+                #   z_body = cos_theta   (already computed via matmul)
+                # Matches the body-frame derivation used in the 3-D /
+                # 4-D power paths post-lever-2.
+                x_body = cand_cos_beta[:, :, None] * sin_da
+                y_body = (
+                    cos_beta_c_s[:, None, :] * cand_sin_beta[:, :, None]
+                    - sin_beta_c_s[:, None, :] * cand_cos_beta[:, :, None] * cos_da
+                )
+                z_body = cos_theta
+                p_rel_flat = _evaluate_custom_2d_from_body_frame_to_linear(
+                    pattern_context,
+                    x_body.reshape(-1),
+                    y_body.reshape(-1),
+                    z_body.reshape(-1),
+                    inv_gmax_lin=float(inv_gmax_lin),
+                )
+            else:
+                p_rel_flat = _evaluate_normalised_pattern_cp(
+                    pattern_context, theta_deg.reshape(-1), inv_gmax_lin=inv_gmax_lin,
+                )
+            p_rel_s = p_rel_flat.reshape(theta_deg.shape)
 
+        # Aggregate sum across beam axis, then max across candidates
+        pfd_per_beam = eirp_c_s[:, None, :] * p_rel_s * geom_factor_s[:, :, None]
+        pfd_agg = cp.sum(pfd_per_beam, axis=-1)
+        peak_pfd_s = cp.max(pfd_agg, axis=-1)
+        peak_pfd_flat_cp[start:stop] = peak_pfd_s
+
+    for _start in range(0, n_groups, chunk_size):
+        _stop = min(_start + chunk_size, n_groups)
+        _process_slice(_start, _stop)
+
+    # Guard against NaN from groups with zero valid beams.  When
+    # ``K_act > 0`` (because at least one group has active beams) but a
+    # specific group has zero active beams, its compacted beam slots
+    # contain NaN directions → candidate PFD evaluates to NaN → peak is
+    # NaN.  Replace NaN peaks with 0 (no emission → no cap needed).
+    peak_pfd_flat_cp = cp.where(
+        cp.isnan(peak_pfd_flat_cp), cp.float32(0.0), peak_pfd_flat_cp,
+    )
     peak_safe = cp.maximum(peak_pfd_flat_cp, cp.float32(1.0e-30))
     cap_factor_flat_cp = cp.minimum(
         cp.float32(1.0), max_pfd_lin_cp / peak_safe,
@@ -12072,6 +16045,57 @@ def _get_hist_bin_mask_kernel():
     return _hist_bin_mask_kernel
 
 
+_histogram_1d_atomic_raw_module = None
+
+
+def _get_histogram_1d_atomic_kernel():
+    """Fused atomic accumulator kernel for
+    :func:`_histogram_positive_value_db_cp`.
+
+    1-D analogue of ``_get_histogram_2d_atomic_kernel``: replaces the
+    ``_dbw_k`` + ``cp.searchsorted`` + ``_hist_bin_mask_kernel`` +
+    ``cp.bincount`` + ``astype(int64)`` chain with a single atomicAdd
+    kernel.  Used by every 1-D distribution collector (EPFD, Prx total,
+    Total PFD RAS, per-satellite PFD), each called up to 4× per batch.
+    """
+    global _histogram_1d_atomic_raw_module
+    if _histogram_1d_atomic_raw_module is not None:
+        return _histogram_1d_atomic_raw_module
+    _histogram_1d_atomic_raw_module = cp.RawModule(code=r"""
+extern "C" __global__
+void histogram_1d_atomic(
+    const float* __restrict__ value_flat,
+    const float* __restrict__ value_edges,
+    long long* __restrict__ hist,
+    const long long n_total,
+    const int n_bins,
+    const int n_edges,
+    const float db_offset_db)
+{
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_total) return;
+    float v_lin = value_flat[i];
+    if (!isfinite(v_lin) || v_lin <= 0.0f) return;
+    float dbw = log10f(v_lin) * 10.0f + db_offset_db;
+    if (!isfinite(dbw)) return;
+
+    /* Binary search: upper_bound in value_edges, matches
+     * cp.searchsorted(value_edges, dbw, side="right") - 1. */
+    int lo = 0, hi = n_edges;
+    while (lo < hi) {
+        int mid = (lo + hi) >> 1;
+        if (value_edges[mid] <= dbw) lo = mid + 1;
+        else hi = mid;
+    }
+    int yb = lo - 1;
+    if (yb < 0 || yb >= n_bins) return;
+
+    atomicAdd((unsigned long long*)&hist[yb], (unsigned long long)1);
+}
+""")
+    return _histogram_1d_atomic_raw_module
+
+
 def _histogram_positive_value_db_cp(
     *,
     value_linear: Any,
@@ -12085,14 +16109,105 @@ def _histogram_positive_value_db_cp(
         raise ValueError("value_edges_dbw must define at least one histogram bin.")
 
     flat = value_cp.reshape(-1)
-    # Fused: compute 10*log10(x)+offset in one kernel; NaN for invalid
-    dbw = _get_log10_masked_dbw_kernel()(flat, cp.float32(float(db_offset_db)))
-    # searchsorted gives bin index (right side) — pass as raw_bin_plus1
-    raw_bin_plus1 = cp.searchsorted(value_edges_cp, dbw, side="right")
-    # Fused: valid check + range check + clamp → (kept_bin, weight) in one kernel
-    kept_bins, weights = _get_hist_bin_mask_kernel()(raw_bin_plus1, dbw, cp.int64(n_bins))
-    counts = cp.bincount(kept_bins, weights=weights, minlength=n_bins)
-    return counts.astype(cp.int64, copy=False)
+    # The raw kernel indexes ``value_flat[i]`` assuming a contiguous
+    # float32 layout; non-contiguous ``reshape`` views would read wrong
+    # data (see iteration 15 contiguity-bug write-up). Enforce
+    # contiguity explicitly before the launch.
+    if (not flat.flags.c_contiguous) or flat.dtype != cp.float32:
+        flat = cp.ascontiguousarray(flat, dtype=cp.float32)
+
+    hist = cp.zeros(n_bins, dtype=cp.int64)
+    n_total = int(flat.size)
+    if n_total <= 0:
+        return hist
+    kernel = _get_histogram_1d_atomic_kernel().get_function("histogram_1d_atomic")
+    threads = 256
+    blocks = (n_total + threads - 1) // threads
+    kernel(
+        (blocks,), (threads,),
+        (
+            flat,
+            value_edges_cp,
+            hist,
+            np.int64(n_total),
+            np.int32(n_bins),
+            np.int32(int(value_edges_cp.size)),
+            np.float32(float(db_offset_db)),
+        ),
+    )
+    return hist
+
+
+_histogram_2d_atomic_raw_module = None
+
+
+def _get_histogram_2d_atomic_kernel():
+    """Fused atomic accumulator kernel for ``_histogram_value_vs_elevation_cp``.
+
+    Replaces the per-slab chain of ``cp.tile(x_bin)`` +
+    ``cp.tile(x_valid)`` + ``_get_log10_masked_dbw_kernel`` +
+    ``cp.searchsorted`` + ``_get_heatmap_2d_bin_kernel`` +
+    ``cp.bincount(pair, weights=weight, minlength=nx*ny)`` +
+    ``reshape`` + ``astype(int64)`` + in-place ``hist += …`` with a
+    single ``atomicAdd`` kernel.
+
+    Per thread:
+      - derive ``base_idx = i % n_base`` to look up the precomputed
+        ``x_bin`` / ``x_valid`` without materialising a tiled copy
+      - compute ``dBw = 10·log10(v) + offset`` inline
+      - binary-search the ``value_edges`` array (matches
+        ``cp.searchsorted(side="right") - 1``)
+      - ``atomicAdd`` one count into the output ``hist[xb * ny + yb]``
+
+    Eliminates 6 intermediate arrays (x_bin_rep, x_valid_rep, dbw,
+    raw_y, pair, weight) and 6-7 kernel launches per sky slab.
+    """
+    global _histogram_2d_atomic_raw_module
+    if _histogram_2d_atomic_raw_module is not None:
+        return _histogram_2d_atomic_raw_module
+    _histogram_2d_atomic_raw_module = cp.RawModule(code=r"""
+extern "C" __global__
+void histogram_2d_atomic(
+    const float* __restrict__ value_flat,
+    const long long* __restrict__ x_bin_base,
+    const bool* __restrict__ x_valid_base,
+    const float* __restrict__ value_edges,
+    long long* __restrict__ hist,
+    const long long n_total,
+    const long long n_base,
+    const int nx,
+    const int ny,
+    const int ny_edges,
+    const float db_offset_db)
+{
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_total) return;
+    long long base_idx = (n_base > 0) ? (i % n_base) : 0;
+    long long xb = x_bin_base[base_idx];
+    bool xv = x_valid_base[base_idx];
+    if (!xv || xb < 0 || xb >= nx) return;
+
+    float v_lin = value_flat[i];
+    if (!isfinite(v_lin) || v_lin <= 0.0f) return;
+    float dbw = log10f(v_lin) * 10.0f + db_offset_db;
+    if (!isfinite(dbw)) return;
+
+    /* Binary search: upper_bound in value_edges, matches
+     * cp.searchsorted(value_edges, dbw, side="right") - 1. */
+    int lo = 0, hi = ny_edges;
+    while (lo < hi) {
+        int mid = (lo + hi) >> 1;
+        if (value_edges[mid] <= dbw) lo = mid + 1;
+        else hi = mid;
+    }
+    int yb = lo - 1;
+    if (yb < 0 || yb >= ny) return;
+
+    atomicAdd((unsigned long long*)&hist[xb * (long long)ny + yb],
+              (unsigned long long)1);
+}
+""")
+    return _histogram_2d_atomic_raw_module
 
 
 def _histogram_value_vs_elevation_cp(
@@ -12132,44 +16247,60 @@ def _histogram_value_vs_elevation_cp(
     x_valid = cp.isfinite(elev_flat) & (x_bin >= 0) & (x_bin < nx)
     x_bin = x_bin.astype(cp.int32, copy=False)
 
-    db_offset_cp = cp.float32(float(db_offset_db))
+    db_offset_f = float(db_offset_db)
     slab_width = max(1, int(sky_slab))
     n_sky = int(value_cp.shape[2])
 
-    if n_sky == 1:
-        # Fast dense path for non-boresight: avoid cp.nonzero entirely
-        flat_val = value_cp.reshape(-1)
-        dbw = _get_log10_masked_dbw_kernel()(flat_val, db_offset_cp)
-        raw_y = cp.searchsorted(value_edges_cp, dbw, side="right")
-        _hk = _get_heatmap_2d_bin_kernel()
-        pair, weight = _hk(
-            x_bin.astype(cp.int64, copy=False),
-            raw_y,
-            dbw,
-            x_valid,
-            cp.int64(nx),
-            cp.int64(ny),
+    # Fused atomic-add histogram kernel — single-launch replacement for the
+    # tile + dbw + searchsorted + heatmap_2d_bin + bincount chain.
+    atomic_kernel = _get_histogram_2d_atomic_kernel().get_function("histogram_2d_atomic")
+    # Persistent inputs to every slab call
+    x_bin_base = x_bin.astype(cp.int64, copy=False)
+    x_valid_base = x_valid.astype(cp.bool_, copy=False)
+    n_base = x_bin_base.size
+    hist_flat = hist.reshape(-1)
+    nx_i32 = np.int32(nx)
+    ny_i32 = np.int32(ny)
+    ny_edges_i32 = np.int32(int(value_edges_cp.size))
+    db_offset_f32 = np.float32(db_offset_f)
+
+    def _launch_atomic(slab_flat: Any) -> None:
+        n_total = int(slab_flat.size)
+        if n_total <= 0:
+            return
+        # The raw kernel reads ``value_flat[i]`` assuming a contiguous
+        # float32 layout.  CuPy's ``reshape(-1)`` on a non-contiguous
+        # slice (e.g. ``value_cp[:, :, a:b]`` when the sky axis is the
+        # inner axis) returns a **strided view**, not a copy — same
+        # `shape=(N,)`` but ``strides != (4,)``.  Force contiguity
+        # explicitly so the kernel's linear index math holds.
+        if (not slab_flat.flags.c_contiguous) or slab_flat.dtype != cp.float32:
+            slab_flat = cp.ascontiguousarray(slab_flat, dtype=cp.float32)
+        threads = 256
+        blocks = (n_total + threads - 1) // threads
+        atomic_kernel(
+            (blocks,), (threads,),
+            (
+                slab_flat,
+                x_bin_base,
+                x_valid_base,
+                value_edges_cp,
+                hist_flat,
+                np.int64(n_total),
+                np.int64(int(n_base)),
+                nx_i32,
+                ny_i32,
+                ny_edges_i32,
+                db_offset_f32,
+            ),
         )
-        hist += cp.bincount(pair, weights=weight, minlength=nx * ny).reshape(nx, ny).astype(cp.int64)
+
+    if n_sky == 1:
+        _launch_atomic(value_cp.reshape(-1))
     else:
-        # Dense path for boresight (n_sky > 1): flatten entire (T*S, sky)
-        # into one pass per sky slab — no cp.nonzero, use fused kernels.
-        _dbw_k = _get_log10_masked_dbw_kernel()
-        _hk = _get_heatmap_2d_bin_kernel()
-        x_bin_i64 = x_bin.astype(cp.int64, copy=False)
         for sky_start in range(0, n_sky, slab_width):
             sky_stop = min(sky_start + slab_width, n_sky)
-            n_cols = sky_stop - sky_start
-            # Flatten slab: (T*S, n_cols) → (T*S*n_cols,)
-            slab_flat = value_cp[:, :, sky_start:sky_stop].reshape(-1)
-            # Replicate x_bin and x_valid for each sky column
-            x_bin_rep = cp.tile(x_bin_i64, n_cols)
-            x_valid_rep = cp.tile(x_valid, n_cols)
-            # Fused dB conversion
-            dbw = _dbw_k(slab_flat, db_offset_cp)
-            raw_y = cp.searchsorted(value_edges_cp, dbw, side="right")
-            pair, weight = _hk(x_bin_rep, raw_y, dbw, x_valid_rep, cp.int64(nx), cp.int64(ny))
-            hist += cp.bincount(pair, weights=weight, minlength=nx * ny).reshape(nx, ny).astype(cp.int64)
+            _launch_atomic(value_cp[:, :, sky_start:sky_stop].reshape(-1))
 
     return hist
 
@@ -12342,35 +16473,83 @@ def _accumulate_beamforming_collapsed_power_cp(
         sat_el_rad = sat_elevation_deg * d2r
         if tel_az.ndim >= 2:
             sky_count = int(tel_az.shape[1])
-        if sky_count > 1:
-            # Per-(t, sky, sat) γ
-            tel_az_rad = (tel_az * d2r)[:, :, None]
-            tel_el_rad = (tel_el * d2r)[:, :, None]
-            sat_az_3 = sat_az_rad[:, None, :]
-            sat_el_3 = sat_el_rad[:, None, :]
-            cos_gamma = (
-                cp.sin(tel_el_rad) * cp.sin(sat_el_3)
-                + cp.cos(tel_el_rad) * cp.cos(sat_el_3)
-                * cp.cos(tel_az_rad - sat_az_3)
+        _ras_is_custom_2d = isinstance(
+            ras_pattern_context, GpuCustomPattern2DContext,
+        )
+        # Try fused RX kernel (angular distance + RA.1631 pattern + dB→linear
+        # in one launch) — same kernel used by the directive path.
+        _use_fused_rx_bc = isinstance(ras_pattern_context, GpuRasPatternContext)
+        if _use_fused_rx_bc:
+            _d_wlen = np.float32(ras_pattern_context.diameter_m / ras_pattern_context.wavelength_m)
+            _gmax_r = np.float32(10.0 * np.log10(ras_pattern_context.eta_a_dimless * (np.pi * _d_wlen) ** 2))
+            _g1_r = np.float32(-1.0 + 15.0 * np.log10(_d_wlen))
+            _phi_m_r = np.float32(20.0 / _d_wlen * np.sqrt(_gmax_r - _g1_r))
+            _phi_r_r = np.float32(15.85 * _d_wlen ** -0.6)
+            _rx_k = _get_rx_angular_distance_ras_lin_kernel()
+            sat_az_deg_f32 = sat_topo_cp[:, :, 0].astype(cp.float32, copy=False)
+            if sky_count > 1:
+                grx_per_sky_sat = _rx_k(
+                    tel_az[:, :, None].astype(cp.float32, copy=False),
+                    tel_el[:, :, None].astype(cp.float32, copy=False),
+                    sat_az_deg_f32[:, None, :],
+                    sat_elevation_deg[:, None, :].astype(cp.float32, copy=False),
+                    _d_wlen, _gmax_r, _g1_r, _phi_m_r, _phi_r_r,
+                )
+            else:
+                tel_az_use = tel_az[:, 0] if tel_az.ndim >= 2 else tel_az
+                tel_el_use = tel_el[:, 0] if tel_el.ndim >= 2 else tel_el
+                grx_lin_2d = _rx_k(
+                    (tel_az_use[:, None] if tel_az_use.ndim == 1 else tel_az_use).astype(cp.float32, copy=False),
+                    (tel_el_use[:, None] if tel_el_use.ndim == 1 else tel_el_use).astype(cp.float32, copy=False),
+                    sat_az_deg_f32,
+                    sat_elevation_deg.astype(cp.float32, copy=False),
+                    _d_wlen, _gmax_r, _g1_r, _phi_m_r, _phi_r_r,
+                )
+        elif sky_count > 1:
+            # Fallback for custom RAS patterns (Custom-1D/2D).
+            # Fused angular distance (14 ops → 1) + fused phi (10 ops → 1).
+            _ang_k = _get_rx_angular_distance_only_kernel()
+            grx_offset_deg = _ang_k(
+                tel_az[:, :, None].astype(cp.float32, copy=False),
+                tel_el[:, :, None].astype(cp.float32, copy=False),
+                sat_az_deg_f32[:, None, :],
+                sat_elevation_deg[:, None, :].astype(cp.float32, copy=False),
             )
-            cp.clip(cos_gamma, cp.float32(-1), cp.float32(1), out=cos_gamma)
-            grx_offset_deg = cp.arccos(cos_gamma) * cp.float32(57.29577951308232)
-            grx_db = _evaluate_ras_pattern_cp(ras_pattern_context, grx_offset_deg)
+            grx_phi_deg = (
+                _ras_boresight_frame_phi_deg(
+                    (tel_az * d2r)[:, :, None],
+                    (tel_el * d2r)[:, :, None],
+                    sat_az_rad[:, None, :],
+                    sat_el_rad[:, None, :],
+                )
+                if _ras_is_custom_2d else None
+            )
+            grx_db = _evaluate_ras_pattern_cp(
+                ras_pattern_context, grx_offset_deg, grx_phi_deg,
+            )
             grx_per_sky_sat = cp.power(cp.float32(10.0), grx_db * cp.float32(0.1))
         else:
-            # Legacy: single-pointing case (ndim < 2 or N_sky == 1).
             tel_az_use = tel_az[:, 0] if tel_az.ndim >= 2 else tel_az
             tel_el_use = tel_el[:, 0] if tel_el.ndim >= 2 else tel_el
-            tel_az_rad = (tel_az_use[:, None] * d2r) if tel_az_use.ndim == 1 else tel_az_use * d2r
-            tel_el_rad = (tel_el_use[:, None] * d2r) if tel_el_use.ndim == 1 else tel_el_use * d2r
-            cos_gamma = (
-                cp.sin(tel_el_rad) * cp.sin(sat_el_rad)
-                + cp.cos(tel_el_rad) * cp.cos(sat_el_rad)
-                * cp.cos(tel_az_rad - sat_az_rad)
+            _ang_k = _get_rx_angular_distance_only_kernel()
+            grx_offset_deg = _ang_k(
+                (tel_az_use[:, None] if tel_az_use.ndim == 1 else tel_az_use).astype(cp.float32, copy=False),
+                (tel_el_use[:, None] if tel_el_use.ndim == 1 else tel_el_use).astype(cp.float32, copy=False),
+                sat_az_deg_f32,
+                sat_elevation_deg.astype(cp.float32, copy=False),
             )
-            cp.clip(cos_gamma, cp.float32(-1), cp.float32(1), out=cos_gamma)
-            grx_offset_deg = cp.arccos(cos_gamma) * cp.float32(57.29577951308232)
-            grx_db = _evaluate_ras_pattern_cp(ras_pattern_context, grx_offset_deg)
+            grx_phi_deg = (
+                _ras_boresight_frame_phi_deg(
+                    ((tel_az_use[:, None] if tel_az_use.ndim == 1 else tel_az_use) * d2r).astype(cp.float32, copy=False),
+                    ((tel_el_use[:, None] if tel_el_use.ndim == 1 else tel_el_use) * d2r).astype(cp.float32, copy=False),
+                    sat_az_rad,
+                    sat_el_rad,
+                )
+                if _ras_is_custom_2d else None
+            )
+            grx_db = _evaluate_ras_pattern_cp(
+                ras_pattern_context, grx_offset_deg, grx_phi_deg,
+            )
             grx_lin_2d = cp.power(cp.float32(10.0), grx_db * cp.float32(0.1))
 
     pfd_scale = cp.float32(4.0 * float(np.pi) / (float(wavelength_m) ** 2))
@@ -12409,7 +16588,10 @@ def _accumulate_beamforming_collapsed_power_cp(
 def _accumulate_uemr_power_cp(
     *,
     uemr_pattern_context: "GpuIsotropicPatternContext",
-    ras_pattern_context: "GpuRasPatternContext | None",
+    ras_pattern_context: (
+        "GpuRasPatternContext | GpuCustomPattern1DContext"
+        " | GpuCustomPattern2DContext | None"
+    ),
     atmosphere_lut_context: "GpuAtmosphereLutContext | None",
     sat_topo: Any,
     telescope_azimuth_deg: Any | None,
@@ -12427,8 +16609,15 @@ def _accumulate_uemr_power_cp(
     include_per_satellite_prx: bool = False,
     include_total_pfd: bool = False,
     include_per_satellite_pfd: bool = False,
+    random_power_variation: bool = False,
+    power_dtype: Any = None,
+    pattern_dtype: Any = None,
 ) -> dict[str, Any]:
     """Compute per-satellite power / PFD / EPFD for a UEMR-mode system.
+
+    When ``random_power_variation=True``, each satellite at each
+    timestep radiates a uniformly distributed fraction ``U(0, 1)``
+    of the configured EIRP — models stochastic unwanted emissions.
 
     UEMR (unwanted emissions from internal circuitry) radiates isotropically,
     Gtx = 0 dBi in every direction, with no beam mechanics. Each visible
@@ -12459,6 +16648,12 @@ def _accumulate_uemr_power_cp(
         pipeline) multiplies in the in-band fraction of the transmit
         spectrum for the current spectral slab so the emission mask can
         shape UEMR power across frequency. Default ``1.0`` (no mask).
+    power_dtype
+        Dtype for power-stage accumulation (EIRP, FSPL, PFD, Prx).
+        Must be at least fp32 (fp16 silently promoted). ``None`` → fp32.
+    pattern_dtype
+        Dtype for RAS pattern evaluation (Grx angles and gain). Can be
+        fp16 for LUT-based patterns. ``None`` → fp32.
 
     Returns
     -------
@@ -12486,7 +16681,25 @@ def _accumulate_uemr_power_cp(
     if not np.isfinite(bandwidth_value) or bandwidth_value <= 0.0:
         raise ValueError("bandwidth_mhz must be finite and > 0.")
 
-    sat_topo_cp = _to_cupy_array(sat_topo, dtype=cp.float32)
+    # Resolve per-stage precision — mirrors the directive kernel's logic.
+    # Power must be >= fp32 (FSPL ~1e-16 underflows fp16).
+    # Pattern evaluation can use fp16; trig (sin/cos/arccos) always >= fp32.
+    pwr_dt = cp.float32
+    pat_dt = cp.float32
+    if power_dtype is not None:
+        _pwr = np.dtype(power_dtype)
+        if _pwr == np.dtype(np.float64):
+            pwr_dt = cp.float64
+        # fp16 not allowed for power — silently promote to fp32
+    if pattern_dtype is not None:
+        _pat = np.dtype(pattern_dtype)
+        if _pat == np.dtype(np.float64):
+            pat_dt = cp.float64
+        elif _pat == np.dtype(np.float16):
+            pat_dt = cp.float16
+    trig_dt = cp.float32 if pat_dt == cp.float16 else pat_dt
+
+    sat_topo_cp = _to_cupy_array(sat_topo, dtype=pwr_dt)
     if sat_topo_cp.ndim != 3 or sat_topo_cp.shape[2] != 3:
         raise ValueError(
             "sat_topo must have shape (T, S, 3); got "
@@ -12494,24 +16707,24 @@ def _accumulate_uemr_power_cp(
         )
     time_count, sat_count = int(sat_topo_cp.shape[0]), int(sat_topo_cp.shape[1])
     wavelength_m = float(uemr_pattern_context.wavelength_m)
-    range_m = sat_topo_cp[..., 2] * cp.float32(1000.0)
+    range_m = sat_topo_cp[..., 2] * pwr_dt(1000.0)
     sat_el_deg = sat_topo_cp[..., 1]
     sat_az_deg = sat_topo_cp[..., 0]
     # Radio-horizon aware visibility: use the same threshold the rest of
     # the pipeline applies (can be slightly negative when use_radio_horizon
     # extends visibility via tropospheric/ionospheric refraction).
-    vis = sat_el_deg > cp.float32(float(visibility_elev_threshold_deg))
+    vis = sat_el_deg > pwr_dt(float(visibility_elev_threshold_deg))
 
     if atmosphere_lut_context is not None:
         atm_lin = _lookup_atmosphere_lut_cp(
             atmosphere_lut_context, sat_el_deg, altitude_km=observer_alt_km,
-        ).astype(cp.float32, copy=False)
+        ).astype(pwr_dt, copy=False)
         # Atmosphere LUT returns linear transmission ∈ (0, 1]; clip so
         # LUT rounding artifacts cannot push the computed PFD above the
         # free-space value. Mirrors the directive power kernel behaviour.
-        atm_lin = cp.clip(atm_lin, cp.float32(0.0), cp.float32(1.0))
+        atm_lin = cp.clip(atm_lin, pwr_dt(0.0), pwr_dt(1.0))
     else:
-        atm_lin = cp.ones((time_count, sat_count), dtype=cp.float32)
+        atm_lin = cp.ones((time_count, sat_count), dtype=pwr_dt)
 
     # Resolve EIRP_channel in linear watts. Target-PFD mode reverse-maps the
     # user's requested surface PFD to an equivalent EIRP via a reference
@@ -12542,20 +16755,30 @@ def _accumulate_uemr_power_cp(
     slab_frac = float(eirp_slab_fraction_lin)
     if not np.isfinite(slab_frac) or slab_frac < 0.0:
         raise ValueError("eirp_slab_fraction_lin must be finite and non-negative.")
-    eirp_effective_w = cp.float32(eirp_lin_channel * slab_frac)
+
+    if random_power_variation:
+        # Each satellite at each timestep gets a random uniform [0, 1]
+        # factor multiplied into the EIRP — models stochastic UEMR.
+        rand_factor = cp.random.uniform(
+            low=0.0, high=1.0,
+            size=(time_count, sat_count),
+        ).astype(pwr_dt, copy=False)
+        eirp_effective_w = pwr_dt(eirp_lin_channel * slab_frac) * rand_factor
+    else:
+        eirp_effective_w = pwr_dt(eirp_lin_channel * slab_frac)
 
     # FSPL = (λ / 4π·d)². Guard against zero range.
-    wavelength_w = cp.float32(wavelength_m)
-    four_pi_w = cp.float32(4.0 * _math.pi)
-    range_safe = cp.where(vis, range_m, cp.float32(1.0))
-    fspl = cp.power(wavelength_w / (four_pi_w * range_safe), cp.float32(2.0))
-    fspl = cp.where(vis, fspl, cp.float32(0.0))
+    wavelength_w = pwr_dt(wavelength_m)
+    four_pi_w = pwr_dt(4.0 * _math.pi)
+    range_safe = cp.where(vis, range_m, pwr_dt(1.0))
+    fspl = cp.power(wavelength_w / (four_pi_w * range_safe), pwr_dt(2.0))
+    fspl = cp.where(vis, fspl, pwr_dt(0.0))
 
-    pfd_scale = cp.float32(4.0 * _math.pi / (wavelength_m * wavelength_m))
+    pfd_scale = pwr_dt(4.0 * _math.pi / (wavelength_m * wavelength_m))
     pfd_per_sat = eirp_effective_w * atm_lin / (
         four_pi_w * range_safe * range_safe
     )
-    pfd_per_sat = cp.where(vis, pfd_per_sat, cp.float32(0.0))
+    pfd_per_sat = cp.where(vis, pfd_per_sat, pwr_dt(0.0))
 
     # Grx(γ) for Prx / EPFD. UEMR is direction-agnostic on TX, but the
     # received Prx absolutely depends on RAS pointing direction because
@@ -12569,22 +16792,106 @@ def _accumulate_uemr_power_cp(
     # at index 0 → effective RAS pointing direction changed → peak Prx
     # shifted by ~10 dB with no physical justification).
     sky_count = 1
-    grx_lin: Any = cp.float32(1.0)
+    grx_lin: Any = pwr_dt(1.0)
     grx_per_sky_sat = None  # shape (T, N_sky, S) when computed
     if (
         ras_pattern_context is not None
         and telescope_azimuth_deg is not None
         and telescope_elevation_deg is not None
     ):
-        tel_az = _to_cupy_array(telescope_azimuth_deg, dtype=cp.float32)
-        tel_el = _to_cupy_array(telescope_elevation_deg, dtype=cp.float32)
-        d2r = cp.float32(_math.pi / 180.0)
-        sat_az_r = sat_az_deg * d2r            # shape (T, S)
-        sat_el_r = sat_el_deg * d2r            # shape (T, S)
+        tel_az = _to_cupy_array(telescope_azimuth_deg, dtype=trig_dt)
+        tel_el = _to_cupy_array(telescope_elevation_deg, dtype=trig_dt)
+        d2r = trig_dt(_math.pi / 180.0)
+        sat_az_r = sat_az_deg.astype(trig_dt, copy=False) * d2r
+        sat_el_r = sat_el_deg.astype(trig_dt, copy=False) * d2r
         if tel_az.ndim >= 2:
             sky_count = int(tel_az.shape[1])
-        if sky_count > 1:
-            # Per-(t, sky, sat) γ. tel_*_r shape (T, N_sky, 1); sat_*_r (T, 1, S).
+        _ras_is_custom_2d = isinstance(
+            ras_pattern_context, GpuCustomPattern2DContext,
+        )
+        # Try fused RX kernel: angular distance + RA.1631 pattern + dB→linear
+        # in one launch.  Works for both sky_count>1 (3D broadcast) and
+        # sky_count==1 (2D) because it's an ElementwiseKernel.
+        _use_fused_rx = (
+            pwr_dt == cp.float32
+            and isinstance(ras_pattern_context, GpuRasPatternContext)
+        )
+        if _use_fused_rx:
+            d_wlen = np.float32(ras_pattern_context.diameter_m / ras_pattern_context.wavelength_m)
+            _gmax_ras = np.float32(10.0 * np.log10(ras_pattern_context.eta_a_dimless * (np.pi * d_wlen) ** 2))
+            _g1_ras = np.float32(-1.0 + 15.0 * np.log10(d_wlen))
+            _phi_m_ras = np.float32(20.0 / d_wlen * np.sqrt(_gmax_ras - _g1_ras))
+            _phi_r_ras = np.float32(15.85 * d_wlen ** -0.6)
+            _rx_kernel = _get_rx_angular_distance_ras_lin_kernel()
+            if sky_count > 1:
+                # Per-(t, sky, sat): broadcast (T,N_sky,1) × (T,1,S) → (T,N_sky,S)
+                grx_per_sky_sat = _rx_kernel(
+                    tel_az[:, :, None].astype(cp.float32, copy=False),
+                    tel_el[:, :, None].astype(cp.float32, copy=False),
+                    sat_az_deg[:, None, :].astype(cp.float32, copy=False),
+                    sat_el_deg[:, None, :].astype(cp.float32, copy=False),
+                    d_wlen, _gmax_ras, _g1_ras, _phi_m_ras, _phi_r_ras,
+                )
+            else:
+                tel_az_use = tel_az[:, 0] if tel_az.ndim >= 2 else tel_az
+                tel_el_use = tel_el[:, 0] if tel_el.ndim >= 2 else tel_el
+                grx_lin = _rx_kernel(
+                    (tel_az_use[:, None] if tel_az_use.ndim == 1 else tel_az_use).astype(cp.float32, copy=False),
+                    (tel_el_use[:, None] if tel_el_use.ndim == 1 else tel_el_use).astype(cp.float32, copy=False),
+                    sat_az_deg.astype(cp.float32, copy=False),
+                    sat_el_deg.astype(cp.float32, copy=False),
+                    d_wlen, _gmax_ras, _g1_ras, _phi_m_ras, _phi_r_ras,
+                )
+        elif trig_dt == cp.float32 and sky_count > 1:
+            # Fused angular distance for Custom RAS patterns (fp32).
+            _ang_k = _get_rx_angular_distance_only_kernel()
+            gamma_deg = _ang_k(
+                tel_az[:, :, None].astype(cp.float32, copy=False),
+                tel_el[:, :, None].astype(cp.float32, copy=False),
+                sat_az_deg[:, None, :].astype(cp.float32, copy=False),
+                sat_el_deg[:, None, :].astype(cp.float32, copy=False),
+            )
+            phi_deg_cp = (
+                _ras_boresight_frame_phi_deg(
+                    (tel_az * d2r)[:, :, None], (tel_el * d2r)[:, :, None],
+                    sat_az_r[:, None, :], sat_el_r[:, None, :],
+                )
+                if _ras_is_custom_2d else None
+            )
+            grx_db = _evaluate_ras_pattern_cp(
+                ras_pattern_context, gamma_deg, phi_deg_cp,
+            )
+            grx_per_sky_sat = cp.power(
+                pwr_dt(10.0),
+                grx_db.astype(pwr_dt, copy=False) * pwr_dt(0.1),
+            )
+        elif trig_dt == cp.float32:
+            # Fused angular distance for Custom RAS patterns (fp32, single-sky).
+            tel_az_use = tel_az[:, 0] if tel_az.ndim >= 2 else tel_az
+            tel_el_use = tel_el[:, 0] if tel_el.ndim >= 2 else tel_el
+            _ang_k = _get_rx_angular_distance_only_kernel()
+            gamma_deg = _ang_k(
+                (tel_az_use[:, None] if tel_az_use.ndim == 1 else tel_az_use).astype(cp.float32, copy=False),
+                (tel_el_use[:, None] if tel_el_use.ndim == 1 else tel_el_use).astype(cp.float32, copy=False),
+                sat_az_deg.astype(cp.float32, copy=False),
+                sat_el_deg.astype(cp.float32, copy=False),
+            )
+            tel_az_r_1d = (tel_az_use[:, None] * d2r) if tel_az_use.ndim == 1 else tel_az_use * d2r
+            tel_el_r_1d = (tel_el_use[:, None] * d2r) if tel_el_use.ndim == 1 else tel_el_use * d2r
+            phi_deg_cp = (
+                _ras_boresight_frame_phi_deg(
+                    tel_az_r_1d.astype(cp.float32, copy=False),
+                    tel_el_r_1d.astype(cp.float32, copy=False),
+                    sat_az_r, sat_el_r,
+                )
+                if _ras_is_custom_2d else None
+            )
+            grx_db = _evaluate_ras_pattern_cp(
+                ras_pattern_context, gamma_deg, phi_deg_cp,
+            )
+            grx_lin = cp.power(pwr_dt(10.0), grx_db.astype(pwr_dt, copy=False) * pwr_dt(0.1))
+        elif sky_count > 1:
+            # fp64 fallback: per-(t, sky, sat) γ.
             tel_az_r = (tel_az * d2r)[:, :, None]
             tel_el_r = (tel_el * d2r)[:, :, None]
             sat_az_r3 = sat_az_r[:, None, :]
@@ -12593,14 +16900,23 @@ def _accumulate_uemr_power_cp(
                 cp.sin(tel_el_r) * cp.sin(sat_el_r3)
                 + cp.cos(tel_el_r) * cp.cos(sat_el_r3) * cp.cos(tel_az_r - sat_az_r3)
             )
-            cp.clip(cos_gamma, cp.float32(-1.0), cp.float32(1.0), out=cos_gamma)
-            gamma_deg = cp.arccos(cos_gamma) * cp.float32(180.0 / _math.pi)
-            grx_db = _evaluate_ras_pattern_cp(ras_pattern_context, gamma_deg)
+            cp.clip(cos_gamma, trig_dt(-1.0), trig_dt(1.0), out=cos_gamma)
+            gamma_deg = cp.arccos(cos_gamma) * trig_dt(180.0 / _math.pi)
+            phi_deg_cp = (
+                _ras_boresight_frame_phi_deg(
+                    tel_az_r, tel_el_r, sat_az_r3, sat_el_r3,
+                )
+                if _ras_is_custom_2d else None
+            )
+            grx_db = _evaluate_ras_pattern_cp(
+                ras_pattern_context, gamma_deg, phi_deg_cp,
+            )
             grx_per_sky_sat = cp.power(
-                cp.float32(10.0),
-                grx_db.astype(cp.float32, copy=False) * cp.float32(0.1),
+                pwr_dt(10.0),
+                grx_db.astype(pwr_dt, copy=False) * pwr_dt(0.1),
             )
         else:
+            # fp64 fallback: single-sky.
             tel_az_use = tel_az[:, 0] if tel_az.ndim >= 2 else tel_az
             tel_el_use = tel_el[:, 0] if tel_el.ndim >= 2 else tel_el
             tel_az_r = (tel_az_use[:, None] * d2r) if tel_az_use.ndim == 1 else tel_az_use * d2r
@@ -12609,10 +16925,18 @@ def _accumulate_uemr_power_cp(
                 cp.sin(tel_el_r) * cp.sin(sat_el_r)
                 + cp.cos(tel_el_r) * cp.cos(sat_el_r) * cp.cos(tel_az_r - sat_az_r)
             )
-            cp.clip(cos_gamma, cp.float32(-1.0), cp.float32(1.0), out=cos_gamma)
-            gamma_deg = cp.arccos(cos_gamma) * cp.float32(180.0 / _math.pi)
-            grx_db = _evaluate_ras_pattern_cp(ras_pattern_context, gamma_deg)
-            grx_lin = cp.power(cp.float32(10.0), grx_db.astype(cp.float32, copy=False) * cp.float32(0.1))
+            cp.clip(cos_gamma, trig_dt(-1.0), trig_dt(1.0), out=cos_gamma)
+            gamma_deg = cp.arccos(cos_gamma) * trig_dt(180.0 / _math.pi)
+            phi_deg_cp = (
+                _ras_boresight_frame_phi_deg(
+                    tel_az_r, tel_el_r, sat_az_r, sat_el_r,
+                )
+                if _ras_is_custom_2d else None
+            )
+            grx_db = _evaluate_ras_pattern_cp(
+                ras_pattern_context, gamma_deg, phi_deg_cp,
+            )
+            grx_lin = cp.power(pwr_dt(10.0), grx_db.astype(pwr_dt, copy=False) * pwr_dt(0.1))
 
     # Base per-sat power with FSPL + atmosphere (no RAS-receive gain yet).
     base_per_sat = eirp_effective_w * fspl * atm_lin   # shape (T, S)
@@ -12664,10 +16988,78 @@ def _accumulate_uemr_power_cp(
     return result
 
 
+_leakage_scale_fused_kernel: Any = None
+_cap_apply_fused_kernel: Any = None
+
+
+def _get_cap_apply_fused_kernel():
+    """Fused kernel: K × EIRP_peak → peak PFD → safety clamp → cap ratio →
+    validity mask → multiply into emitted EIRP.  Replaces 6 CuPy dispatches."""
+    global _cap_apply_fused_kernel
+    if _cap_apply_fused_kernel is not None:
+        return _cap_apply_fused_kernel
+    _cap_apply_fused_kernel = cp.ElementwiseKernel(
+        "float32 emitted_eirp, float32 k_val, float32 eirp_peak, "
+        "float32 cap_limit, bool valid_beam",
+        "float32 capped_eirp",
+        """
+        if (!valid_beam) {
+            capped_eirp = emitted_eirp;
+            return;
+        }
+        float peak_pfd = eirp_peak * k_val;
+        float peak_safe = peak_pfd > 1.0e-30f ? peak_pfd : 1.0e-30f;
+        float cap_factor = cap_limit / peak_safe;
+        if (cap_factor > 1.0f) cap_factor = 1.0f;
+        capped_eirp = emitted_eirp * cap_factor;
+        """,
+        "cap_apply_fused",
+    )
+    return _cap_apply_fused_kernel
+
+
+def _get_leakage_scale_fused_kernel():
+    """Fused kernel: beam-index → cell-index + boresight override + validity
+    check + leakage gather + EIRP multiply — replaces ~7 CuPy dispatches."""
+    global _leakage_scale_fused_kernel
+    if _leakage_scale_fused_kernel is not None:
+        return _leakage_scale_fused_kernel
+    _leakage_scale_fused_kernel = cp.ElementwiseKernel(
+        "int32 beam_idx, bool valid_beam, bool mask_bore, "
+        "float32 emitted_eirp_in, "
+        "raw float32 leakage_factors, "
+        "int32 n_links, int32 ras_cell_idx, int32 n_cells, "
+        "int32 use_bore",
+        "float32 emitted_eirp_out",
+        """
+        if (!valid_beam || beam_idx < 0) {
+            emitted_eirp_out = emitted_eirp_in;
+            return;
+        }
+        int cell_idx = beam_idx / n_links;
+        if (use_bore && mask_bore) {
+            cell_idx = ras_cell_idx;
+        }
+        if (cell_idx < 0 || cell_idx >= n_cells) {
+            emitted_eirp_out = 0.0f;
+            return;
+        }
+        emitted_eirp_out = emitted_eirp_in * leakage_factors[cell_idx];
+        """,
+        "leakage_scale_fused",
+    )
+    return _leakage_scale_fused_kernel
+
+
 def _accumulate_ras_power_cp(
     *,
     s1528_pattern_context: GpuS1528PatternContext | GpuS1528Rec12PatternContext | GpuM2101PatternContext,
-    ras_pattern_context: GpuRasPatternContext | None,
+    ras_pattern_context: (
+        GpuRasPatternContext
+        | GpuCustomPattern1DContext
+        | GpuCustomPattern2DContext
+        | None
+    ),
     atmosphere_lut_context: GpuAtmosphereLutContext | None,
     sat_topo: Any,
     sat_azel: Any,
@@ -12705,6 +17097,7 @@ def _accumulate_ras_power_cp(
     surface_pfd_stats_enabled: bool = False,
     precomputed_cap_factor_cp: Any | None = None,
     precomputed_cap_stats: dict[str, float] | None = None,
+    visibility_elev_threshold_deg: float = 0.0,
 ) -> dict[str, Any]:
     # Resolve per-stage precision.  The power stage must be at least fp32
     # because FSPL values (~1e-16) underflow fp16.  Pattern evaluation can
@@ -12828,15 +17221,9 @@ def _accumulate_ras_power_cp(
     # Derive peak gain: S.1528 uses gm_db directly; M.2101 uses element gain + array gain;
     # isotropic (UEMR leakage) has Gmax = 0 dBi = 1.0 linear.
     is_isotropic_ctx = isinstance(s1528_pattern_context, GpuIsotropicPatternContext)
-    if isinstance(s1528_pattern_context, GpuM2101PatternContext):
-        _gm_db = float(s1528_pattern_context.g_emax_db) + 10.0 * math.log10(
-            max(1, int(s1528_pattern_context.n_h) * int(s1528_pattern_context.n_v))
-        )
-    elif is_isotropic_ctx:
-        _gm_db = 0.0
-    else:
-        _gm_db = float(s1528_pattern_context.gm_db) if s1528_pattern_context.gm_db is not None else 0.0
-    gmax_lin = cp.float32(10.0 ** (_gm_db / 10.0) if _gm_db != 0.0 else 1.0)
+    # Peak linear gain; ``_pattern_peak_gain_linear`` handles every
+    # supported context type including Custom-1D / Custom-2D.
+    gmax_lin = cp.float32(_pattern_peak_gain_linear(s1528_pattern_context))
     pfd_from_prx_iso_scale = cp.float32((4.0 * np.pi) / (float(s1528_pattern_context.wavelength_m) ** 2))
     earth_radius_m = cp.float32(R_earth.to_value(u.m))
 
@@ -12973,7 +17360,7 @@ def _accumulate_ras_power_cp(
         cosb0 = cp.cos(beta0_rad)
         range_m = sat_topo_cp[..., 2].astype(pwr_dt, copy=False) * pwr_dt(1000.0)
         sat_elevation_deg = sat_topo_cp[..., 1].astype(pwr_dt, copy=False)
-        vis_horizon = sat_elevation_deg > pwr_dt(0.0)
+        vis_horizon = sat_elevation_deg > pwr_dt(float(visibility_elev_threshold_deg))
         orbit_radius = _to_cupy_array(orbit_radius_m_per_sat, dtype=pwr_dt).reshape(-1)
         if int(orbit_radius.size) != sat_count:
             raise ValueError(
@@ -12994,11 +17381,13 @@ def _accumulate_ras_power_cp(
         fspl_lin *= atm_ras_station
 
         valid_beam = beam_idx_cp >= 0
+        # Gate on satellite visibility BEFORE extracting active indices.
+        # This skips pattern + geometry + EIRP computation for invisible
+        # satellites (~40% of beam slots typically), giving a large
+        # reduction in power-stage work.  vis_horizon is (T, S), broadcast
+        # to (T, N_sky, S, K) via [:, None, :, None].
+        valid_beam &= vis_horizon[:, None, :, None]
         active_t_cp, active_sky_cp, active_sat_cp, active_slot_cp = cp.nonzero(valid_beam)
-        eirp_sum_flat_cp = cp.zeros(
-            (int(time_count) * int(sky_count) * int(sat_count),),
-            dtype=pwr_dt,
-        )
         if int(active_t_cp.size) > 0:
             # Pattern stage: trig in trig_dt, gain output in pat_dt
             active_alpha_cp = beam_alpha_cp[
@@ -13010,15 +17399,107 @@ def _accumulate_ras_power_cp(
             alpha0_active_cp = alpha0_rad[active_t_cp, active_sat_cp]
             sinb0_active_cp = sinb0[active_t_cp, active_sat_cp]
             cosb0_active_cp = cosb0[active_t_cp, active_sat_cp]
-            beam_sinb_cp = cp.sin(active_beta_cp)
-            beam_cosb_cp = cp.cos(active_beta_cp)
-            cos_da_cp = cp.cos(alpha0_active_cp - active_alpha_cp)
-            cos_gamma_tx_cp = cosb0_active_cp * beam_cosb_cp + sinb0_active_cp * beam_sinb_cp * cos_da_cp
-            cp.clip(cos_gamma_tx_cp, trig_dt(-1.0), trig_dt(1.0), out=cos_gamma_tx_cp)
+            # Fused trig: sin/cos β, Δα, sin/cos Δα, cos γ_tx in one launch.
+            # Replaces 9 separate CuPy operations.
+            if trig_dt == cp.float32:
+                _trig_4d_kernel = _get_4d_trig_kernel()
+                beam_sinb_cp, beam_cosb_cp, cos_gamma_tx_cp, sin_da_cp, cos_da_cp = (
+                    _trig_4d_kernel(
+                        active_alpha_cp, active_beta_cp,
+                        alpha0_active_cp, sinb0_active_cp, cosb0_active_cp,
+                    )
+                )
+            else:
+                # Non-fp32 trig: keep unfused path (kernel is fp32-only)
+                beam_sinb_cp = cp.sin(active_beta_cp)
+                beam_cosb_cp = cp.cos(active_beta_cp)
+                delta_a_cp = alpha0_active_cp - active_alpha_cp
+                cos_da_cp = cp.cos(delta_a_cp)
+                cos_gamma_tx_cp = cosb0_active_cp * beam_cosb_cp + sinb0_active_cp * beam_sinb_cp * cos_da_cp
+                cp.clip(cos_gamma_tx_cp, trig_dt(-1.0), trig_dt(1.0), out=cos_gamma_tx_cp)
             if is_isotropic_ctx:
                 # Isotropic UEMR leakage: Gtx = 0 dBi ⇒ abs=rel=1.0 everywhere.
                 gtx_abs_lin_cp = cp.ones(active_t_cp.shape, dtype=pwr_dt)
                 gtx_rel_lin_cp = gtx_abs_lin_cp
+            elif isinstance(s1528_pattern_context, GpuCustomPattern2DContext):
+                # Custom 2-D: MEGA pattern-eval kernel (lever #2).
+                # Takes raw beam trig directly (skips x_body/y_body
+                # intermediate compute) and emits BOTH rel and abs
+                # linear gain in ONE launch — replaces 3-5 launches
+                # (x_body mult, y_body arithmetic, body-frame kernel,
+                # gmax multiply) with 1.
+                sin_da_cp_c2d = (
+                    sin_da_cp if trig_dt == cp.float32
+                    else cp.sin(alpha0_active_cp - active_alpha_cp)
+                )
+                if pwr_dt in (cp.float32, cp.float64):
+                    gtx_rel_lin_cp, gtx_abs_lin_cp = (
+                        _evaluate_custom_2d_from_beam_trig_to_rel_abs_linear(
+                            s1528_pattern_context,
+                            beam_sinb_cp, beam_cosb_cp,
+                            sin_da_cp_c2d, cos_da_cp,
+                            sinb0_active_cp, cosb0_active_cp,
+                            cos_gamma_tx_cp,
+                            inv_gmax_lin=1.0 / float(gmax_lin),
+                            compute_dtype=pwr_dt,
+                        )
+                    )
+                else:
+                    # dead branch (pwr_dt always fp32 or fp64 today)
+                    # kept as a sentinel; fallback below handles
+                    # fp16/other compute dtype using body-frame path.
+                    x_body_cp = beam_cosb_cp * sin_da_cp_c2d
+                    y_body_cp = (
+                        cosb0_active_cp * beam_sinb_cp
+                        - sinb0_active_cp * beam_cosb_cp * cos_da_cp
+                    )
+                    z_body_cp = cos_gamma_tx_cp
+                    # fp16 / other compute dtype: body-frame kernel not
+                    # offered (fp16 power underflows FSPL downstream
+                    # anyway).  Fall back to the unfused path.
+                    if s1528_pattern_context.grid_mode == "az_el":
+                        az_rad_fb = cp.arctan2(x_body_cp, z_body_cp)
+                        y_clip_fb = cp.clip(y_body_cp, trig_dt(-1.0), trig_dt(1.0))
+                        el_rad_fb = cp.arcsin(y_clip_fb)
+                        a0_deg_fb = (az_rad_fb * trig_dt(180.0 / np.pi)).astype(pat_dt, copy=False)
+                        a1_deg_fb = (el_rad_fb * trig_dt(180.0 / np.pi)).astype(pat_dt, copy=False)
+                    else:
+                        z_clip_fb = cp.clip(z_body_cp, trig_dt(-1.0), trig_dt(1.0))
+                        th_rad_fb = cp.arccos(z_clip_fb)
+                        ph_rad_fb = cp.arctan2(y_body_cp, x_body_cp)
+                        a0_deg_fb = (th_rad_fb * trig_dt(180.0 / np.pi)).astype(pat_dt, copy=False)
+                        a1_deg_fb = (ph_rad_fb * trig_dt(180.0 / np.pi)).astype(pat_dt, copy=False)
+                    gtx_db_cp = _evaluate_custom_2d_pattern_cp(
+                        s1528_pattern_context, a0_deg_fb, a1_deg_fb,
+                    )
+                    gtx_abs_lin_cp = cp.power(
+                        pwr_dt(10.0),
+                        gtx_db_cp.astype(pwr_dt, copy=False) * pwr_dt(0.1),
+                    )
+                    gtx_rel_lin_cp = gtx_abs_lin_cp * pwr_dt(
+                        1.0 / float(gmax_lin)
+                    )
+            elif isinstance(s1528_pattern_context, GpuCustomPattern1DContext):
+                # Custom 1-D axisymmetric: drop-in for symmetric S.1528 —
+                # same cos_gamma_tx → theta pipeline, same fused LUT kernel.
+                gtx_offset_deg_cp = (
+                    cp.arccos(cos_gamma_tx_cp) * trig_dt(180.0 / np.pi)
+                ).astype(pat_dt, copy=False)
+                if pwr_dt == cp.float32:
+                    gtx_rel_lin_cp = _evaluate_custom_1d_pattern_cp_to_linear(
+                        s1528_pattern_context,
+                        gtx_offset_deg_cp,
+                        inv_gmax_lin=1.0 / float(gmax_lin),
+                    )
+                    gtx_abs_lin_cp = gtx_rel_lin_cp * pwr_dt(float(gmax_lin))
+                else:
+                    gtx_db_cp = _evaluate_custom_1d_pattern_cp(
+                        s1528_pattern_context, gtx_offset_deg_cp,
+                    )
+                    gtx_abs_lin_cp = cp.power(
+                        pwr_dt(10.0), gtx_db_cp.astype(pwr_dt, copy=False) * pwr_dt(0.1),
+                    )
+                    gtx_rel_lin_cp = gtx_abs_lin_cp * pwr_dt(1.0 / float(gmax_lin))
             elif isinstance(s1528_pattern_context, GpuM2101PatternContext):
                 # M.2101 phased array: need satellite-frame az/el for both
                 # the RAS direction (from sat_azel) and beam steering direction
@@ -13027,7 +17508,7 @@ def _accumulate_ras_power_cp(
                 ras_el_cp = sat_azel_cp[active_t_cp, active_sat_cp, 1].astype(cp.float32, copy=False)
                 steer_az_cp = (active_alpha_cp * trig_dt(180.0 / np.pi)).astype(cp.float32, copy=False)
                 steer_el_cp = (active_beta_cp * trig_dt(180.0 / np.pi)).astype(cp.float32, copy=False)
-                if _s1528_pattern_eval_mode == "lut" and pwr_dt == cp.float32:
+                if _pattern_eval_mode == "lut" and pwr_dt == cp.float32:
                     gtx_rel_lin_cp = _evaluate_m2101_pattern_cp_lut_to_linear(
                         s1528_pattern_context, ras_az_cp, ras_el_cp, steer_az_cp, steer_el_cp,
                         inv_gmax_lin=1.0 / float(gmax_lin),
@@ -13041,9 +17522,40 @@ def _accumulate_ras_power_cp(
                     gtx_rel_lin_cp = gtx_abs_lin_cp * pwr_dt(1.0 / float(gmax_lin))
             else:
                 gtx_offset_deg_cp = (cp.arccos(cos_gamma_tx_cp) * trig_dt(180.0 / np.pi)).astype(pat_dt, copy=False)
-                if _s1528_pattern_eval_mode == "lut" and pwr_dt == cp.float32:
+                if getattr(s1528_pattern_context, "is_2d", False):
+                    # Asymmetric S.1528 Rec 1.4: need azimuth phi around the
+                    # beam boresight. Derived from spherical geometry with
+                    # the boresight as pole — phi=0 aligned with the lr axis
+                    # (conventionally horizontal / azimuthal). The 4-fold
+                    # symmetry of the pattern in phi means the quadrant
+                    # choice does not matter (the LUT folds arbitrary phi).
+                    _sin_da_asym = sin_da_cp if trig_dt == cp.float32 else cp.sin(delta_a_cp)
+                    phi_rad_cp = cp.arctan2(
+                        cosb0_active_cp * beam_sinb_cp
+                        - sinb0_active_cp * beam_cosb_cp * cos_da_cp,
+                        beam_cosb_cp * _sin_da_asym,
+                    )
+                    phi_deg_cp = (phi_rad_cp * trig_dt(180.0 / np.pi)).astype(pat_dt, copy=False)
+                    if pwr_dt == cp.float32:
+                        # Fused 2-D LUT + dB→linear + inv_gmax in one kernel,
+                        # matching the 1-D fused path and the M.2101 kernel.
+                        # Avoids a separate ``cp.power(10, g/10) * inv_gmax``
+                        # round-trip that was ~2× the LUT-kernel cost.
+                        gtx_rel_lin_cp = _evaluate_s1528_pattern_cp_lut_2d_to_linear(
+                            s1528_pattern_context,
+                            gtx_offset_deg_cp, phi_deg_cp,
+                            inv_gmax_lin=1.0 / float(gmax_lin),
+                        )
+                        gtx_abs_lin_cp = gtx_rel_lin_cp * pwr_dt(float(gmax_lin))
+                    else:
+                        gtx_db_cp = _evaluate_s1528_pattern_cp(
+                            s1528_pattern_context, gtx_offset_deg_cp, phi_deg=phi_deg_cp,
+                        )
+                        gtx_abs_lin_cp = cp.power(pwr_dt(10.0), gtx_db_cp.astype(pwr_dt, copy=False) * pwr_dt(0.1))
+                        gtx_rel_lin_cp = gtx_abs_lin_cp * pwr_dt(1.0 / float(gmax_lin))
+                elif _pattern_eval_mode == "lut" and pwr_dt == cp.float32:
                     # Fused path: LUT interpolation + dB→linear + relative gain in 1 kernel
-                    gtx_rel_lin_cp = _evaluate_s1528_pattern_cp_lut_to_linear(
+                    gtx_rel_lin_cp = _evaluate_s1528_pattern_cp_lut_1d_to_linear(
                         s1528_pattern_context,
                         gtx_offset_deg_cp,
                         inv_gmax_lin=1.0 / float(gmax_lin),
@@ -13057,46 +17569,81 @@ def _accumulate_ras_power_cp(
             # Power stage: geometry, EIRP, accumulation in pwr_dt
             earth_r = pwr_dt(float(earth_radius_m))
             target_pfd_w = pwr_dt(float(target_pfd_lin_channel))
-            beam_cosb_w = beam_cosb_cp.astype(pwr_dt, copy=False)
-            beam_sinb_w = beam_sinb_cp.astype(pwr_dt, copy=False)
             range_active_cp = range_m[active_t_cp, active_sat_cp]
             orbit_active_cp = orbit_radius[active_sat_cp]
             atm_ras_active_cp = atm_ras_station[active_t_cp, active_sat_cp]
-            term_cp = orbit_active_cp * beam_cosb_w
-            disc_cp = term_cp * term_cp - (orbit_active_cp * orbit_active_cp - earth_r * earth_r)
-            hit_earth_cp = disc_cp >= pwr_dt(0.0)
-            cos_positive_cp = beam_cosb_w > pwr_dt(0.0)
-            valid_geom_cp = hit_earth_cp & cos_positive_cp
-            d_target_geom_m_cp = term_cp - cp.sqrt(cp.where(valid_geom_cp, disc_cp, pwr_dt(0.0)))
-            if atmosphere_lut_context is None:
-                atm_target_safe_cp = cp.ones((int(active_t_cp.size),), dtype=pwr_dt)
-            else:
-                cos_e_target_cp = cp.clip(
-                    (orbit_active_cp / earth_r) * beam_sinb_w,
-                    pwr_dt(0.0), pwr_dt(1.0),
+            mask_bore_cp = active_slot_cp == 0
+
+            # Fused geometry+EIRP kernel: replaces ~15 separate CuPy ops
+            # (term, disc, hit_earth, cos_positive, valid_geom, d_target,
+            # e_target, cos_e, clip, arccos, max, EIRP) with one launch.
+            if pwr_dt == cp.float32:
+                _eirp_4d_kernel = _get_4d_eirp_kernel()
+                _atm_elev_min = cp.float32(
+                    atmosphere_lut_context.elev_min_deg if atmosphere_lut_context is not None else 0.0
                 )
-                e_target_deg_cp = (
-                    cp.arccos(cos_e_target_cp.astype(trig_dt, copy=False)) * trig_dt(180.0 / np.pi)
-                ).astype(pwr_dt, copy=False)
-                e_target_deg_cp = cp.where(
+                d_target_geom_m_cp, e_target_deg_cp, valid_geom_cp, boresight_eirp_raw_cp = (
+                    _eirp_4d_kernel(
+                        beam_sinb_cp.astype(cp.float32, copy=False),
+                        beam_cosb_cp.astype(cp.float32, copy=False),
+                        orbit_active_cp, earth_r,
+                        _atm_elev_min,
+                        range_active_cp, atm_ras_active_cp,
+                        pwr_dt(float(target_pfd_lin_channel) * 4.0 * np.pi),
+                        bool(use_ras_station_alt_for_co), mask_bore_cp,
+                    )
+                )
+                # Apply atmosphere correction for non-boresight geometry EIRP
+                if atmosphere_lut_context is not None:
+                    atm_target_cp = _lookup_atmosphere_lut_cp(
+                        atmosphere_lut_context, e_target_deg_cp, altitude_km=target_alt_km,
+                    ).astype(pwr_dt, copy=False)
+                    atm_target_safe_cp = cp.where(valid_geom_cp, atm_target_cp, pwr_dt(1.0))
+                    # Geometry EIRP needs atm correction: divide out for non-boresight
+                    boresight_eirp_cp = cp.where(
+                        mask_bore_cp,
+                        boresight_eirp_raw_cp,
+                        cp.where(valid_geom_cp, boresight_eirp_raw_cp / atm_target_safe_cp, pwr_dt(0.0)),
+                    )
+                else:
+                    boresight_eirp_cp = boresight_eirp_raw_cp
+            else:
+                # Non-fp32: keep unfused path
+                beam_cosb_w = beam_cosb_cp.astype(pwr_dt, copy=False)
+                beam_sinb_w = beam_sinb_cp.astype(pwr_dt, copy=False)
+                term_cp = orbit_active_cp * beam_cosb_w
+                disc_cp = term_cp * term_cp - (orbit_active_cp * orbit_active_cp - earth_r * earth_r)
+                hit_earth_cp = disc_cp >= pwr_dt(0.0)
+                cos_positive_cp = beam_cosb_w > pwr_dt(0.0)
+                valid_geom_cp = hit_earth_cp & cos_positive_cp
+                d_target_geom_m_cp = term_cp - cp.sqrt(cp.where(valid_geom_cp, disc_cp, pwr_dt(0.0)))
+                if atmosphere_lut_context is None:
+                    atm_target_safe_cp = cp.ones((int(active_t_cp.size),), dtype=pwr_dt)
+                else:
+                    cos_e_target_cp = cp.clip(
+                        (orbit_active_cp / earth_r) * beam_sinb_w,
+                        pwr_dt(0.0), pwr_dt(1.0),
+                    )
+                    e_target_deg_cp = (
+                        cp.arccos(cos_e_target_cp.astype(trig_dt, copy=False)) * trig_dt(180.0 / np.pi)
+                    ).astype(pwr_dt, copy=False)
+                    e_target_deg_cp = cp.where(
+                        valid_geom_cp,
+                        cp.maximum(e_target_deg_cp, pwr_dt(atmosphere_lut_context.elev_min_deg)),
+                        pwr_dt(0.0),
+                    )
+                    atm_target_cp = _lookup_atmosphere_lut_cp(
+                        atmosphere_lut_context, e_target_deg_cp, altitude_km=target_alt_km,
+                    ).astype(pwr_dt, copy=False)
+                    atm_target_safe_cp = cp.where(valid_geom_cp, atm_target_cp, pwr_dt(1.0))
+                boresight_eirp_geom_cp = cp.where(
                     valid_geom_cp,
-                    cp.maximum(e_target_deg_cp, pwr_dt(atmosphere_lut_context.elev_min_deg)),
+                    target_pfd_w * four_pi_w * d_target_geom_m_cp * d_target_geom_m_cp / atm_target_safe_cp,
                     pwr_dt(0.0),
                 )
-                atm_target_cp = _lookup_atmosphere_lut_cp(
-                    atmosphere_lut_context, e_target_deg_cp, altitude_km=target_alt_km,
-                ).astype(pwr_dt, copy=False)
-                atm_target_safe_cp = cp.where(valid_geom_cp, atm_target_cp, pwr_dt(1.0))
-
-            boresight_eirp_geom_cp = cp.where(
-                valid_geom_cp,
-                target_pfd_w * four_pi_w * d_target_geom_m_cp * d_target_geom_m_cp / atm_target_safe_cp,
-                pwr_dt(0.0),
-            )
-            atm_co_cp = atm_ras_active_cp if use_ras_station_alt_for_co else pwr_dt(1.0)
-            boresight_eirp_co_cp = target_pfd_w * four_pi_w * range_active_cp * range_active_cp / atm_co_cp
-            mask_bore_cp = active_slot_cp == 0
-            boresight_eirp_cp = cp.where(mask_bore_cp, boresight_eirp_co_cp, boresight_eirp_geom_cp)
+                atm_co_cp = atm_ras_active_cp if use_ras_station_alt_for_co else pwr_dt(1.0)
+                boresight_eirp_co_cp = target_pfd_w * four_pi_w * range_active_cp * range_active_cp / atm_co_cp
+                boresight_eirp_cp = cp.where(mask_bore_cp, boresight_eirp_co_cp, boresight_eirp_geom_cp)
 
             # Compute variable power for satellite_eirp / satellite_ptx modes
             _var_mode = str(power_variation_mode or "fixed").strip().lower()
@@ -13279,12 +17826,27 @@ def _accumulate_ras_power_cp(
                 np.int32(int(sky_count)),
                 np.int32(int(sat_count)),
             )
-            eirp_sum_flat_cp = cp.bincount(
-                group_key_cp,
+            # Compact per-(t, sky, sat) reduction.  The earlier version built
+            # a dense ``(T*N_sky*S,)`` bincount buffer here and then ran
+            # ``cp.nonzero`` over the whole thing to find the populated
+            # groups.  At production sizes (T=65, N_sky≈500-1734, S=3360)
+            # that buffer is 400 MB-1.5 GB of transient scratch, and the
+            # nonzero sweep has to scan it end-to-end.  Only N_unique ≤
+            # N_active groups are actually populated (≈ 10-100 k), so use
+            # ``cp.unique`` to get the compact key set and ``bincount`` on
+            # the inverse map for an O(N_unique) reduction.  Downstream
+            # consumers still treat ``active_group_flat_cp`` as the set of
+            # global flat keys (sorted ascending), so no behavioural change.
+            unique_keys_cp, inverse_cp = cp.unique(group_key_cp, return_inverse=True)
+            eirp_sum_active_cp = cp.bincount(
+                inverse_cp,
                 weights=emitted_eirp_cp.astype(pwr_dt, copy=False),
-                minlength=int(time_count) * int(sky_count) * int(sat_count),
+                minlength=int(unique_keys_cp.size),
             ).astype(pwr_dt, copy=False)
-        active_group_flat_cp = cp.nonzero(eirp_sum_flat_cp > pwr_dt(0.0))[0].astype(cp.int64, copy=False)
+            active_group_flat_cp = unique_keys_cp.astype(cp.int64, copy=False)
+        else:
+            active_group_flat_cp = cp.empty((0,), dtype=cp.int64)
+            eirp_sum_active_cp = cp.empty((0,), dtype=pwr_dt)
         active_group_key_cp = cp.empty((0,), dtype=cp.int32)
         active_group_scale_cp = cp.empty((0,), dtype=pwr_dt)
         active_group_t_cp = cp.empty((0,), dtype=cp.int32)
@@ -13298,7 +17860,7 @@ def _accumulate_ras_power_cp(
                 np.int64(int(sat_count)),
             )
             active_group_scale_cp = (
-                eirp_sum_flat_cp[active_group_flat_cp]
+                eirp_sum_active_cp
                 * fspl_lin[active_group_t_cp, active_group_sat_cp]
             )
             active_group_scale_cp *= vis_horizon[active_group_t_cp, active_group_sat_cp].astype(pwr_dt, copy=False)
@@ -13322,8 +17884,15 @@ def _accumulate_ras_power_cp(
                 tel_el_deg_cp = telescope_el_cp[active_group_t_cp, active_group_sky_cp].astype(cp.float32, copy=False)
                 sat_az_deg_cp = sat_topo_cp[active_group_t_cp, active_group_sat_cp, 0].astype(cp.float32, copy=False)
                 sat_el_deg_cp = sat_elevation_deg[active_group_t_cp, active_group_sat_cp].astype(cp.float32, copy=False)
-                if pwr_dt == cp.float32:
-                    # Fused path: angular distance + RAS pattern + dB→linear in 1 kernel
+                if pwr_dt == cp.float32 and isinstance(
+                    ras_pattern_context, GpuRasPatternContext,
+                ):
+                    # Fused path: angular distance + RA.1631 RAS pattern +
+                    # dB→linear in 1 kernel. Only applies to the native
+                    # RA.1631 context — Custom-1D / Custom-2D contexts
+                    # don't expose the closed-form (D/λ, η) parameters
+                    # the fused kernel needs, so they fall through to
+                    # the per-op path below.
                     d_wlen = np.float32(ras_pattern_context.diameter_m / ras_pattern_context.wavelength_m)
                     _gmax_ras = np.float32(10.0 * np.log10(ras_pattern_context.eta_a_dimless * (np.pi * d_wlen) ** 2))
                     _g1_ras = np.float32(-1.0 + 15.0 * np.log10(d_wlen))
@@ -13350,7 +17919,17 @@ def _accumulate_ras_power_cp(
                     )
                     cp.clip(cos_gamma_rx_cp, trig_dt(-1.0), trig_dt(1.0), out=cos_gamma_rx_cp)
                     grx_offset_deg_cp = (cp.arccos(cos_gamma_rx_cp) * _r2d).astype(pat_dt, copy=False)
-                    grx_db_cp = _evaluate_ras_pattern_cp(ras_pattern_context, grx_offset_deg_cp)
+                    grx_phi_deg_cp = (
+                        _ras_boresight_frame_phi_deg(
+                            tel_az_rad_cp, tel_el_rad_cp,
+                            sat_az_rad_cp, sat_el_rad_cp,
+                        ).astype(pat_dt, copy=False)
+                        if isinstance(ras_pattern_context, GpuCustomPattern2DContext)
+                        else None
+                    )
+                    grx_db_cp = _evaluate_ras_pattern_cp(
+                        ras_pattern_context, grx_offset_deg_cp, grx_phi_deg_cp,
+                    )
                     grx_lin_cp = cp.power(pwr_dt(10.0), grx_db_cp.astype(pwr_dt, copy=False) * pwr_dt(0.1))
                 prx_group_cp = grx_lin_cp.astype(pwr_dt, copy=False) * active_group_scale_cp
             prx_total_ts = None
@@ -13428,7 +18007,10 @@ def _accumulate_ras_power_cp(
             sat_azel_cp[..., 1].astype(cp.float32, copy=False)[:, :, None],
             beam_idx_cp.shape,
         )
-        beam_sinb, beam_cosb, cos_gamma_tx = _tx_geom_kernel(
+        (
+            beam_sinb, beam_cosb, cos_gamma_tx,
+            sinb0_geom, cosb0_geom, sin_da_geom, cos_da_geom,
+        ) = _tx_geom_kernel(
             _sat_az_bcast,
             _sat_el_bcast,
             beam_alpha_cp.astype(cp.float32, copy=False),
@@ -13448,23 +18030,100 @@ def _accumulate_ras_power_cp(
         beam_beta_safe = cp.where(valid_beam, beam_beta_cp.astype(trig_dt, copy=False), trig_dt(0.0))
         beam_sinb = cp.sin(beam_beta_safe)
         beam_cosb = cp.cos(beam_beta_safe)
-        cos_da = cp.cos(alpha0_rad[:, :, None] - beam_alpha_safe)
+        delta_a = alpha0_rad[:, :, None] - beam_alpha_safe
+        cos_da = cp.cos(delta_a)
+        sin_da = cp.sin(delta_a)
         cos_gamma_tx = cosb0[:, :, None] * beam_cosb + sinb0[:, :, None] * beam_sinb * cos_da
         cos_gamma_tx = cp.where(mask_bore, trig_dt(1.0), cos_gamma_tx)
         cos_gamma_tx = cp.where(valid_beam, cos_gamma_tx, trig_dt(-1.0))
         cp.clip(cos_gamma_tx, trig_dt(-1.0), trig_dt(1.0), out=cos_gamma_tx)
+        # Expose the asymmetric-pattern inputs under a common name so the
+        # is_2d branch below can be shape-agnostic across trig precisions.
+        sinb0_geom = sinb0[:, :, None]
+        cosb0_geom = cosb0[:, :, None]
+        sin_da_geom = sin_da
+        cos_da_geom = cos_da
 
     if is_isotropic_ctx:
         # Isotropic UEMR: flat 0 dBi, masked to active beams.
         gtx_abs_lin = cp.where(valid_beam, pwr_dt(1.0), pwr_dt(0.0))
         gtx_rel_lin = gtx_abs_lin
+    elif isinstance(s1528_pattern_context, GpuCustomPattern2DContext):
+        # Custom 2-D (4-D boresight path).  MEGA pattern-eval kernel
+        # (lever #2): raw beam trig → (rel, abs) linear gain in ONE
+        # launch.  No x_body/y_body intermediate, no separate gmax
+        # multiply.  Same architecture as the 3-D path.
+        if pwr_dt in (cp.float32, cp.float64):
+            gtx_rel_lin, gtx_abs_lin = (
+                _evaluate_custom_2d_from_beam_trig_to_rel_abs_linear(
+                    s1528_pattern_context,
+                    beam_sinb, beam_cosb,
+                    sin_da_geom, cos_da_geom,
+                    sinb0_geom, cosb0_geom,
+                    cos_gamma_tx,
+                    inv_gmax_lin=1.0 / float(gmax_lin),
+                    compute_dtype=pwr_dt,
+                )
+            )
+            gtx_rel_lin = cp.where(valid_beam, gtx_rel_lin, pwr_dt(0.0))
+            gtx_abs_lin = cp.where(valid_beam, gtx_abs_lin, pwr_dt(0.0))
+        else:
+            x_body = beam_cosb * sin_da_geom
+            y_body = cosb0_geom * beam_sinb - sinb0_geom * beam_cosb * cos_da_geom
+            z_body = cos_gamma_tx
+            # fp16 / other compute dtype: fall back to the unfused
+            # path (fp16 FSPL underflows downstream anyway).
+            if s1528_pattern_context.grid_mode == "az_el":
+                az_rad_fb = cp.arctan2(x_body, z_body)
+                y_clip_fb = cp.clip(y_body, trig_dt(-1.0), trig_dt(1.0))
+                el_rad_fb = cp.arcsin(y_clip_fb)
+                a0_deg_fb = (az_rad_fb * trig_dt(180.0 / np.pi)).astype(pat_dt, copy=False)
+                a1_deg_fb = (el_rad_fb * trig_dt(180.0 / np.pi)).astype(pat_dt, copy=False)
+            else:
+                z_clip_fb = cp.clip(z_body, trig_dt(-1.0), trig_dt(1.0))
+                th_rad_fb = cp.arccos(z_clip_fb)
+                ph_rad_fb = cp.arctan2(y_body, x_body)
+                a0_deg_fb = (th_rad_fb * trig_dt(180.0 / np.pi)).astype(pat_dt, copy=False)
+                a1_deg_fb = (ph_rad_fb * trig_dt(180.0 / np.pi)).astype(pat_dt, copy=False)
+            gtx_db = _evaluate_custom_2d_pattern_cp(
+                s1528_pattern_context, a0_deg_fb, a1_deg_fb,
+            )
+            gtx_abs_lin = cp.power(
+                pwr_dt(10.0),
+                gtx_db.astype(pwr_dt, copy=False) * pwr_dt(0.1),
+            )
+            gtx_abs_lin = cp.where(valid_beam, gtx_abs_lin, pwr_dt(0.0))
+            gtx_rel_lin = gtx_abs_lin * pwr_dt(1.0 / float(gmax_lin))
+    elif isinstance(s1528_pattern_context, GpuCustomPattern1DContext):
+        # Custom 1-D axisymmetric: θ-only path, drop-in for symmetric
+        # S.1528 / Rec 1.2 — reuses the same fused ``s1528_lut_1d_to_linear``
+        # kernel on the pattern-agnostic regular-grid LUT.
+        gtx_offset_deg = (
+            cp.arccos(cos_gamma_tx) * trig_dt(180.0 / np.pi)
+        ).astype(pat_dt, copy=False)
+        if pwr_dt == cp.float32:
+            gtx_rel_lin = _evaluate_custom_1d_pattern_cp_to_linear(
+                s1528_pattern_context, gtx_offset_deg,
+                inv_gmax_lin=1.0 / float(gmax_lin),
+            )
+            gtx_rel_lin = cp.where(valid_beam, gtx_rel_lin, pwr_dt(0.0))
+            gtx_abs_lin = gtx_rel_lin * pwr_dt(float(gmax_lin))
+        else:
+            gtx_db = _evaluate_custom_1d_pattern_cp(
+                s1528_pattern_context, gtx_offset_deg,
+            )
+            gtx_abs_lin = cp.power(
+                pwr_dt(10.0), gtx_db.astype(pwr_dt, copy=False) * pwr_dt(0.1),
+            )
+            gtx_abs_lin = cp.where(valid_beam, gtx_abs_lin, pwr_dt(0.0))
+            gtx_rel_lin = gtx_abs_lin * pwr_dt(1.0 / float(gmax_lin))
     elif isinstance(s1528_pattern_context, GpuM2101PatternContext):
         # M.2101: 2D pattern from satellite-frame angles
         ras_az_3d = sat_azel_cp[..., 0].astype(cp.float32, copy=False)
         ras_el_3d = sat_azel_cp[..., 1].astype(cp.float32, copy=False)
         steer_az_3d = (beam_alpha_cp.astype(trig_dt, copy=False) * trig_dt(180.0 / np.pi)).astype(cp.float32, copy=False)
         steer_el_3d = (beam_beta_cp.astype(trig_dt, copy=False) * trig_dt(180.0 / np.pi)).astype(cp.float32, copy=False)
-        if _s1528_pattern_eval_mode == "lut" and pwr_dt == cp.float32:
+        if _pattern_eval_mode == "lut" and pwr_dt == cp.float32:
             gtx_rel_lin = _evaluate_m2101_pattern_cp_lut_to_linear(
                 s1528_pattern_context,
                 ras_az_3d[:, :, None], ras_el_3d[:, :, None],
@@ -13482,11 +18141,37 @@ def _accumulate_ras_power_cp(
             gtx_abs_lin = cp.power(pwr_dt(10.0), gtx_db_3d.astype(pwr_dt, copy=False) * pwr_dt(0.1))
             gtx_abs_lin = cp.where(valid_beam, gtx_abs_lin, pwr_dt(0.0))
             gtx_rel_lin = gtx_abs_lin * pwr_dt(1.0 / float(gmax_lin))
+    elif getattr(s1528_pattern_context, "is_2d", False):
+        # Asymmetric S.1528 Rec 1.4 (lt_m != lr_m): compute theta AND phi
+        # per (t, sat, k) and dispatch through the 2-D (theta, phi) LUT.
+        # sinb0/cosb0/sin_da/cos_da come from the trig stage above — the
+        # fused fp32 kernel emits them directly, the fp64 sequential path
+        # exposes the same names with [:, :, None] broadcast. phi is the
+        # azimuth of the pointing around the beam boresight, derived from
+        # spherical geometry with the boresight as pole (phi=0 along the
+        # lr axis by convention). The LUT's 4-fold folding absorbs any
+        # quadrant / sign convention difference.
+        # Note: sin_da_geom has sign `sin(α₀ − α_beam)` — the sign of
+        # the atan2 second argument is therefore flipped relative to
+        # the `sin(α_beam − α₀)` convention in the derivation, but
+        # pattern symmetry makes this harmless.
+        phi_rad = cp.arctan2(
+            cosb0_geom * beam_sinb - sinb0_geom * beam_cosb * cos_da_geom,
+            beam_cosb * sin_da_geom,
+        )
+        phi_deg = (phi_rad * trig_dt(180.0 / np.pi)).astype(pat_dt, copy=False)
+        gtx_offset_deg = (cp.arccos(cos_gamma_tx) * trig_dt(180.0 / np.pi)).astype(pat_dt, copy=False)
+        gtx_db = _evaluate_s1528_pattern_cp(
+            s1528_pattern_context, gtx_offset_deg, phi_deg=phi_deg,
+        )
+        gtx_abs_lin = cp.power(pwr_dt(10.0), gtx_db.astype(pwr_dt, copy=False) * pwr_dt(0.1))
+        gtx_abs_lin = cp.where(valid_beam, gtx_abs_lin, pwr_dt(0.0))
+        gtx_rel_lin = gtx_abs_lin * pwr_dt(1.0 / float(gmax_lin))
     else:
         gtx_offset_deg = (cp.arccos(cos_gamma_tx) * trig_dt(180.0 / np.pi)).astype(pat_dt, copy=False)
 
-        if _s1528_pattern_eval_mode == "lut" and pwr_dt == cp.float32:
-            gtx_rel_lin = _evaluate_s1528_pattern_cp_lut_to_linear(
+        if _pattern_eval_mode == "lut" and pwr_dt == cp.float32:
+            gtx_rel_lin = _evaluate_s1528_pattern_cp_lut_1d_to_linear(
                 s1528_pattern_context,
                 gtx_offset_deg,
                 inv_gmax_lin=1.0 / float(gmax_lin),
@@ -13505,7 +18190,7 @@ def _accumulate_ras_power_cp(
 
     range_m = sat_topo_cp[..., 2].astype(pwr_dt, copy=False) * pwr_dt(1000.0)
     sat_elevation_deg = sat_topo_cp[..., 1].astype(pwr_dt, copy=False)
-    vis_horizon = sat_elevation_deg > _zero_w
+    vis_horizon = sat_elevation_deg > pwr_dt(float(visibility_elev_threshold_deg))
 
     orbit_radius = _to_cupy_array(orbit_radius_m_per_sat, dtype=pwr_dt).reshape(-1)
     if int(orbit_radius.size) != sat_count:
@@ -13536,8 +18221,27 @@ def _accumulate_ras_power_cp(
             beam_idx_cp.astype(cp.int32, copy=False),
             _atm_elev_min,
         )
+    elif pwr_dt == cp.float64:
+        # Fused fp64 beam geometry kernel — replaces ~12 sequential ops.
+        _geom_fp64 = _get_beam_geometry_fp64_kernel()
+        _atm_elev_min_64 = cp.float64(
+            atmosphere_lut_context.elev_min_deg if atmosphere_lut_context is not None else 0.0
+        )
+        _orbit_r_bcast_64 = cp.broadcast_to(
+            orbit_radius.astype(cp.float64, copy=False)[None, :, None],
+            beam_idx_cp.shape,
+        )
+        d_target_geom_m, e_target_deg, valid_geom = _geom_fp64(
+            beam_sinb.astype(cp.float64, copy=False),
+            beam_cosb.astype(cp.float64, copy=False),
+            _orbit_r_bcast_64,
+            cp.float64(float(earth_radius_m)),
+            valid_beam,
+            mask_bore,
+            _atm_elev_min_64,
+        )
     else:
-        # Sequential path for fp64 power dtype.
+        # Generic sequential fallback for unexpected dtypes.
         beam_cosb_w = beam_cosb.astype(pwr_dt, copy=False)
         beam_sinb_w = beam_sinb.astype(pwr_dt, copy=False)
         term = r_m * beam_cosb_w
@@ -13577,22 +18281,6 @@ def _accumulate_ras_power_cp(
     four_pi_w = pwr_dt(4.0 * np.pi)
     target_pfd_w = pwr_dt(float(target_pfd_lin_channel))
 
-    # EIRP for off-boresight beams (geometry-derived)
-    boresight_eirp_geom = cp.where(
-        valid_geom,
-        target_pfd_w * four_pi_w * d_target_geom_m * d_target_geom_m / atm_target_safe,
-        _zero_w,
-    )
-    # EIRP for CO (boresight) beams
-    atm_co = atm_ras_station if use_ras_station_alt_for_co else _one_w
-    boresight_eirp_co = target_pfd_w * four_pi_w * range_m * range_m / atm_co
-    boresight_eirp_w = cp.where(mask_bore, boresight_eirp_co[:, :, None], boresight_eirp_geom)
-
-    # Free-space path loss × atmosphere
-    wavelength_w = pwr_dt(float(wavelength_m))
-    fspl_lin = cp.power(wavelength_w / (four_pi_w * range_m), pwr_dt(2.0))
-    fspl_lin *= atm_ras_station
-
     # Variable power for the 3D path (range_m shape: (T, S))
     _var_mode_3d = str(power_variation_mode or "fixed").strip().lower()
     _var_power_3d: Any = None
@@ -13614,25 +18302,176 @@ def _accumulate_ras_power_cp(
             )
             _var_power_3d = cp.power(pwr_dt(10.0), _rand_3d.astype(pwr_dt, copy=False) * pwr_dt(0.1))
 
-    if quantity_name == "target_pfd":
-        emitted_eirp = boresight_eirp_w * gtx_rel_lin
-    elif quantity_name == "satellite_eirp":
-        if _var_power_3d is not None:
-            emitted_eirp = _var_power_3d[:, :, None] * gtx_rel_lin
-        else:
-            emitted_eirp = pwr_dt(float(satellite_eirp_lin_channel)) * gtx_rel_lin
+    # Mega-fused power kernel: EIRP + leakage + sum + FSPL in 2 launches.
+    # Active for fp32 mode without variable power or per-channel spectral
+    # weights.  When cap is active with a precomputed factor, the mega
+    # kernel still runs — the cap multiply is inserted between K1 and K2.
+    _cap_compatible_with_mega = (
+        not cap_active
+        or precomputed_cap_factor_cp is not None  # hoisted cap: apply between K1 and K2
+    )
+    _use_mega_fused = (
+        pwr_dt == cp.float32
+        and _var_power_3d is None
+        and _cap_compatible_with_mega
+        and cell_spectral_weight_cp is None  # mega kernel handles static leakage only
+    )
+    if _use_mega_fused:
+        _mega_mod = _get_power_mega_kernel()
+        _n_beams = int(beam_idx_cp.shape[-1])
+        _total_tsk = int(time_count) * int(sat_count) * int(_n_beams)
+        _total_ts = int(time_count) * int(sat_count)
+        _block = 256
+
+        # Kernel 1: compute emitted_eirp with leakage
+        emitted_eirp = cp.empty(
+            (time_count, sat_count, _n_beams), dtype=cp.float32,
+        )
+        _qmode = {"target_pfd": 0, "satellite_eirp": 1, "satellite_ptx": 2}.get(quantity_name, 0)
+        _k1 = _mega_mod.get_function("compute_emitted_eirp_with_leakage")
+        _k1(
+            ((_total_tsk + _block - 1) // _block,), (_block,),
+            (
+                valid_geom, mask_bore, valid_beam,
+                d_target_geom_m, atm_target_safe,
+                range_m, atm_ras_station,
+                gtx_rel_lin, gtx_abs_lin if gtx_abs_lin is not None else gtx_rel_lin,
+                beam_idx_cp.astype(cp.int32, copy=False),
+                leakage_factors_cp if leakage_factors_cp is not None else cp.zeros(1, dtype=cp.float32),
+                np.float32(float(target_pfd_lin_channel)),
+                np.float32(float(satellite_eirp_lin_channel) if satellite_eirp_lin_channel is not None else 0.0),
+                np.float32(float(satellite_ptx_lin_channel) if satellite_ptx_lin_channel is not None else 0.0),
+                np.int32(_qmode),
+                np.int32(1 if use_ras_station_alt_for_co else 0),
+                np.int32(n_links_i),
+                np.int32(int(ras_service_cell_index or 0)),
+                np.int32(int(leakage_factors_cp.size) if leakage_factors_cp is not None else 0),
+                np.int32(1 if leakage_factors_cp is not None else 0),
+                np.int32(time_count), np.int32(sat_count), np.int32(_n_beams),
+                emitted_eirp,
+            ),
+        )
+
+        # Apply precomputed surface-PFD cap between K1 (EIRP) and K2
+        # (reduction).  Only runs when cap is active AND the cap factor
+        # was hoisted by the fused direct-EPFD wrapper.  In-kernel cap
+        # (non-precomputed) still disables the mega kernel.
+        if cap_active and precomputed_cap_factor_cp is not None:
+            _precomp = precomputed_cap_factor_cp.astype(cp.float32, copy=False)
+            _expected_per_beam = (int(time_count), int(sat_count), _n_beams)
+            _expected_per_sat = (int(time_count), int(sat_count))
+            if tuple(_precomp.shape) == _expected_per_beam:
+                # Per-beam (T, S, K) factor
+                emitted_eirp *= _precomp
+            elif tuple(_precomp.shape) == _expected_per_sat:
+                # Per-satellite (T, S) factor — broadcast to (T, S, K)
+                emitted_eirp *= _precomp[:, :, None]
+            else:
+                raise ValueError(
+                    "precomputed_cap_factor_cp in the mega-fused 3-D path "
+                    f"must have shape {_expected_per_beam!r} (per-beam) or "
+                    f"{_expected_per_sat!r} (per-satellite); "
+                    f"got {tuple(_precomp.shape)!r}."
+                )
+            # Propagate hoisted cap stats
+            if surface_pfd_stats_enabled and precomputed_cap_stats is not None:
+                cap_stats_accum["n_beams_capped"] = (
+                    int(cap_stats_accum["n_beams_capped"])
+                    + int(precomputed_cap_stats.get("n_capped", 0))
+                )
+                cap_stats_accum["cap_db_sum_over_capped"] = (
+                    float(cap_stats_accum["cap_db_sum_over_capped"])
+                    + float(precomputed_cap_stats.get("cap_db_sum", 0.0))
+                )
+                cap_stats_accum["cap_db_max"] = float(
+                    max(
+                        float(cap_stats_accum["cap_db_max"]),
+                        float(precomputed_cap_stats.get("cap_db_max", 0.0)),
+                    )
+                )
+
+        # Kernel 2: reduce over beams + FSPL + atm + vis → scale_w_channel
+        scale_w_channel = cp.empty((time_count, sat_count), dtype=cp.float32)
+        _k2 = _mega_mod.get_function("reduce_eirp_to_scale")
+        _k2(
+            ((_total_ts + _block - 1) // _block,), (_block,),
+            (
+                emitted_eirp, range_m, atm_ras_station, vis_horizon,
+                np.float32(float(wavelength_m)),
+                np.int32(time_count), np.int32(sat_count), np.int32(_n_beams),
+                scale_w_channel,
+            ),
+        )
+        # Skip the CuPy EIRP + sum + FSPL + scale path below.
+        # Jump directly to receive-side pattern evaluation.
+
+    # Original single-EIRP fused kernel (fallback when mega not available)
+    elif not _use_mega_fused and (
+        pwr_dt == cp.float32
+        and quantity_name == "target_pfd"
+        and _var_power_3d is None
+        and not cap_active
+    ):
+        _use_fused_eirp = True
+        _eirp_mod = _get_eirp_fspl_fused_kernel()
+        _eirp_kernel = _eirp_mod.get_function("compute_eirp_and_scale")
+        emitted_eirp = cp.empty_like(gtx_rel_lin)
+        _n_beams = int(beam_idx_cp.shape[-1])
+        _total_elems = int(time_count) * int(sat_count) * int(_n_beams)
+        _block = 256
+        _grid = (_total_elems + _block - 1) // _block
+        _eirp_kernel(
+            (_grid,), (_block,),
+            (
+                valid_geom, mask_bore, valid_beam,
+                d_target_geom_m, atm_target_safe,
+                range_m, atm_ras_station,
+                gtx_rel_lin, vis_horizon,
+                np.float32(float(target_pfd_lin_channel)),
+                np.float32(float(wavelength_m)),
+                np.int32(1 if use_ras_station_alt_for_co else 0),
+                np.int32(time_count), np.int32(sat_count), np.int32(_n_beams),
+                emitted_eirp,
+            ),
+        )
     else:
-        if _var_power_3d is not None:
-            emitted_eirp = _var_power_3d[:, :, None] * gtx_abs_lin
+        # Fallback: separate CuPy operations (fp64, satellite_eirp/ptx modes,
+        # variable power, or non-standard configurations).
+        boresight_eirp_geom = cp.where(
+            valid_geom,
+            target_pfd_w * four_pi_w * d_target_geom_m * d_target_geom_m / atm_target_safe,
+            _zero_w,
+        )
+        atm_co = atm_ras_station if use_ras_station_alt_for_co else _one_w
+        boresight_eirp_co = target_pfd_w * four_pi_w * range_m * range_m / atm_co
+        boresight_eirp_w = cp.where(mask_bore, boresight_eirp_co[:, :, None], boresight_eirp_geom)
+
+        if quantity_name == "target_pfd":
+            emitted_eirp = boresight_eirp_w * gtx_rel_lin
+        elif quantity_name == "satellite_eirp":
+            if _var_power_3d is not None:
+                emitted_eirp = _var_power_3d[:, :, None] * gtx_rel_lin
+            else:
+                emitted_eirp = pwr_dt(float(satellite_eirp_lin_channel)) * gtx_rel_lin
         else:
-            emitted_eirp = pwr_dt(float(satellite_ptx_lin_channel)) * gtx_abs_lin
+            if _var_power_3d is not None:
+                emitted_eirp = _var_power_3d[:, :, None] * gtx_abs_lin
+            else:
+                emitted_eirp = pwr_dt(float(satellite_ptx_lin_channel)) * gtx_abs_lin
+
+    # Free-space path loss × atmosphere
+    wavelength_w = pwr_dt(float(wavelength_m))
+    fspl_lin = cp.power(wavelength_w / (four_pi_w * range_m), pwr_dt(2.0))
+    fspl_lin *= atm_ras_station
 
     # Surface-PFD cap — inserted BEFORE spectral / leakage scaling so
     # the cap targets the antenna's radiated EIRP, matching the 4-D
     # boresight-avoidance path above.  The ``per_satellite`` aggregate
     # mode broadcasts a (T, S) scale factor to all beams of each
     # satellite; the ``per_beam`` mode applies a per-(T, S, K) factor.
-    if cap_active:
+    # Skip when the mega kernel already applied the precomputed cap
+    # between K1 and K2 above.
+    if cap_active and not _use_mega_fused:
         # Per-beam peak EIRP (shared between both cap modes)
         if quantity_name == "target_pfd":
             eirp_peak_3d = boresight_eirp_w  # (T, S, K)
@@ -13702,26 +18541,40 @@ def _accumulate_ras_power_cp(
                     beam_alpha_cp,
                     beam_beta_cp,
                     shell_per_beam_3d_cp,
-                ).astype(pwr_dt, copy=False)
-                peak_pfd_3d_cp = eirp_peak_3d * k_3d_cp  # broadcast ok for scalar
-                limit_w_3d_cp = pwr_dt(cap_limit_w)
-                peak_safe_3d_cp = cp.maximum(peak_pfd_3d_cp, pwr_dt(1.0e-30))
-                cap_factor_3d_cp = cp.minimum(
-                    pwr_dt(1.0), limit_w_3d_cp / peak_safe_3d_cp,
-                ).astype(pwr_dt, copy=False)
-                cap_factor_3d_cp = cp.where(
-                    valid_beam, cap_factor_3d_cp, pwr_dt(1.0),
+                ).astype(cp.float32, copy=False)
+                # Fuse: K × EIRP_peak → peak PFD → safety clamp → cap
+                # ratio → validity mask → apply.  6 ops → 1 kernel.
+                _eirp_peak_broadcast = cp.broadcast_to(
+                    cp.asarray(eirp_peak_3d, dtype=cp.float32),
+                    k_3d_cp.shape,
+                ) if hasattr(eirp_peak_3d, 'shape') and eirp_peak_3d.shape != k_3d_cp.shape else (
+                    cp.full(k_3d_cp.shape, float(eirp_peak_3d), dtype=cp.float32)
+                    if not hasattr(eirp_peak_3d, 'shape') or eirp_peak_3d.ndim == 0
+                    else cp.asarray(eirp_peak_3d, dtype=cp.float32)
                 )
-                emitted_eirp = emitted_eirp * cap_factor_3d_cp
+                emitted_eirp = _get_cap_apply_fused_kernel()(
+                    emitted_eirp.astype(cp.float32, copy=False),
+                    k_3d_cp,
+                    _eirp_peak_broadcast,
+                    cp.float32(float(cap_limit_w)),
+                    valid_beam,
+                ).astype(pwr_dt, copy=False)
 
                 if surface_pfd_stats_enabled:
+                    # Recompute cap_factor for stats reporting (not on hot path)
+                    _peak_pfd_stats = _eirp_peak_broadcast * k_3d_cp
+                    _peak_safe_stats = cp.maximum(_peak_pfd_stats, cp.float32(1.0e-30))
+                    _cap_factor_stats = cp.minimum(
+                        cp.float32(1.0), cp.float32(float(cap_limit_w)) / _peak_safe_stats,
+                    )
+                    _cap_factor_stats = cp.where(valid_beam, _cap_factor_stats, cp.float32(1.0))
                     capped_mask_3d_cp = (
-                        (cap_factor_3d_cp < pwr_dt(1.0 - 1.0e-6)) & valid_beam
+                        (_cap_factor_stats < pwr_dt(1.0 - 1.0e-6)) & valid_beam
                     )
                     cap_db_3d_cp = cp.where(
                         capped_mask_3d_cp,
                         pwr_dt(-10.0) * cp.log10(
-                            cp.maximum(cap_factor_3d_cp, pwr_dt(1.0e-30))
+                            cp.maximum(_cap_factor_stats, pwr_dt(1.0e-30))
                         ),
                         pwr_dt(0.0),
                     )
@@ -13831,25 +18684,32 @@ def _accumulate_ras_power_cp(
         ).astype(pwr_dt, copy=False)
         emitted_eirp *= spectral_scale
     elif leakage_factors_cp is not None:
-        source_cell_idx = (beam_idx_cp.astype(cp.int64, copy=False) // np.int64(n_links_i)).astype(cp.int32, copy=False)
-        if ras_service_cell_index is not None:
-            source_cell_idx = cp.where(mask_bore, cp.int32(int(ras_service_cell_index)), source_cell_idx)
-        valid_source = valid_beam & (source_cell_idx >= 0) & (
-            source_cell_idx < int(leakage_factors_cp.size)
-        )
-        leakage_scale = cp.where(valid_source, leakage_factors_cp[source_cell_idx], _zero_w).astype(pwr_dt, copy=False)
-        emitted_eirp *= leakage_scale
+        _lk_kernel = _get_leakage_scale_fused_kernel()
+        emitted_eirp = _lk_kernel(
+            beam_idx_cp.astype(cp.int32, copy=False),
+            valid_beam,
+            mask_bore,
+            emitted_eirp.astype(cp.float32, copy=False),
+            leakage_factors_cp.astype(cp.float32, copy=False),
+            cp.int32(n_links_i),
+            cp.int32(int(ras_service_cell_index or 0)),
+            cp.int32(int(leakage_factors_cp.size)),
+            cp.int32(1 if ras_service_cell_index is not None else 0),
+        ).astype(pwr_dt, copy=False)
 
-    eirp_sum = cp.sum(emitted_eirp, axis=2, dtype=pwr_dt)
-    scale_w_channel = eirp_sum * fspl_lin
-    scale_w_channel *= vis_horizon.astype(pwr_dt, copy=False)
+    if not _use_mega_fused:
+        eirp_sum = cp.sum(emitted_eirp, axis=2, dtype=pwr_dt)
+        scale_w_channel = eirp_sum * fspl_lin
+        scale_w_channel *= vis_horizon.astype(pwr_dt, copy=False)
     result: dict[str, Any] = {}
     if include_receive_outputs:
         # Receive-side angular distance + RAS pattern evaluation.
         # For fp32 (the common production path) use the fused kernel
         # that does trig + angular distance + RAS pattern + dB→linear
         # in a single CUDA launch (~16 separate ops → 1).
-        if pwr_dt == cp.float32:
+        if pwr_dt == cp.float32 and isinstance(
+            ras_pattern_context, GpuRasPatternContext,
+        ):
             n_tel = int(telescope_az_cp.shape[1])
             d_wlen = np.float32(ras_pattern_context.diameter_m / ras_pattern_context.wavelength_m)
             _gmax_ras = np.float32(10.0 * np.log10(ras_pattern_context.eta_a_dimless * (np.pi * d_wlen) ** 2))
@@ -13866,48 +18726,118 @@ def _accumulate_ras_power_cp(
                 cp.broadcast_to(sat_elevation_deg.astype(cp.float32, copy=False)[:, None, :], _rx_out_shape),
                 d_wlen, _gmax_ras, _g1_ras, _phi_m_ras, _phi_r_ras,
             )
+        elif trig_dt == cp.float32:
+            # Fused angular distance: 14 sequential trig ops → 1 kernel.
+            # Used for Custom RAS patterns where pattern eval is separate.
+            n_tel = int(telescope_az_cp.shape[1])
+            _rx_out_shape_fb = (int(time_count), int(n_tel), int(sat_count))
+            _ang_kernel = _get_rx_angular_distance_only_kernel()
+            grx_offset_deg = _ang_kernel(
+                cp.broadcast_to(telescope_az_cp.astype(cp.float32, copy=False)[:, :, None], _rx_out_shape_fb),
+                cp.broadcast_to(telescope_el_cp.astype(cp.float32, copy=False)[:, :, None], _rx_out_shape_fb),
+                cp.broadcast_to(sat_topo_cp[..., 0].astype(cp.float32, copy=False)[:, None, :], _rx_out_shape_fb),
+                cp.broadcast_to(sat_elevation_deg.astype(cp.float32, copy=False)[:, None, :], _rx_out_shape_fb),
+            ).astype(pat_dt, copy=False)
+            grx_phi_deg_bs = None
+            if isinstance(ras_pattern_context, GpuCustomPattern2DContext):
+                # Fused phi uses radians — convert from degrees inline
+                _d2r_f32 = cp.float32(np.pi / 180.0)
+                grx_phi_deg_bs = _ras_boresight_frame_phi_deg(
+                    telescope_az_cp.astype(cp.float32, copy=False)[:, :, None] * _d2r_f32,
+                    telescope_el_cp.astype(cp.float32, copy=False)[:, :, None] * _d2r_f32,
+                    sat_topo_cp[..., 0].astype(cp.float32, copy=False)[:, None, :] * _d2r_f32,
+                    sat_elevation_deg.astype(cp.float32, copy=False)[:, None, :] * _d2r_f32,
+                ).astype(pat_dt, copy=False)
+            grx_db = _evaluate_ras_pattern_cp(
+                ras_pattern_context, grx_offset_deg, grx_phi_deg_bs,
+            )
+            grx_lin = cp.power(pwr_dt(10.0), grx_db.astype(pwr_dt, copy=False) * pwr_dt(0.1))
         else:
+            # fp64 fallback: unfused trig for maximum precision.
+            n_tel = int(telescope_az_cp.shape[1])
             tel_az_rad = telescope_az_cp.astype(trig_dt, copy=False) * trig_dt(np.pi / 180.0)
             tel_el_rad = telescope_el_cp.astype(trig_dt, copy=False) * trig_dt(np.pi / 180.0)
-            tel_sin_el = cp.sin(tel_el_rad)
-            tel_cos_el = cp.cos(tel_el_rad)
-            tel_sin_az = cp.sin(tel_az_rad)
-            tel_cos_az = cp.cos(tel_az_rad)
             sat_az_rad = sat_topo_cp[..., 0].astype(trig_dt, copy=False) * trig_dt(np.pi / 180.0)
             sat_el_rad = sat_elevation_deg.astype(trig_dt, copy=False) * trig_dt(np.pi / 180.0)
-            sat_sin_el = cp.sin(sat_el_rad)
-            sat_cos_el = cp.cos(sat_el_rad)
-            sat_sin_az = cp.sin(sat_az_rad)
-            sat_cos_az = cp.cos(sat_az_rad)
             cos_daz = (
-                tel_cos_az[:, :, None] * sat_cos_az[:, None, :]
-                + tel_sin_az[:, :, None] * sat_sin_az[:, None, :]
+                cp.cos(tel_az_rad[:, :, None]) * cp.cos(sat_az_rad[:, None, :])
+                + cp.sin(tel_az_rad[:, :, None]) * cp.sin(sat_az_rad[:, None, :])
             )
             cos_gamma_rx = (
-                tel_sin_el[:, :, None] * sat_sin_el[:, None, :]
-                + tel_cos_el[:, :, None] * sat_cos_el[:, None, :] * cos_daz
+                cp.sin(tel_el_rad[:, :, None]) * cp.sin(sat_el_rad[:, None, :])
+                + cp.cos(tel_el_rad[:, :, None]) * cp.cos(sat_el_rad[:, None, :]) * cos_daz
             )
             cp.clip(cos_gamma_rx, trig_dt(-1.0), trig_dt(1.0), out=cos_gamma_rx)
             grx_offset_deg = (cp.arccos(cos_gamma_rx) * trig_dt(180.0 / np.pi)).astype(pat_dt, copy=False)
-            grx_db = _evaluate_ras_pattern_cp(ras_pattern_context, grx_offset_deg)
+            grx_phi_deg_bs = (
+                _ras_boresight_frame_phi_deg(
+                    tel_az_rad[:, :, None], tel_el_rad[:, :, None],
+                    sat_az_rad[:, None, :], sat_el_rad[:, None, :],
+                ).astype(pat_dt, copy=False)
+                if isinstance(ras_pattern_context, GpuCustomPattern2DContext)
+                else None
+            )
+            grx_db = _evaluate_ras_pattern_cp(
+                ras_pattern_context, grx_offset_deg, grx_phi_deg_bs,
+            )
             grx_lin = cp.power(pwr_dt(10.0), grx_db.astype(pwr_dt, copy=False) * pwr_dt(0.1))
         grx_lin *= vis_horizon[:, None, :].astype(pwr_dt, copy=False)
 
-        prx_scale_cp = grx_lin * scale_w_channel[:, None, :]
-        prx_total_ts = None
-        if include_prx_total or include_epfd:
-            prx_total_ts = cp.sum(prx_scale_cp, axis=2, dtype=pwr_dt)
-        if include_prx_total and prx_total_ts is not None:
-            result["Prx_total_W"] = prx_total_ts[:, None, :]
-        if include_per_satellite_prx:
-            result["Prx_per_sat_RAS_STATION_W"] = cp.transpose(
-                prx_scale_cp, (0, 2, 1),
-            )[:, None, :, :]
-        if include_epfd:
-            if prx_total_ts is None:
+        # Fused Prx + EPFD output kernel for fp32 non-boresight path.
+        # Works with any EIRP computation path (mega, single-EIRP, or
+        # fallback) as long as scale_w_channel is fp32 and we don't
+        # need per-satellite Prx output.
+        _use_prx_fused = (
+            pwr_dt == cp.float32
+            and not include_per_satellite_prx  # per-sat Prx needs the full (T, N_tel, S) tensor
+        )
+        if _use_prx_fused:
+            _prx_mod = _get_prx_output_kernel()
+            _prx_k = _prx_mod.get_function("compute_prx_and_reduce")
+            _n_tel = int(grx_lin.shape[1])
+            _want_prx = bool(include_prx_total)
+            _want_epfd = bool(include_epfd)
+            _want_pfd = bool(include_total_pfd)
+            _prx_total_buf = cp.empty((time_count, _n_tel), dtype=cp.float32) if _want_prx or _want_epfd else cp.empty(1, dtype=cp.float32)
+            _epfd_buf = cp.empty((time_count, _n_tel), dtype=cp.float32) if _want_epfd else cp.empty(1, dtype=cp.float32)
+            _pfd_buf = cp.empty((time_count,), dtype=cp.float32) if _want_pfd else cp.empty(1, dtype=cp.float32)
+            _max_idx = max(int(time_count) * int(_n_tel), int(time_count))
+            _block = 256
+            _prx_k(
+                ((_max_idx + _block - 1) // _block,), (_block,),
+                (
+                    grx_lin, scale_w_channel, vis_horizon,
+                    np.float32(float(pfd_from_prx_iso_scale)),
+                    np.int32(time_count), np.int32(_n_tel), np.int32(sat_count),
+                    np.int32(1 if _want_prx else 0),
+                    np.int32(1 if _want_epfd else 0),
+                    np.int32(1 if _want_pfd else 0),
+                    _prx_total_buf, _epfd_buf, _pfd_buf,
+                ),
+            )
+            if _want_prx:
+                result["Prx_total_W"] = _prx_total_buf[:, None, :]
+            if _want_epfd:
+                result["EPFD_W_m2"] = _epfd_buf[:, None, :]
+            if _want_pfd:
+                result["PFD_total_RAS_STATION_W_m2"] = _pfd_buf
+        else:
+            prx_scale_cp = grx_lin * scale_w_channel[:, None, :]
+            prx_total_ts = None
+            if include_prx_total or include_epfd:
                 prx_total_ts = cp.sum(prx_scale_cp, axis=2, dtype=pwr_dt)
-            result["EPFD_W_m2"] = (prx_total_ts * pwr_dt(float(pfd_from_prx_iso_scale)))[:, None, :]
-    if include_total_pfd:
+            if include_prx_total and prx_total_ts is not None:
+                result["Prx_total_W"] = prx_total_ts[:, None, :]
+            if include_per_satellite_prx:
+                result["Prx_per_sat_RAS_STATION_W"] = cp.transpose(
+                    prx_scale_cp, (0, 2, 1),
+                )[:, None, :, :]
+            if include_epfd:
+                if prx_total_ts is None:
+                    prx_total_ts = cp.sum(prx_scale_cp, axis=2, dtype=pwr_dt)
+                result["EPFD_W_m2"] = (prx_total_ts * pwr_dt(float(pfd_from_prx_iso_scale)))[:, None, :]
+    _prx_fused_active = include_receive_outputs and locals().get('_use_prx_fused', False)
+    if not _prx_fused_active and include_total_pfd:
         result["PFD_total_RAS_STATION_W_m2"] = (
             cp.sum(scale_w_channel, axis=1, dtype=pwr_dt) * pwr_dt(float(pfd_from_prx_iso_scale))
         )
@@ -14233,6 +19163,7 @@ def _accumulate_direct_epfd_from_link_library_cp(
     scheduler_target_profile: str | float | None = "high_throughput",
     debug_direct_epfd: bool = False,
     return_device: bool = True,
+    visibility_elev_threshold_deg: float = 0.0,
 ) -> dict[str, Any]:
     boresight_active = bool(library.boresight_active)
     sky_count_total = int(library.boresight_sky_count if boresight_active else 1)
@@ -14549,17 +19480,14 @@ def _accumulate_direct_epfd_from_link_library_cp(
                 and not isinstance(s1528_pattern_context, GpuIsotropicPatternContext)
             ):
                 # Derive per-beam peak EIRP for the whole slab, matching
-                # the semantics inside the power kernel.
-                _gm_db_loc = float(
-                    s1528_pattern_context.gm_db
-                    if getattr(s1528_pattern_context, "gm_db", None) is not None
-                    else 0.0
-                )
-                if isinstance(s1528_pattern_context, GpuM2101PatternContext):
-                    _gm_db_loc = float(s1528_pattern_context.g_emax_db) + 10.0 * math.log10(
-                        max(1, int(s1528_pattern_context.n_h) * int(s1528_pattern_context.n_v))
-                    )
-                _gmax_lin_loc = 10.0 ** (_gm_db_loc / 10.0) if _gm_db_loc != 0.0 else 1.0
+                # the semantics inside the power kernel. Use the
+                # canonical ``_pattern_peak_gain_linear`` resolver so
+                # Custom-1D / Custom-2D contexts (whose peak comes from
+                # the schema's ``peak_gain_dbi`` field, not a
+                # closed-form ``gm_db`` / ``g_emax_db``) pick up their
+                # actual peak rather than silently falling back to
+                # ``gmax_lin=1`` (0 dB).
+                _gmax_lin_loc = float(_pattern_peak_gain_linear(s1528_pattern_context))
                 quantity_loc = str(power_input_quantity).strip().lower()
                 # Resolve the channel-total power inputs the same way the
                 # hot kernel does via ``session.accumulate_ras_power``.
@@ -14846,6 +19774,7 @@ def _accumulate_direct_epfd_from_link_library_cp(
                         working_memory_budget_bytes=power_working_memory_budget_bytes,
                         sky_slab=power_sky_slab,
                         return_device=True,
+                        visibility_elev_threshold_deg=float(visibility_elev_threshold_deg),
                     )
                 except Exception as exc:
                     raise _DirectEpfdStageExecutionError("power_accumulation", exc) from exc
@@ -15104,9 +20033,32 @@ class GpuScepterSession:
         self._s1586_pointing_context_cache: dict[tuple[Any, ...], GpuS1586PointingContext] = {}
         self._s1528_pattern_context_cache: dict[tuple[Any, ...], GpuS1528PatternContext] = {}
         self._ras_pattern_context_cache: dict[tuple[Any, ...], GpuRasPatternContext] = {}
+        # Custom-pattern contexts are two-level:
+        # ``{system_id: OrderedDict[content-hash key -> context]}``.
+        # The outer dict gives every registered system its own LRU
+        # bucket so cross-system eviction can't happen (system A's
+        # in-place pattern tweaks don't evict system B's contexts).
+        # Each bucket is an ``OrderedDict`` with ``LRU`` semantics —
+        # move-to-end on hit, pop-oldest on overflow — capped at
+        # ``_CUSTOM_PATTERN_CACHE_SLOTS_PER_SYSTEM``. Callers that
+        # don't pass ``system_id`` (tests, GUI previews) use a
+        # single shared ``None`` bucket with the same per-bucket cap.
+        # Keys use the pattern's ``content_fingerprint()`` — a BLAKE2b
+        # -128 hash over every radiation-affecting field — so a
+        # mutating caller flips the hash and the cache automatically
+        # misses on the next ``prepare_*`` call.
+        self._custom_pattern_context_cache: dict[
+            Any, OrderedDict[tuple[Any, ...], Any]
+        ] = {}
         self._atmosphere_lut_context_cache: dict[tuple[Any, ...], GpuAtmosphereLutContext] = {}
         self._peak_pfd_lut_context_cache: dict[tuple[Any, ...], GpuPeakPfdLutContext] = {}
         self._spectrum_plan_context_cache: dict[tuple[Any, ...], GpuSpectrumPlanContext] = {}
+        # Dedicated non-default stream for export-stage device-to-host
+        # transfers.  Lazy-built on first access so sessions that don't
+        # run the direct-EPFD pipeline (pure geometry, tests) don't pay
+        # the per-session stream creation cost.  See
+        # ``copy_device_to_host_async`` and ``sync_export_stream``.
+        self._export_stream: Any | None = None
         _SESSION_REGISTRY.register(self)
 
     def activate(self) -> _SessionActivation:
@@ -15150,6 +20102,55 @@ class GpuScepterSession:
 
     def _touch(self) -> None:
         self._last_used_monotonic = time.monotonic()
+
+    def _ensure_export_stream(self) -> Any:
+        """Lazy-build and cache the dedicated export-stage CUDA stream.
+
+        The stream is created the first time an async D2H is requested on
+        this session — avoids paying the ``cp.cuda.Stream`` constructor
+        cost for sessions that never export (pure-geometry tests, GUI
+        previews).  Used by ``copy_device_to_host_async`` +
+        ``sync_export_stream`` to queue export D2Hs off the null stream
+        so host-side payload construction can overlap with in-flight
+        transfers.
+        """
+        if self._export_stream is None and _has_cupy():
+            # Non-blocking so it doesn't implicitly serialise against the
+            # null stream (the one the hot GPU kernels use) — we sync
+            # explicitly at end-of-export instead.
+            self._export_stream = cp.cuda.Stream(non_blocking=True)
+        return self._export_stream
+
+    def copy_device_to_host_async(self, value: Any) -> np.ndarray:
+        """Async variant of :func:`copy_device_to_host`.
+
+        Queues the memcpy on the session's dedicated export stream and
+        returns the host numpy array immediately.  The returned buffer
+        is NOT safe to read until :meth:`sync_export_stream` has been
+        called — callers must sync before handing the array to a
+        downstream consumer (writer, caller, hashing, etc.).
+
+        Falls back to the synchronous path for non-CuPy inputs (already
+        on host, Numba device arrays, etc.) so callers can use this
+        everywhere without type-sniffing.
+        """
+        if not _has_cupy() or not isinstance(value, cp.ndarray):
+            return copy_device_to_host(value)
+        stream = self._ensure_export_stream()
+        if stream is None:
+            return cp.asnumpy(value)
+        return cp.asnumpy(value, stream=stream)
+
+    def sync_export_stream(self) -> None:
+        """Wait for pending async export D2Hs to complete.
+
+        Call once per batch after all :meth:`copy_device_to_host_async`
+        calls finish queueing, BEFORE touching any of the returned host
+        buffers or handing them to the writer.  Safe no-op when the
+        export stream was never created.
+        """
+        if self._export_stream is not None:
+            self._export_stream.synchronize()
 
     def _enter_activation(self) -> None:
         self._ensure_owner_thread()
@@ -15694,6 +20695,11 @@ class GpuScepterSession:
         sigma = float(mu_roots_arr[int(l) - 1] / np.sqrt(A * A + (int(l) - 0.5) ** 2))
         pi2sig2 = float((np.pi ** 2) * (sigma ** 2))
 
+        # Asymmetric Rec 1.4 (lt_m != lr_m) requires a 2-D LUT in (theta, phi).
+        # The 1-D LUT path only captures the phi=0 slice and silently drops
+        # all dependence on lt_m when applied to an asymmetric aperture.
+        is_asymmetric = abs(lt_val - lr_val) > 1e-9
+
         with self._temporary_activation():
             context = GpuS1528PatternContext(
                 session=self,
@@ -15712,6 +20718,7 @@ class GpuScepterSession:
                 pi2sig2=pi2sig2,
                 mu_roots=mu_roots_arr[: int(l)].copy(),
                 d_mu_roots=cp.asarray(mu_roots_arr[: int(l)].copy()),
+                is_2d=is_asymmetric,
             )
         self._s1528_pattern_context_cache[key] = context
         self._touch()
@@ -15840,6 +20847,413 @@ class GpuScepterSession:
             wavelength_m=wavelength_val,
         )
         self._s1528_pattern_context_cache[key] = context
+        self._touch()
+        return context
+
+    def prepare_custom_pattern_1d_context(
+        self,
+        *,
+        pattern: "CustomAntennaPattern",
+        wavelength_m: float | u.Quantity = 0.1,
+        theta_step_deg: float | None = None,
+        system_id: Any = None,
+    ) -> GpuCustomPattern1DContext:
+        """Upload a 1-D axisymmetric custom pattern to GPU as a regular LUT.
+
+        Resamples the user's pattern (which may have an irregular grid
+        and/or step discontinuities expressed as duplicate grid angles)
+        onto a regular degree-spaced grid via the schema-correct
+        right-continuous interpolator, so the hot-path GPU evaluator
+        can share the existing S.1528 1-D ElementwiseKernel without
+        any custom step-handling logic.
+
+        The returned ``gain_db`` LUT is in **absolute dBi**. Relative-
+        mode files have their peak baked in here at build time, so
+        downstream evaluators never need to know how the source was
+        normalised.
+
+        Parameters
+        ----------
+        pattern :
+            A validated :class:`~scepter.custom_antenna.CustomAntennaPattern`
+            with ``kind == KIND_1D``.
+        wavelength_m :
+            Wavelength for the context's FSPL / PFD conversions,
+            matching the convention of the S.1528 / M.2101 contexts.
+        theta_step_deg :
+            Optional override for the regular-grid resample step in
+            degrees. Defaults to ``_CUSTOM_1D_LUT_STEP_DEG`` (0.001°),
+            which captures any realistic user-authored source. Pass a
+            finer step only for extreme cases (sub-0.001° main-beam
+            features). Matches the ``axis0_step_deg`` override exposed
+            by :meth:`prepare_custom_pattern_2d_context` for symmetry.
+        system_id :
+            Optional identifier selecting which per-system bucket of
+            the session's LRU cache to use. Multi-system scenarios
+            pass the system index here so each system has its own
+            bounded cache with no cross-system eviction. Callers that
+            don't care (tests, single-system runs, GUI previews) leave
+            the default and share a single anonymous bucket.
+        """
+        from scepter.custom_antenna import (  # local import keeps top-level deps minimal
+            CustomAntennaPattern as _CAP,
+            KIND_1D as _KIND_1D,
+            NORMALISATION_ABSOLUTE as _NORM_ABS,
+            PEAK_SOURCE_LUT as _PS_LUT,
+            evaluate_pattern_1d as _eval_1d,
+        )
+
+        self._ensure_owner_thread()
+        self._ensure_open()
+        _require_cupy()
+
+        if not isinstance(pattern, _CAP):
+            raise TypeError(
+                "prepare_custom_pattern_1d_context requires a "
+                "CustomAntennaPattern instance; "
+                f"got {type(pattern).__name__}."
+            )
+        if pattern.kind != _KIND_1D:
+            raise ValueError(
+                "prepare_custom_pattern_1d_context requires kind="
+                f"{_KIND_1D!r}; got {pattern.kind!r}. Use the 2-D "
+                "builder (Stage 12) for asymmetric patterns."
+            )
+
+        wavelength_val = float(
+            u.Quantity(wavelength_m).to_value(u.m)
+            if hasattr(wavelength_m, "to")
+            else wavelength_m
+        )
+        if not np.isfinite(wavelength_val) or wavelength_val <= 0.0:
+            raise ValueError(
+                "Custom 1-D context: wavelength_m must be finite and > 0; "
+                f"got {wavelength_val!r}."
+            )
+
+        step = (
+            float(theta_step_deg) if theta_step_deg is not None
+            else float(_CUSTOM_1D_LUT_STEP_DEG)
+        )
+        if not np.isfinite(step) or step <= 0.0:
+            raise ValueError(
+                f"theta_step_deg must be finite and > 0; got {step!r}."
+            )
+        max_deg = float(_CUSTOM_1D_LUT_MAX_DEG)
+
+        # Cache key uses a ``CustomAntennaPattern.content_fingerprint``
+        # rather than ``id(pattern)`` so the user can mutate the
+        # loaded LUT in place (e.g. via a GUI pattern editor) and
+        # re-prepare the context without a save-reload round-trip —
+        # any radiation-affecting change flips the hash, triggering
+        # a fresh LUT build. ``meta`` / ``format_version`` are
+        # excluded from the hash (they don't affect gain). The
+        # ``system_id`` is *not* part of the key — it selects which
+        # per-system LRU bucket to look in, so two systems with the
+        # same pattern content get their own contexts rather than
+        # sharing one.
+        key = (
+            "custom_1d",
+            self.device_id,
+            self.compute_dtype.str,
+            pattern.content_fingerprint(),
+            round(wavelength_val, 9),
+            round(step, 9),
+        )
+        bucket = self._custom_pattern_context_cache.setdefault(
+            system_id, OrderedDict()
+        )
+        cached = bucket.get(key)
+        if cached is not None:
+            bucket.move_to_end(key)
+            self._touch()
+            return cached
+
+        n = int(round(max_deg / step)) + 2
+        grid_host = np.arange(n, dtype=np.float64) * np.float64(step)
+        # ``evaluate_pattern_1d`` returns absolute dBi, shifting relative
+        # patterns by peak_gain_dbi. The returned LUT therefore stores
+        # absolute dBi — same convention as the S.1528 1-D LUT.
+        gain_host = _eval_1d(pattern, grid_host).astype(np.float32)
+
+        # Resolve the effective peak per the schema's peak-gain rule:
+        # ``absolute+lut`` → peak is max of the tabulated LUT;
+        # every other (normalisation, peak_gain_source) combination
+        # uses the declared ``peak_gain_dbi`` verbatim. This matters
+        # for ``peak_source="lut"`` patterns where the LUT maximum
+        # and the declared peak can legitimately differ (ITU
+        # regulatory masks, undersampled narrow-beam datasheets).
+        if (
+            pattern.normalisation == _NORM_ABS
+            and pattern.peak_gain_source == _PS_LUT
+        ):
+            resolved_peak_dbi = float(np.max(pattern.gain_db))
+        else:
+            resolved_peak_dbi = float(pattern.peak_gain_dbi)
+
+        with self._temporary_activation():
+            d_gain_lut = cp.asarray(gain_host, dtype=cp.float32)
+            # Downcast to fp16 when the session's pattern stage runs at
+            # fp16 — the shared ``s1528_lut_1d_*`` evaluators dispatch
+            # on LUT dtype, so Custom-1D transparently rides along.
+            if np.dtype(self.pattern_dtype) == np.dtype(np.float16):
+                d_gain_lut = d_gain_lut.astype(cp.float16, copy=False)
+            context = GpuCustomPattern1DContext(
+                session=self,
+                compute_dtype=self.compute_dtype,
+                device_id=self.device_id,
+                peak_gain_dbi=resolved_peak_dbi,
+                wavelength_m=wavelength_val,
+                d_gain_lut=d_gain_lut,
+                gain_lut_step_deg=step,
+                gain_lut_max_deg=max_deg,
+                gain_lut_n=n,
+                source_pattern=pattern,
+            )
+        bucket[key] = context
+        self._trim_custom_pattern_cache(system_id)
+        self._touch()
+        return context
+
+    def prepare_custom_pattern_2d_context(
+        self,
+        *,
+        pattern: "CustomAntennaPattern",
+        wavelength_m: float | u.Quantity = 0.1,
+        axis0_step_deg: float | None = None,
+        axis1_step_deg: float | None = None,
+        system_id: Any = None,
+    ) -> GpuCustomPattern2DContext:
+        """Upload a 2-D custom pattern to GPU as a regular bilinear LUT.
+
+        The user-supplied pattern (possibly on an irregular grid, and
+        possibly expressing step discontinuities via duplicate grid
+        angles) is resampled onto a regular grid via the schema-correct
+        CPU evaluator :func:`scepter.custom_antenna.evaluate_pattern_2d`
+        (bilinear with right-continuous step handling) before upload.
+        The hot-path GPU kernel is therefore agnostic to both the
+        irregularity and the step discontinuities — it sees a plain
+        regular-grid LUT.
+
+        Default resample resolutions mirror the internal M.2101 / S.1528
+        2-D LUTs (``az/el = 0.5°``, ``θ = 0.05°``, ``φ = 0.5°``) — fine
+        enough for any realistic user-authored source, comfortably
+        under a few tens of MB on device. Callers who want finer or
+        coarser grids pass ``axis0_step_deg`` / ``axis1_step_deg``.
+
+        Parameters
+        ----------
+        pattern :
+            Validated :class:`~scepter.custom_antenna.CustomAntennaPattern`
+            with ``kind == KIND_2D``.
+        wavelength_m :
+            FSPL / PFD-conversion wavelength (matches the other
+            pattern contexts).
+        axis0_step_deg, axis1_step_deg :
+            Optional overrides for the regular-grid resample step on
+            each axis. Units are degrees. If omitted, defaults match
+            the pattern's ``grid_mode``.
+        system_id :
+            Optional per-system LRU-bucket selector — see
+            :meth:`prepare_custom_pattern_1d_context` for the full
+            rationale.
+        """
+        from scepter.custom_antenna import (  # local import — keeps top-level dep graph minimal
+            CustomAntennaPattern as _CAP,
+            GRID_MODE_AZEL as _GM_AZEL,
+            GRID_MODE_THETAPHI as _GM_THETAPHI,
+            KIND_2D as _KIND_2D,
+            NORMALISATION_ABSOLUTE as _NORM_ABS,
+            PEAK_SOURCE_LUT as _PS_LUT,
+            evaluate_pattern_2d as _eval_2d,
+        )
+
+        self._ensure_owner_thread()
+        self._ensure_open()
+        _require_cupy()
+
+        if not isinstance(pattern, _CAP):
+            raise TypeError(
+                "prepare_custom_pattern_2d_context requires a "
+                "CustomAntennaPattern instance; "
+                f"got {type(pattern).__name__}."
+            )
+        if pattern.kind != _KIND_2D:
+            raise ValueError(
+                "prepare_custom_pattern_2d_context requires kind="
+                f"{_KIND_2D!r}; got {pattern.kind!r}. Use the 1-D "
+                "builder for axisymmetric patterns."
+            )
+
+        wavelength_val = float(
+            u.Quantity(wavelength_m).to_value(u.m)
+            if hasattr(wavelength_m, "to") else wavelength_m
+        )
+        if not np.isfinite(wavelength_val) or wavelength_val <= 0.0:
+            raise ValueError(
+                "Custom 2-D context: wavelength_m must be finite and > 0; "
+                f"got {wavelength_val!r}."
+            )
+
+        if pattern.grid_mode == _GM_AZEL:
+            default_axis0_step = _CUSTOM_2D_AZEL_AZ_STEP_DEG
+            default_axis1_step = _CUSTOM_2D_AZEL_EL_STEP_DEG
+            axis0_min, axis0_max = -180.0, 180.0
+            axis1_min, axis1_max = -90.0, 90.0
+            axis0_wraps = bool(pattern.az_wraps if pattern.az_wraps is not None else True)
+            axis1_wraps = False   # elevation never wraps
+            pat_axis0 = np.asarray(pattern.az_grid_deg, dtype=np.float64)
+            pat_axis1 = np.asarray(pattern.el_grid_deg, dtype=np.float64)
+        elif pattern.grid_mode == _GM_THETAPHI:
+            default_axis0_step = _CUSTOM_2D_THETAPHI_THETA_STEP_DEG
+            default_axis1_step = _CUSTOM_2D_THETAPHI_PHI_STEP_DEG
+            axis0_min, axis0_max = 0.0, 180.0
+            axis1_min, axis1_max = -180.0, 180.0
+            axis0_wraps = False   # theta never wraps
+            axis1_wraps = bool(pattern.phi_wraps if pattern.phi_wraps is not None else True)
+            pat_axis0 = np.asarray(pattern.theta_grid_deg, dtype=np.float64)
+            pat_axis1 = np.asarray(pattern.phi_grid_deg, dtype=np.float64)
+        else:
+            raise ValueError(
+                f"Unsupported custom pattern grid_mode={pattern.grid_mode!r}."
+            )
+
+        # Choose the GPU LUT step to match the pattern's native grid
+        # when the pattern is already on a regular grid.  The old
+        # code always promoted to the default 0.1° resolution, which
+        # inflated a typical 1°-medium 361×181 editor grid to a
+        # 3601×1801 LUT (100× more VRAM + bandwidth for zero extra
+        # fidelity — bilinear interpolation of a 1° grid only
+        # produces a 1° pattern regardless of how finely the LUT is
+        # sampled).  Honour-user-grid policy:
+        #
+        #   - If the pattern's step is within tolerance of uniform,
+        #     use that step exactly. This is the "WYSIWYG" path:
+        #     editor's surface grid == exported JSON grid == GPU
+        #     LUT grid, so what the user sees is what the GPU
+        #     simulates (no silent resample).
+        #   - Otherwise (non-uniform grid, rare — mostly hand-authored
+        #     JSONs), fall back to the old default step so the
+        #     resample at least lands on a regular grid.
+        #   - Explicit caller-supplied step always wins.
+        def _regular_step(axis: np.ndarray) -> float | None:
+            if axis.size < 2:
+                return None
+            diffs = np.diff(axis.astype(np.float64))
+            if diffs.size == 0:
+                return None
+            nominal = float(np.median(diffs))
+            if nominal <= 0.0:
+                return None
+            spread = float(np.max(diffs) - np.min(diffs))
+            # Accept as "regular" if max deviation is ≤ 0.1% of
+            # nominal step — covers floating-point drift from linspace
+            # reconstructions, rejects hand-authored non-uniform grids.
+            if spread > max(1.0e-6, 0.001 * nominal):
+                return None
+            return nominal
+
+        if axis0_step_deg is None:
+            native0 = _regular_step(pat_axis0)
+            if native0 is not None:
+                default_axis0_step = native0
+        if axis1_step_deg is None:
+            native1 = _regular_step(pat_axis1)
+            if native1 is not None:
+                default_axis1_step = native1
+
+        axis0_step = float(axis0_step_deg) if axis0_step_deg is not None else float(default_axis0_step)
+        axis1_step = float(axis1_step_deg) if axis1_step_deg is not None else float(default_axis1_step)
+        if axis0_step <= 0.0 or not np.isfinite(axis0_step):
+            raise ValueError(f"axis0_step_deg must be > 0; got {axis0_step!r}.")
+        if axis1_step <= 0.0 or not np.isfinite(axis1_step):
+            raise ValueError(f"axis1_step_deg must be > 0; got {axis1_step!r}.")
+
+        # Content-hash cache key — see the matching comment in
+        # ``prepare_custom_pattern_1d_context``. The fingerprint
+        # already includes ``grid_mode``, ``az_wraps`` / ``phi_wraps``,
+        # and every grid / gain array, so we don't need them in the
+        # key separately. Per-system bucketing via ``system_id``
+        # isolates each system's LRU from the others.
+        key = (
+            "custom_2d",
+            self.device_id,
+            self.compute_dtype.str,
+            pattern.content_fingerprint(),
+            round(wavelength_val, 9),
+            round(axis0_step, 9),
+            round(axis1_step, 9),
+        )
+        bucket = self._custom_pattern_context_cache.setdefault(
+            system_id, OrderedDict()
+        )
+        cached = bucket.get(key)
+        if cached is not None:
+            bucket.move_to_end(key)
+            self._touch()
+            return cached
+
+        axis0_n = int(round((axis0_max - axis0_min) / axis0_step)) + 1
+        axis1_n = int(round((axis1_max - axis1_min) / axis1_step)) + 1
+        # Safety: if the pattern-derived step would exceed the VRAM
+        # budget, coarsen both axes proportionally until it fits.
+        while axis0_n * axis1_n > _CUSTOM_2D_MAX_LUT_ELEMENTS:
+            axis0_step *= 2.0
+            axis1_step *= 2.0
+            axis0_n = int(round((axis0_max - axis0_min) / axis0_step)) + 1
+            axis1_n = int(round((axis1_max - axis1_min) / axis1_step)) + 1
+        axis0_grid = np.arange(axis0_n, dtype=np.float64) * axis0_step + axis0_min
+        axis1_grid = np.arange(axis1_n, dtype=np.float64) * axis1_step + axis1_min
+
+        axis0_mesh, axis1_mesh = np.meshgrid(axis0_grid, axis1_grid, indexing="ij")
+        gain_host = _eval_2d(pattern, axis0_mesh, axis1_mesh).astype(np.float32)
+        if gain_host.shape != (axis0_n, axis1_n):  # pragma: no cover — defensive
+            raise RuntimeError(
+                "Custom 2-D resample produced unexpected shape "
+                f"{gain_host.shape}, expected ({axis0_n}, {axis1_n})."
+            )
+
+        # Schema-correct peak resolution — see the matching comment in
+        # ``prepare_custom_pattern_1d_context``. ``absolute+lut``
+        # derives the peak from the tabulated maximum; every other
+        # (normalisation, peak_gain_source) combination trusts the
+        # declared ``peak_gain_dbi`` verbatim.
+        if (
+            pattern.normalisation == _NORM_ABS
+            and pattern.peak_gain_source == _PS_LUT
+        ):
+            resolved_peak_dbi = float(np.max(pattern.gain_db))
+        else:
+            resolved_peak_dbi = float(pattern.peak_gain_dbi)
+
+        with self._temporary_activation():
+            d_gain_lut = cp.asarray(gain_host, dtype=cp.float32)
+            # Downcast to fp16 when the session's pattern stage runs at
+            # fp16.  The ``custom_2d_lut_*`` evaluators dispatch on LUT
+            # dtype, so the hot path transparently picks the fp16
+            # kernel variants.
+            if np.dtype(self.pattern_dtype) == np.dtype(np.float16):
+                d_gain_lut = d_gain_lut.astype(cp.float16, copy=False)
+            context = GpuCustomPattern2DContext(
+                session=self,
+                compute_dtype=self.compute_dtype,
+                device_id=self.device_id,
+                peak_gain_dbi=resolved_peak_dbi,
+                wavelength_m=wavelength_val,
+                grid_mode=pattern.grid_mode,
+                axis0_min_deg=float(axis0_min),
+                axis0_step_deg=float(axis0_step),
+                axis0_n=int(axis0_n),
+                axis0_wraps=bool(axis0_wraps),
+                axis1_min_deg=float(axis1_min),
+                axis1_step_deg=float(axis1_step),
+                axis1_n=int(axis1_n),
+                axis1_wraps=bool(axis1_wraps),
+                d_gain_lut=d_gain_lut,
+                source_pattern=pattern,
+            )
+        bucket[key] = context
+        self._trim_custom_pattern_cache(system_id)
         self._touch()
         return context
 
@@ -16126,11 +21540,24 @@ class GpuScepterSession:
 
         Parameters
         ----------
-        pattern_context : GpuS1528PatternContext, GpuS1528Rec12PatternContext, or GpuM2101PatternContext
+        pattern_context
             Transmit pattern shared by every satellite the LUT covers.
-            S.1528 contexts build a 1-D ``K(β)`` table; M.2101 contexts
-            build a 2-D ``K(α, β)`` table (``is_2d == True``) that
-            captures the phased array's non-axisymmetric gain pattern.
+            Supported context types:
+
+            * **S.1528** (both axisymmetric ``lt_m == lr_m`` and
+              asymmetric ``lt_m != lr_m``), **S.1528 Rec 1.2**,
+              **isotropic**, **Custom-1D**, **Custom-2D** → build a
+              1-D ``K(β)`` table (``is_2d == False``). The asymmetric
+              S.1528 and Custom-2D paths sweep a 2-D ``(ψ, φ)``
+              observation grid to capture the φ-dependent main-lobe
+              peak, but the resulting K is still α-invariant because
+              the aperture rotates with the beam (see Stage-10
+              decision doc and
+              ``_build_peak_pfd_k_lut_custom2d_cp`` docstring).
+            * **M.2101** → 2-D ``K(α, β)`` table (``is_2d == True``)
+              because the element pattern is fixed in the satellite
+              body frame, so K genuinely depends on the beam
+              steering azimuth.
         sat_orbit_radius_m_per_sat : array_like
             Per-satellite orbit radius in metres, shape ``(sat_count,)``.
             Distinct shells are deduplicated at centimetre precision.
@@ -16183,8 +21610,22 @@ class GpuScepterSession:
         earth_radius_m = float(R_earth.to_value(u.m))
         pattern_id = id(pattern_context)
         apply_atmosphere = atmosphere_lut_context is not None
-        pattern_eval_mode = str(_s1528_pattern_eval_mode)
+        pattern_eval_mode = str(_pattern_eval_mode)
         is_m2101_ctx = isinstance(pattern_context, GpuM2101PatternContext)
+        is_asym_s1528_ctx = (
+            isinstance(pattern_context, GpuS1528PatternContext)
+            and bool(pattern_context.is_2d)
+        )
+        is_custom_2d_ctx = isinstance(pattern_context, GpuCustomPattern2DContext)
+        # 2-D K(α, β) LUT is only needed for patterns whose angular
+        # structure is fixed in the satellite body frame (M.2101 element
+        # pattern). Asymmetric S.1528 *and* Custom-2D both attach the
+        # asymmetry to the beam boresight — rotating α_i rotates the
+        # aperture, so K is α-invariant and a 1-D K(β) suffices (built
+        # with a 2-D observation sweep to catch the φ-dependent main
+        # lobe max). See Stage-10 decision doc and
+        # _build_peak_pfd_k_lut_custom2d_cp docstring.
+        uses_2d_lut = is_m2101_ctx
 
         key = (
             self.device_id,
@@ -16199,6 +21640,8 @@ class GpuScepterSession:
             round(float(psi_step_deg), 9),
             pattern_eval_mode,
             bool(is_m2101_ctx),
+            bool(is_asym_s1528_ctx),
+            bool(is_custom_2d_ctx),
             round(float(m2101_beta_step_deg), 9),
             round(float(m2101_alpha_step_deg), 9),
             round(float(m2101_psi_step_deg), 9),
@@ -16222,7 +21665,7 @@ class GpuScepterSession:
 
         k_rows: list[Any] = []
         psi_horizon_per_shell = np.empty((n_shells,), dtype=np.float64)
-        beta_step_out = float(beta_step_deg if not is_m2101_ctx else m2101_beta_step_deg)
+        beta_step_out = float(m2101_beta_step_deg if uses_2d_lut else beta_step_deg)
         beta_max_out = 0.0
         n_beta_out = 0
         alpha_step_out = 0.0
@@ -16253,6 +21696,48 @@ class GpuScepterSession:
                         psi_step_deg=float(m2101_psi_step_deg),
                         phi_step_deg=float(m2101_phi_step_deg),
                     )
+                elif is_asym_s1528_ctx:
+                    (
+                        k_cp,
+                        beta_step_ret,
+                        beta_max_ret,
+                        n_beta_ret,
+                        psi_horizon_deg,
+                    ) = _build_peak_pfd_k_lut_asym_s1528_cp(
+                        pattern_context=pattern_context,
+                        orbit_radius_m=float(shell_r),
+                        earth_radius_m=earth_radius_m,
+                        atmosphere_lut_context=atmosphere_lut_context,
+                        target_alt_km=float(target_alt_km),
+                        beta_step_deg=float(beta_step_deg),
+                        beta_extra_margin_deg=float(beta_extra_margin_deg),
+                        psi_step_deg=float(psi_step_deg),
+                        phi_step_deg=float(m2101_phi_step_deg),
+                    )
+                    alpha_step_ret = 0.0
+                    alpha_min_ret = 0.0
+                    n_alpha_ret = 0
+                elif is_custom_2d_ctx:
+                    (
+                        k_cp,
+                        beta_step_ret,
+                        beta_max_ret,
+                        n_beta_ret,
+                        psi_horizon_deg,
+                    ) = _build_peak_pfd_k_lut_custom2d_cp(
+                        pattern_context=pattern_context,
+                        orbit_radius_m=float(shell_r),
+                        earth_radius_m=earth_radius_m,
+                        atmosphere_lut_context=atmosphere_lut_context,
+                        target_alt_km=float(target_alt_km),
+                        beta_step_deg=float(beta_step_deg),
+                        beta_extra_margin_deg=float(beta_extra_margin_deg),
+                        psi_step_deg=float(psi_step_deg),
+                        phi_step_deg=float(m2101_phi_step_deg),
+                    )
+                    alpha_step_ret = 0.0
+                    alpha_min_ret = 0.0
+                    n_alpha_ret = 0
                 else:
                     (
                         k_cp,
@@ -16285,7 +21770,7 @@ class GpuScepterSession:
                     if int(n_beta_ret) != n_beta_out:
                         # Different shells produced different β grids — pad/trim
                         # to the common n_beta so we can stack into one tensor.
-                        if is_m2101_ctx:
+                        if uses_2d_lut:
                             if int(n_beta_ret) > n_beta_out:
                                 k_cp = k_cp[:, :n_beta_out]
                             else:
@@ -16328,7 +21813,7 @@ class GpuScepterSession:
             target_alt_km=float(target_alt_km),
             d_k_lut=d_k_lut,
             d_shell_id_per_sat=d_shell_id_per_sat,
-            is_2d=bool(is_m2101_ctx),
+            is_2d=bool(uses_2d_lut),
             alpha_step_deg=alpha_step_out,
             alpha_min_deg=alpha_min_out,
             n_alpha=n_alpha_out,
@@ -17136,8 +22621,17 @@ class GpuScepterSession:
     def accumulate_ras_power(
         self,
         *,
-        s1528_pattern_context: GpuS1528PatternContext | GpuS1528Rec12PatternContext | GpuM2101PatternContext,
-        ras_pattern_context: GpuRasPatternContext | None,
+        s1528_pattern_context: (
+            GpuS1528PatternContext
+            | GpuS1528Rec12PatternContext
+            | GpuM2101PatternContext
+            | GpuIsotropicPatternContext
+            | GpuCustomPattern1DContext
+            | GpuCustomPattern2DContext
+        ),
+        ras_pattern_context: (
+            GpuRasPatternContext | GpuCustomPattern1DContext | None
+        ),
         sat_topo: Any,
         sat_azel: Any,
         beam_idx: Any,
@@ -17182,6 +22676,7 @@ class GpuScepterSession:
         working_memory_budget_bytes: int | None = None,
         sky_slab: int | None = None,
         return_device: bool = True,
+        visibility_elev_threshold_deg: float = 0.0,
     ) -> dict[str, Any]:
         """
         Accumulate EPFDflow receive power and optional PFD payloads on the GPU.
@@ -17290,100 +22785,126 @@ class GpuScepterSession:
             raise ValueError("peak_pfd_lut_context must belong to this session.")
 
         bandwidth_value = float(bandwidth_mhz)
-        if not np.isfinite(bandwidth_value) or bandwidth_value <= 0.0:
-            raise ValueError("bandwidth_mhz must be finite and > 0.")
 
-        def _coerce_channel_value(
-            channel_value: float | None,
-            spectral_value: float | None,
-            *,
-            label: str,
-        ) -> float | None:
-            channel_finite = channel_value is not None and np.isfinite(float(channel_value))
-            spectral_finite = spectral_value is not None and np.isfinite(float(spectral_value))
-            if channel_finite and spectral_finite:
-                derived_channel = float(spectral_value) + 10.0 * math.log10(float(bandwidth_value))
-                if not math.isclose(float(channel_value), float(derived_channel), rel_tol=0.0, abs_tol=1.0e-6):
-                    raise ValueError(
-                        f"{label} per-MHz and per-channel values are inconsistent for "
-                        f"bandwidth_mhz={bandwidth_value!r}."
-                    )
-                return float(channel_value)
-            if channel_finite:
-                return float(channel_value)
-            if spectral_finite:
-                return float(spectral_value) + 10.0 * math.log10(float(bandwidth_value))
-            return None
-
-        target_pfd_dbw_m2_channel = _coerce_channel_value(
-            target_pfd_dbw_m2_channel,
-            target_pfd_dbw_m2_mhz if target_pfd_dbw_m2_mhz is not None else pfd0_dbw_m2_mhz,
-            label="target_pfd",
+        # Cache coerced power values to avoid repeated log10/isclose
+        # calls that produce the same result every batch.  Safe because
+        # ALL cached values are scalar power configuration (bandwidth,
+        # target PFD, EIRP, cap threshold) that are constant for the
+        # entire simulation run — they come from the user's config, not
+        # from per-batch geometry.  Tensor inputs (sat_topo, beam_idx,
+        # cell_spectral_weight) are NOT cached — they vary per batch.
+        _cache_key = (
+            bandwidth_value,
+            target_pfd_dbw_m2_channel, target_pfd_dbw_m2_mhz,
+            pfd0_dbw_m2_mhz,
+            satellite_ptx_dbw_channel, satellite_ptx_dbw_mhz,
+            satellite_eirp_dbw_channel, satellite_eirp_dbw_mhz,
+            max_surface_pfd_dbw_m2_channel, max_surface_pfd_dbw_m2_mhz,
+            max_surface_pfd_lin_channel,
         )
-        satellite_ptx_dbw_channel = _coerce_channel_value(
-            satellite_ptx_dbw_channel,
-            satellite_ptx_dbw_mhz,
-            label="satellite_ptx",
-        )
-        satellite_eirp_dbw_channel = _coerce_channel_value(
-            satellite_eirp_dbw_channel,
-            satellite_eirp_dbw_mhz,
-            label="satellite_eirp",
-        )
-
-        max_surface_pfd_dbw_m2_channel_resolved = _coerce_channel_value(
-            max_surface_pfd_dbw_m2_channel,
-            max_surface_pfd_dbw_m2_mhz,
-            label="max_surface_pfd",
-        )
-        if (
-            max_surface_pfd_lin_channel is not None
-            and max_surface_pfd_dbw_m2_channel_resolved is not None
-        ):
-            # The caller supplied both the pre-computed linear form and
-            # one of the dB forms.  They must agree (up to fp32 rounding)
-            # so we never silently pick the wrong one.
-            derived = float(10.0 ** (float(max_surface_pfd_dbw_m2_channel_resolved) / 10.0))
-            ratio = float(max_surface_pfd_lin_channel) / derived if derived > 0.0 else 1.0
-            if not (0.999 <= ratio <= 1.001):
-                raise ValueError(
-                    "max_surface_pfd_lin_channel and max_surface_pfd_dbw_m2_* "
-                    f"disagree: {float(max_surface_pfd_lin_channel):.6e} "
-                    f"vs {derived:.6e} W/m²/channel."
-                )
-        if (
-            peak_pfd_lut_context is not None
-            and max_surface_pfd_dbw_m2_channel_resolved is None
-            and max_surface_pfd_lin_channel is None
-        ):
-            raise ValueError(
-                "peak_pfd_lut_context supplied but no max_surface_pfd_dbw_m2_* "
-                "or max_surface_pfd_lin_channel limit was provided."
-            )
-        if (
-            (
-                max_surface_pfd_dbw_m2_channel_resolved is not None
-                or max_surface_pfd_lin_channel is not None
-            )
-            and peak_pfd_lut_context is None
-        ):
-            raise ValueError(
-                "max_surface_pfd_dbw_m2_* / _lin_channel limit supplied but "
-                "peak_pfd_lut_context is None — build it via "
-                "GpuScepterSession.prepare_peak_pfd_lut_context."
-            )
-        # Prefer the pre-computed linear value when present: the fused
-        # direct-EPFD path takes advantage of this to avoid a lossy
-        # dB↔linear round trip through fp32.  Fall back to converting
-        # from the dB form when the caller only supplied dB.
-        if max_surface_pfd_lin_channel is not None:
-            max_surface_pfd_lin_channel_value = float(max_surface_pfd_lin_channel)
-        elif max_surface_pfd_dbw_m2_channel_resolved is not None:
-            max_surface_pfd_lin_channel_value = float(
-                10.0 ** (float(max_surface_pfd_dbw_m2_channel_resolved) / 10.0)
-            )
+        _cached = getattr(self, "_power_coerce_cache", None)
+        if _cached is not None and _cached[0] == _cache_key:
+            (_, target_pfd_dbw_m2_channel, satellite_ptx_dbw_channel,
+             satellite_eirp_dbw_channel, max_surface_pfd_dbw_m2_channel_resolved,
+             max_surface_pfd_lin_channel_value) = _cached
         else:
-            max_surface_pfd_lin_channel_value = None
+            if not np.isfinite(bandwidth_value) or bandwidth_value <= 0.0:
+                raise ValueError("bandwidth_mhz must be finite and > 0.")
+
+            def _coerce_channel_value(
+                channel_value: float | None,
+                spectral_value: float | None,
+                *,
+                label: str,
+            ) -> float | None:
+                channel_finite = channel_value is not None and np.isfinite(float(channel_value))
+                spectral_finite = spectral_value is not None and np.isfinite(float(spectral_value))
+                if channel_finite and spectral_finite:
+                    derived_channel = float(spectral_value) + 10.0 * math.log10(float(bandwidth_value))
+                    if not math.isclose(float(channel_value), float(derived_channel), rel_tol=0.0, abs_tol=1.0e-6):
+                        raise ValueError(
+                            f"{label} per-MHz and per-channel values are inconsistent for "
+                            f"bandwidth_mhz={bandwidth_value!r}."
+                        )
+                    return float(channel_value)
+                if channel_finite:
+                    return float(channel_value)
+                if spectral_finite:
+                    return float(spectral_value) + 10.0 * math.log10(float(bandwidth_value))
+                return None
+
+            target_pfd_dbw_m2_channel = _coerce_channel_value(
+                target_pfd_dbw_m2_channel,
+                target_pfd_dbw_m2_mhz if target_pfd_dbw_m2_mhz is not None else pfd0_dbw_m2_mhz,
+                label="target_pfd",
+            )
+            satellite_ptx_dbw_channel = _coerce_channel_value(
+                satellite_ptx_dbw_channel,
+                satellite_ptx_dbw_mhz,
+                label="satellite_ptx",
+            )
+            satellite_eirp_dbw_channel = _coerce_channel_value(
+                satellite_eirp_dbw_channel,
+                satellite_eirp_dbw_mhz,
+                label="satellite_eirp",
+            )
+
+            max_surface_pfd_dbw_m2_channel_resolved = _coerce_channel_value(
+                max_surface_pfd_dbw_m2_channel,
+                max_surface_pfd_dbw_m2_mhz,
+                label="max_surface_pfd",
+            )
+            if (
+                max_surface_pfd_lin_channel is not None
+                and max_surface_pfd_dbw_m2_channel_resolved is not None
+            ):
+                derived = float(10.0 ** (float(max_surface_pfd_dbw_m2_channel_resolved) / 10.0))
+                ratio = float(max_surface_pfd_lin_channel) / derived if derived > 0.0 else 1.0
+                if not (0.999 <= ratio <= 1.001):
+                    raise ValueError(
+                        "max_surface_pfd_lin_channel and max_surface_pfd_dbw_m2_* "
+                        f"disagree: {float(max_surface_pfd_lin_channel):.6e} "
+                        f"vs {derived:.6e} W/m²/channel."
+                    )
+            if (
+                peak_pfd_lut_context is not None
+                and max_surface_pfd_dbw_m2_channel_resolved is None
+                and max_surface_pfd_lin_channel is None
+            ):
+                raise ValueError(
+                    "peak_pfd_lut_context supplied but no max_surface_pfd_dbw_m2_* "
+                    "or max_surface_pfd_lin_channel limit was provided."
+                )
+            if (
+                (
+                    max_surface_pfd_dbw_m2_channel_resolved is not None
+                    or max_surface_pfd_lin_channel is not None
+                )
+                and peak_pfd_lut_context is None
+            ):
+                raise ValueError(
+                    "max_surface_pfd_dbw_m2_* / _lin_channel limit supplied but "
+                    "peak_pfd_lut_context is None — build it via "
+                    "GpuScepterSession.prepare_peak_pfd_lut_context."
+                )
+            if max_surface_pfd_lin_channel is not None:
+                max_surface_pfd_lin_channel_value = float(max_surface_pfd_lin_channel)
+            elif max_surface_pfd_dbw_m2_channel_resolved is not None:
+                max_surface_pfd_lin_channel_value = float(
+                    10.0 ** (float(max_surface_pfd_dbw_m2_channel_resolved) / 10.0)
+                )
+            else:
+                max_surface_pfd_lin_channel_value = None
+
+            # Cache the coerced values for subsequent calls with same power input.
+            self._power_coerce_cache = (
+                _cache_key,
+                target_pfd_dbw_m2_channel,
+                satellite_ptx_dbw_channel,
+                satellite_eirp_dbw_channel,
+                max_surface_pfd_dbw_m2_channel_resolved,
+                max_surface_pfd_lin_channel_value,
+            )
 
         with self._temporary_activation():
             sat_topo_cp = _coerce_step2_topo_tensor_cp(sat_topo, name="sat_topo")
@@ -17482,6 +23003,7 @@ class GpuScepterSession:
                         surface_pfd_stats_enabled=bool(surface_pfd_stats_enabled),
                         precomputed_cap_factor_cp=precomputed_cap_factor_cp,
                         precomputed_cap_stats=precomputed_cap_stats,
+                        visibility_elev_threshold_deg=float(visibility_elev_threshold_deg),
                         )
                         if not result:
                             result = _allocate_chunked_ras_power_result_cp(
@@ -17537,6 +23059,7 @@ class GpuScepterSession:
                         surface_pfd_stats_enabled=bool(surface_pfd_stats_enabled),
                         precomputed_cap_factor_cp=precomputed_cap_factor_cp,
                         precomputed_cap_stats=precomputed_cap_stats,
+                        visibility_elev_threshold_deg=float(visibility_elev_threshold_deg),
                     )
             else:
                 result = _accumulate_ras_power_cp(
@@ -17581,6 +23104,7 @@ class GpuScepterSession:
                     surface_pfd_stats_enabled=bool(surface_pfd_stats_enabled),
                     precomputed_cap_factor_cp=precomputed_cap_factor_cp,
                     precomputed_cap_stats=precomputed_cap_stats,
+                    visibility_elev_threshold_deg=float(visibility_elev_threshold_deg),
                 )
             if return_device:
                 self._touch()
@@ -17593,8 +23117,17 @@ class GpuScepterSession:
         self,
         *,
         link_library: GpuSatelliteLinkSelectionLibrary,
-        s1528_pattern_context: GpuS1528PatternContext | GpuS1528Rec12PatternContext | GpuM2101PatternContext,
-        ras_pattern_context: GpuRasPatternContext | None,
+        s1528_pattern_context: (
+            GpuS1528PatternContext
+            | GpuS1528Rec12PatternContext
+            | GpuM2101PatternContext
+            | GpuIsotropicPatternContext
+            | GpuCustomPattern1DContext
+            | GpuCustomPattern2DContext
+        ),
+        ras_pattern_context: (
+            GpuRasPatternContext | GpuCustomPattern1DContext | None
+        ),
         sat_topo: Any,
         sat_azel: Any,
         orbit_radius_m_per_sat: Any,
@@ -17648,6 +23181,7 @@ class GpuScepterSession:
         scheduler_target_profile: str | float | None = "high_throughput",
         debug_direct_epfd: bool = False,
         return_device: bool = True,
+        visibility_elev_threshold_deg: float = 0.0,
     ) -> dict[str, Any]:
         """
         Finalize direct EPFD beams and accumulate receive power on-device.
@@ -17836,6 +23370,7 @@ class GpuScepterSession:
                 scheduler_target_profile=scheduler_target_profile,
                 debug_direct_epfd=bool(debug_direct_epfd),
                 return_device=bool(return_device),
+                visibility_elev_threshold_deg=float(visibility_elev_threshold_deg),
             )
         self._touch()
         return result
@@ -17872,7 +23407,12 @@ class GpuScepterSession:
         angle_sampler_context: GpuAngleSamplerContext | None,
         pointing_context: GpuS1586PointingContext | None,
         s1528_pattern_context: GpuS1528PatternContext | None,
-        ras_pattern_context: GpuRasPatternContext | None,
+        ras_pattern_context: (
+            GpuRasPatternContext
+            | GpuCustomPattern1DContext
+            | GpuCustomPattern2DContext
+            | None
+        ),
         atmosphere_lut_context: GpuAtmosphereLutContext | None,
     ) -> int:
         total = 0
@@ -18111,7 +23651,11 @@ class GpuScepterSession:
         angle_sampler_context: GpuAngleSamplerContext,
         pointing_context: GpuS1586PointingContext,
         s1528_pattern_context: GpuS1528PatternContext | GpuS1528Rec12PatternContext | GpuM2101PatternContext,
-        ras_pattern_context: GpuRasPatternContext,
+        ras_pattern_context: (
+            GpuRasPatternContext
+            | GpuCustomPattern1DContext
+            | GpuCustomPattern2DContext
+        ),
         atmosphere_lut_context: GpuAtmosphereLutContext | None,
         visible_satellite_count: int,
         n_links: int,
@@ -18341,7 +23885,11 @@ class GpuScepterSession:
         angle_sampler_context: GpuAngleSamplerContext,
         pointing_context: GpuS1586PointingContext,
         s1528_pattern_context: GpuS1528PatternContext | GpuS1528Rec12PatternContext | GpuM2101PatternContext,
-        ras_pattern_context: GpuRasPatternContext,
+        ras_pattern_context: (
+            GpuRasPatternContext
+            | GpuCustomPattern1DContext
+            | GpuCustomPattern2DContext
+        ),
         atmosphere_lut_context: GpuAtmosphereLutContext | None,
         visible_satellite_count: int,
         n_links: int,
@@ -20908,6 +26456,7 @@ class GpuScepterSession:
             self._s1586_pointing_context_cache,
             self._s1528_pattern_context_cache,
             self._ras_pattern_context_cache,
+            self._custom_pattern_context_cache,
             self._atmosphere_lut_context_cache,
             self._peak_pfd_lut_context_cache,
             self._spectrum_plan_context_cache,
@@ -20917,11 +26466,50 @@ class GpuScepterSession:
         for cache in self._session_caches():
             cache.clear()
 
+    def _custom_pattern_cache_capacity(self) -> int:
+        """Per-bucket LRU capacity for the custom-pattern context cache.
+
+        Each ``system_id`` bucket gets this many slots independently,
+        so total cache growth scales with the number of active systems
+        (analytical systems never touch this cache, so they don't
+        contribute to the footprint). A multi-system project with 30
+        LUT systems holds at most ``30 × capacity`` contexts.
+        """
+        return int(_CUSTOM_PATTERN_CACHE_SLOTS_PER_SYSTEM)
+
+    def _trim_custom_pattern_cache(self, system_id: Any) -> None:
+        """Evict the coldest entries in a system's bucket until it fits.
+
+        Called after each insert into a bucket. Dropping our cache
+        reference does not force an immediate GPU free (the caller
+        that asked for the context still holds it, and the CuPy
+        memory pool is process-lifetime regardless), so this is a
+        bookkeeping bound on the cache itself rather than an eager
+        GPU teardown. Per-bucket trimming guarantees system A's
+        churn can't evict system B's warm entries.
+        """
+        bucket = self._custom_pattern_context_cache.get(system_id)
+        if bucket is None:
+            return
+        cap = self._custom_pattern_cache_capacity()
+        while len(bucket) > cap:
+            bucket.popitem(last=False)
+
     def _invalidate_cached_device_state(self) -> list[Any]:
         detached: list[Any] = []
         for cache in self._session_caches():
-            for cached_value in cache.values():
-                detached.extend(_detach_cached_device_refs(cached_value))
+            # The custom-pattern cache is two-level
+            # ``{system_id: OrderedDict[...]}`` — the other caches are
+            # flat ``{key: context}`` dicts. Flatten the nested one so
+            # ``_detach_cached_device_refs`` sees real dataclass
+            # contexts, not inner ``OrderedDict`` buckets.
+            if cache is self._custom_pattern_context_cache:
+                for bucket in cache.values():
+                    for ctx in bucket.values():
+                        detached.extend(_detach_cached_device_refs(ctx))
+            else:
+                for cached_value in cache.values():
+                    detached.extend(_detach_cached_device_refs(cached_value))
             cache.clear()
         return detached
 
@@ -23821,9 +29409,18 @@ if cuda is not None:
         ras_retargeted_count_out,
         dropped_count_out,
     ):
+        # Warp-packed sky-cell parallelism: launch grid=(T, ceil(sky/32), 1),
+        # block=(32, 1, 1).  Each thread in a block handles one sky cell.
+        # All state tensors are indexed by ``[t, sky, ...]`` so different
+        # sky cells have fully independent state — no cross-thread
+        # coordination required, and the per-sky atomic updates on
+        # ``sat_slot_used`` target disjoint ``(t, sky, sat)`` slots.
+        # This replaces the old ``block=(1, 1, 1)`` launch that wasted 31
+        # of 32 lanes per warp, giving the bulk of the boresight finalize
+        # some actual GPU utilization.
         t = cuda.blockIdx.x
-        sky = cuda.blockIdx.y
-        if t >= assignments.shape[0] or sky >= sky_count or cuda.threadIdx.x != 0:
+        sky = cuda.blockIdx.y * cuda.blockDim.x + cuda.threadIdx.x
+        if t >= assignments.shape[0] or sky >= sky_count:
             return
         cell_count = assignments.shape[1]
         row_base = t * cell_count
@@ -24338,6 +29935,213 @@ if cuda is not None:
                 else:
                     dropped_count_out[t, sky] = dropped_count_out[t, sky] + np.int32(1)
 
+
+    GPU_FINALIZE_BLOCK_SIZE = 128
+
+    @cuda.jit
+    def _finalize_direct_epfd_beam_tables_parallel_kernel(
+        assignments,
+        selected_cone_ok,
+        selected_alpha_rad,
+        selected_beta_rad,
+        row_ptr,
+        candidate_sat,
+        candidate_alpha_rad,
+        candidate_beta_rad,
+        ras_elevation_deg,
+        ras_alpha_rad,
+        ras_beta_rad,
+        sat_min_elev_deg,
+        sat_beta_max_rad,
+        ras_cell_index,
+        n_links,
+        n_beam,
+        use_cone_check,
+        beta_tol_rad,
+        use_ras_guard,
+        ras_guard_cos,
+        sat_output_index,
+        ras_sat_axis_is_compact,
+        cell_slot_sat,
+        needs_repair,
+        sat_slot_used,
+        ras_alpha_by_sat,
+        ras_beta_by_sat,
+        ras_present_by_sat,
+        beam_idx_out,
+        beam_alpha_out,
+        beam_beta_out,
+        ras_retargeted_count_out,
+        direct_kept_count_out,
+        repaired_count_out,
+        dropped_count_out,
+    ):
+        """Parallel finalize kernel: one block per timestep, threads
+        cooperatively process cells within the block.
+
+        Phase 1 (RAS retarget): thread 0 only — sequential (one cell).
+        Phase 2 (direct keep-test): threads stride over cells in parallel,
+        using atomic sat_slot_used increments.
+        Phase 3 (repair): threads stride over cells needing repair.
+        """
+        t = cuda.blockIdx.x
+        tid = cuda.threadIdx.x
+        block_size = cuda.blockDim.x
+        if t >= assignments.shape[0]:
+            return
+
+        cell_count = assignments.shape[1]
+        row_base = t * cell_count
+
+        # ── Phase 1: RAS cell retargeting (thread 0 only) ──
+        if tid == 0:
+            ras_row_start = int(row_ptr[row_base + ras_cell_index])
+            ras_row_stop = int(row_ptr[row_base + ras_cell_index + 1])
+            for k in range(n_links):
+                chosen_sat = int(assignments[t, ras_cell_index, k])
+                if chosen_sat >= 0:
+                    if _row_has_sat_device(cell_slot_sat, t, ras_cell_index, n_links, chosen_sat):
+                        chosen_sat = -1
+                    elif not _ras_candidate_feasible_device(
+                        t, chosen_sat, ras_elevation_deg, ras_beta_rad,
+                        sat_output_index, ras_sat_axis_is_compact,
+                        sat_min_elev_deg, sat_beta_max_rad,
+                        use_cone_check, beta_tol_rad,
+                    ):
+                        chosen_sat = -1
+                if chosen_sat < 0:
+                    for idx in range(ras_row_start, ras_row_stop):
+                        cand_sat = int(candidate_sat[idx])
+                        if _row_has_sat_device(cell_slot_sat, t, ras_cell_index, n_links, cand_sat):
+                            continue
+                        if not _ras_candidate_feasible_device(
+                            t, cand_sat, ras_elevation_deg, ras_beta_rad,
+                            sat_output_index, ras_sat_axis_is_compact,
+                            sat_min_elev_deg, sat_beta_max_rad,
+                            use_cone_check, beta_tol_rad,
+                        ):
+                            continue
+                        chosen_sat = cand_sat
+                        break
+                if chosen_sat >= 0:
+                    beam_slot = cuda.atomic.add(sat_slot_used, (t, chosen_sat), 1)
+                    if beam_slot < n_beam:
+                        sat_out = _ras_lookup_sat_axis_device(
+                            chosen_sat, sat_output_index, ras_sat_axis_is_compact,
+                        )
+                        if sat_out >= 0:
+                            beam_idx_out[t, sat_out, beam_slot] = -2
+                            sat_lookup = _ras_lookup_sat_axis_device(
+                                chosen_sat, sat_output_index, ras_sat_axis_is_compact,
+                            )
+                            beam_alpha_out[t, sat_out, beam_slot] = float(
+                                ras_alpha_rad[t, sat_lookup]
+                            )
+                            beam_beta_out[t, sat_out, beam_slot] = float(
+                                ras_beta_rad[t, sat_lookup]
+                            )
+                        cell_slot_sat[t, ras_cell_index, k] = chosen_sat
+                        ras_present_by_sat[t, chosen_sat] = True
+                        sat_lookup = _ras_lookup_sat_axis_device(
+                            chosen_sat, sat_output_index, ras_sat_axis_is_compact,
+                        )
+                        ras_alpha_by_sat[t, chosen_sat] = float(ras_alpha_rad[t, sat_lookup])
+                        ras_beta_by_sat[t, chosen_sat] = float(ras_beta_rad[t, sat_lookup])
+                        cuda.atomic.add(ras_retargeted_count_out, t, 1)
+                    else:
+                        cuda.atomic.add(sat_slot_used, (t, chosen_sat), -1)
+                        cuda.atomic.add(dropped_count_out, t, 1)
+                else:
+                    cuda.atomic.add(dropped_count_out, t, 1)
+
+        # ── Barrier: wait for Phase 1 to complete ──
+        cuda.syncthreads()
+
+        # ── Phase 2: Direct keep-test (all threads, strided over cells) ──
+        c = tid
+        while c < cell_count:
+            if c != ras_cell_index:
+                for k in range(n_links):
+                    sat = int(assignments[t, c, k])
+                    if sat < 0:
+                        continue
+                    alpha = float(selected_alpha_rad[t, c, k])
+                    beta = float(selected_beta_rad[t, c, k])
+                    keep = bool(selected_cone_ok[t, c, k])
+                    if keep:
+                        keep = _direct_candidate_feasible_device(
+                            t, sat, alpha, beta,
+                            sat_slot_used, n_beam,
+                            sat_beta_max_rad, use_cone_check, beta_tol_rad,
+                            use_ras_guard, ras_guard_cos,
+                            ras_present_by_sat, ras_alpha_by_sat, ras_beta_by_sat,
+                        )
+                    if keep:
+                        beam_slot = cuda.atomic.add(sat_slot_used, (t, sat), 1)
+                        if beam_slot < n_beam:
+                            sat_out = int(sat_output_index[sat])
+                            if sat_out >= 0:
+                                beam_idx_out[t, sat_out, beam_slot] = c * n_links + k
+                                beam_alpha_out[t, sat_out, beam_slot] = alpha
+                                beam_beta_out[t, sat_out, beam_slot] = beta
+                            cell_slot_sat[t, c, k] = sat
+                            cuda.atomic.add(direct_kept_count_out, t, 1)
+                        else:
+                            cuda.atomic.add(sat_slot_used, (t, sat), -1)
+                            needs_repair[t, c, k] = True
+                    else:
+                        needs_repair[t, c, k] = True
+            c += block_size
+
+        # ── Barrier: wait for Phase 2 to complete ──
+        cuda.syncthreads()
+
+        # ── Phase 3: Repair failed direct links (all threads, strided) ──
+        c = tid
+        while c < cell_count:
+            if c != ras_cell_index:
+                row_start = int(row_ptr[row_base + c])
+                row_stop = int(row_ptr[row_base + c + 1])
+                for k in range(n_links):
+                    if not needs_repair[t, c, k]:
+                        continue
+                    chosen_sat = -1
+                    chosen_alpha = 0.0
+                    chosen_beta = 0.0
+                    for idx in range(row_start, row_stop):
+                        cand_sat = int(candidate_sat[idx])
+                        cand_alpha = float(candidate_alpha_rad[idx])
+                        cand_beta = float(candidate_beta_rad[idx])
+                        if _row_has_sat_device(cell_slot_sat, t, c, n_links, cand_sat):
+                            continue
+                        if not _direct_candidate_feasible_device(
+                            t, cand_sat, cand_alpha, cand_beta,
+                            sat_slot_used, n_beam,
+                            sat_beta_max_rad, use_cone_check, beta_tol_rad,
+                            use_ras_guard, ras_guard_cos,
+                            ras_present_by_sat, ras_alpha_by_sat, ras_beta_by_sat,
+                        ):
+                            continue
+                        chosen_sat = cand_sat
+                        chosen_alpha = cand_alpha
+                        chosen_beta = cand_beta
+                        break
+                    if chosen_sat >= 0:
+                        beam_slot = cuda.atomic.add(sat_slot_used, (t, chosen_sat), 1)
+                        if beam_slot < n_beam:
+                            sat_out = int(sat_output_index[chosen_sat])
+                            if sat_out >= 0:
+                                beam_idx_out[t, sat_out, beam_slot] = c * n_links + k
+                                beam_alpha_out[t, sat_out, beam_slot] = chosen_alpha
+                                beam_beta_out[t, sat_out, beam_slot] = chosen_beta
+                            cell_slot_sat[t, c, k] = chosen_sat
+                            cuda.atomic.add(repaired_count_out, t, 1)
+                        else:
+                            cuda.atomic.add(sat_slot_used, (t, chosen_sat), -1)
+                            cuda.atomic.add(dropped_count_out, t, 1)
+                    else:
+                        cuda.atomic.add(dropped_count_out, t, 1)
+            c += block_size
 
     @cuda.jit
     def _finalize_direct_epfd_beam_tables_kernel(

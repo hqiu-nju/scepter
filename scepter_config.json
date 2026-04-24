@@ -1,0 +1,314 @@
+{
+  "output_system_groups": [
+    {
+      "enabled": true,
+      "name": "System 1",
+      "system_indices": [
+        0
+      ]
+    }
+  ],
+  "ras_antenna": {
+    "antenna_diameter_m": 15.0,
+    "custom_pattern": null,
+    "frequency_mhz": 2690.0,
+    "grx_max_dbi": 52.52,
+    "operational_elevation_max_deg": 90.0,
+    "operational_elevation_min_deg": 15.0,
+    "target_pfd_dbw_m2_mhz": null
+  },
+  "ras_station": {
+    "elevation_m": 1052.0,
+    "latitude_deg": -30.712777,
+    "longitude_deg": 21.443611,
+    "ras_reference_mode": "lower",
+    "ras_reference_point_count": 1,
+    "receiver_band_start_mhz": 2690.0,
+    "receiver_band_stop_mhz": 2700.0,
+    "receiver_custom_mask_points": null,
+    "receiver_response_mode": "rectangular"
+  },
+  "runtime": {
+    "atmosphere_elev_bin_deg": 0.1,
+    "atmosphere_elev_max_deg": 90.0,
+    "atmosphere_elev_min_deg": 0.1,
+    "atmosphere_max_path_length_km": 10000.0,
+    "base_end_utc_iso": "2025-01-01T03:00:00Z",
+    "base_start_utc_iso": "2025-01-01T00:00:00Z",
+    "beamforming_collapsed": false,
+    "collapsed_baseline_eirp_dbw_hz": -55.6,
+    "collapsed_eval_freq_mhz": 2695.0,
+    "collapsed_ref_freq_mhz": 2000.0,
+    "force_bulk_timesteps": null,
+    "gpu_compute_dtype": "float32",
+    "gpu_device_id": null,
+    "gpu_memory_budget_gb": 6.0,
+    "gpu_method": "dwarner",
+    "gpu_on_error": "raise",
+    "gpu_output_dtype": "float32",
+    "gpu_pattern_eval_mode": "lut",
+    "gpu_precision_profile": "float32",
+    "hdf5_compression": "lzf",
+    "hdf5_compression_opts": null,
+    "host_memory_budget_gb": 6.0,
+    "include_atmosphere": true,
+    "iteration_count": 1,
+    "iteration_rng_seed": 42,
+    "memory_budget_mode": "hybrid",
+    "memory_headroom_profile": "balanced",
+    "output_families": {
+      "beam_statistics": {
+        "mode": "both"
+      },
+      "epfd_distribution": {
+        "bin_step_db": 0.02,
+        "margin_bins": 16,
+        "max_db": null,
+        "min_db": null,
+        "mode": "both",
+        "range_mode": "dynamic"
+      },
+      "per_satellite_pfd_distribution": {
+        "bin_step_db": 0.02,
+        "margin_bins": 16,
+        "max_db": null,
+        "min_db": null,
+        "mode": "preaccumulated",
+        "range_mode": "dynamic"
+      },
+      "per_satellite_pfd_elevation_heatmap": {
+        "elevation_bin_step_deg": 0.2,
+        "max_db": null,
+        "min_db": null,
+        "mode": "preaccumulated",
+        "range_mode": "dynamic",
+        "sky_slab": 16,
+        "value_bin_step_db": 0.2,
+        "value_margin_bins": 16
+      },
+      "prx_elevation_heatmap": {
+        "bandwidth_mhz": 5.0,
+        "elevation_bin_step_deg": 0.2,
+        "max_db": null,
+        "min_db": null,
+        "mode": "preaccumulated",
+        "range_mode": "dynamic",
+        "sky_slab": 16,
+        "value_bin_step_db": 0.2,
+        "value_margin_bins": 16
+      },
+      "prx_total_distribution": {
+        "bandwidth_mhz": 5.0,
+        "bin_step_db": 0.02,
+        "margin_bins": 16,
+        "max_db": null,
+        "min_db": null,
+        "mode": "preaccumulated",
+        "range_mode": "dynamic"
+      },
+      "total_pfd_ras_distribution": {
+        "bin_step_db": 0.02,
+        "margin_bins": 16,
+        "max_db": null,
+        "min_db": null,
+        "mode": "preaccumulated",
+        "range_mode": "dynamic"
+      }
+    },
+    "profile_stages": false,
+    "progress_desc_mode": "coarse",
+    "radio_horizon_tec": 30.0,
+    "sat_frame": "xyz",
+    "scheduler_target_profile": "high_throughput",
+    "storage_filename": "output.h5",
+    "store_eligible_mask": false,
+    "surface_pfd_stats_enabled": false,
+    "target_alt_km": 0.0,
+    "terminal_gpu_cleanup": false,
+    "timestep_s": 1.0,
+    "use_radio_horizon": false,
+    "use_ras_station_alt_for_co": true,
+    "writer_checkpoint_interval_s": 60.0
+  },
+  "schema_version": 15,
+  "systems": [
+    {
+      "boresight": {
+        "boresight_avoidance_enabled": false,
+        "boresight_theta1_deg": null,
+        "boresight_theta2_cell_ids": null,
+        "boresight_theta2_deg": null,
+        "boresight_theta2_layers": 0,
+        "boresight_theta2_radius_km": null,
+        "boresight_theta2_scope_mode": "adjacency_layers"
+      },
+      "constellation": {
+        "belts": [
+          {
+            "adjacent_plane_offset": true,
+            "altitude_km": 525.0,
+            "argp_deg": 0.0,
+            "belt_name": "System3_Belt_1",
+            "eccentricity": 0.0,
+            "inclination_deg": 53.0,
+            "min_elevation_deg": 20.0,
+            "num_sats_per_plane": 120,
+            "plane_count": 28,
+            "raan_max_deg": 360.0,
+            "raan_min_deg": 0.0
+          }
+        ]
+      },
+      "derived_state": {
+        "_grid_actual_label_text": "Actual achieved spacing: 87.501 km (77442 global cells)",
+        "_hexgrid_applied_signature": [
+          [
+            "{\"adjacent_plane_offset\": true, \"altitude_km\": 525.0, \"argp_deg\": 0.0, \"belt_name\": \"System3_Belt_1\", \"eccentricity\": 0.0, \"inclination_deg\": 53.0, \"min_elevation_deg\": 20.0, \"num_sats_per_plane\": 120, \"plane_count\": 28, \"raan_max_deg\": 360.0, \"raan_min_deg\": 0.0}"
+          ],
+          21.443611,
+          -30.712777,
+          1052.0,
+          90.201571,
+          "none",
+          null,
+          "cartopy",
+          "ras_station",
+          "none",
+          0,
+          null,
+          false,
+          null,
+          null,
+          "adjacency_layers",
+          "",
+          0,
+          null
+        ],
+        "_hexgrid_completed_commit_signature": null,
+        "_hexgrid_completed_overlay_signature": null,
+        "_hexgrid_completed_signature": null,
+        "_last_analyser_selected_cell_km": 90.2015714824337,
+        "_last_analyser_signature": [
+          [
+            "{\"adjacent_plane_offset\": true, \"altitude_km\": 525.0, \"argp_deg\": 0.0, \"belt_name\": \"System3_Belt_1\", \"eccentricity\": 0.0, \"inclination_deg\": 53.0, \"min_elevation_deg\": 20.0, \"num_sats_per_plane\": 120, \"plane_count\": 28, \"raan_max_deg\": 360.0, \"raan_min_deg\": 0.0}"
+          ],
+          2690.0,
+          false,
+          15.0,
+          "s1528_rec1_4",
+          "{\"diameter_m\": null, \"efficiency_pct\": null, \"gm_dbi\": 38.0, \"ln_db\": -20.0, \"z\": 1.0}",
+          "{\"far_sidelobe_level_dbi\": -20.0, \"far_sidelobe_start_deg\": 90.0, \"gm_dbi\": 34.1, \"l\": 2, \"lr_m\": 1.6, \"lt_m\": 1.6, \"slr_db\": 20.0}",
+          "db3",
+          "db7",
+          "spacing_contour",
+          "full_footprint_diameter"
+        ]
+      },
+      "grid_analysis": {
+        "cell_size_override_enabled": false,
+        "cell_size_override_km": null,
+        "cell_spacing_rule": "full_footprint_diameter",
+        "indicative_footprint_drop": "db3",
+        "leading_metric": "spacing_contour",
+        "spacing_drop": "db7"
+      },
+      "hexgrid": {
+        "boresight_avoidance_enabled": false,
+        "boresight_theta1_deg": null,
+        "boresight_theta2_cell_ids": null,
+        "boresight_theta2_deg": null,
+        "boresight_theta2_layers": 0,
+        "boresight_theta2_radius_km": null,
+        "boresight_theta2_scope_mode": "adjacency_layers",
+        "coastline_backend": "cartopy",
+        "geography_mask_mode": "none",
+        "ras_exclusion_layers": 0,
+        "ras_exclusion_mode": "none",
+        "ras_exclusion_radius_km": null,
+        "ras_pointing_mode": "ras_station",
+        "shoreline_buffer_km": null
+      },
+      "sat_sys_mode_visited": true,
+      "satellite_antennas": {
+        "antenna_model": "s1528_rec1_4",
+        "custom_pattern": null,
+        "derive_pattern_wavelength_from_frequency": false,
+        "frequency_mhz": 2690.0,
+        "isotropic": {
+          "uemr_mode": false
+        },
+        "m2101": {
+          "a_m_db": null,
+          "d_h": null,
+          "d_v": null,
+          "g_emax_dbi": null,
+          "n_h": null,
+          "n_v": null,
+          "phi_3db_deg": null,
+          "sla_nu_db": null,
+          "theta_3db_deg": null
+        },
+        "pattern_wavelength_cm": 15.0,
+        "rec12": {
+          "diameter_m": null,
+          "efficiency_pct": null,
+          "gm_dbi": 38.0,
+          "ln_db": -20.0,
+          "z": 1.0
+        },
+        "rec14": {
+          "far_sidelobe_level_dbi": -20.0,
+          "far_sidelobe_start_deg": 90.0,
+          "gm_dbi": 34.1,
+          "l": 2,
+          "lr_m": 1.6,
+          "lt_m": 1.6,
+          "slr_db": 20.0
+        }
+      },
+      "service": {
+        "bandwidth_mhz": 5.0,
+        "cell_activity_factor": 1.0,
+        "cell_activity_mode": "whole_cell",
+        "cell_activity_seed_base": 42001,
+        "max_surface_pfd_dbw_m2_channel": null,
+        "max_surface_pfd_dbw_m2_mhz": null,
+        "max_surface_pfd_enabled": false,
+        "nbeam": 60,
+        "nco": 1,
+        "power_input_basis": "per_mhz",
+        "power_input_quantity": "target_pfd",
+        "power_range_max_db": null,
+        "power_range_min_db": null,
+        "power_variation_mode": "fixed",
+        "ras_guard_angle_override_deg": null,
+        "satellite_eirp_dbw_channel": null,
+        "satellite_eirp_dbw_mhz": null,
+        "satellite_ptx_dbw_channel": null,
+        "satellite_ptx_dbw_mhz": null,
+        "selection_strategy": "max_elevation",
+        "surface_pfd_cap_mode": "per_beam",
+        "target_pfd_dbw_m2_channel": null,
+        "target_pfd_dbw_m2_mhz": -83.5,
+        "uemr_random_power": false
+      },
+      "spectrum": {
+        "custom_mask_points": null,
+        "disabled_channel_indices": null,
+        "multi_group_power_policy": "repeat_per_group",
+        "ras_anchor_reuse_slot": 0,
+        "reuse_factor": 1,
+        "service_band_start_mhz": 2620.0,
+        "service_band_stop_mhz": 2690.0,
+        "spectral_integration_cutoff_basis": "channel_bandwidth",
+        "spectral_integration_cutoff_percent": 250.0,
+        "split_total_group_denominator_mode": "configured_groups",
+        "tx_reference_mode": "middle",
+        "tx_reference_point_count": 1,
+        "unwanted_emission_mask_preset": "sm1541_fss"
+      },
+      "system_color": "#22c55e",
+      "system_name": "System 1"
+    }
+  ]
+}

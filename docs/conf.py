@@ -2,7 +2,7 @@ from __future__ import annotations
 
 project = "SCEPTer"
 author = "SCEPTer contributors"
-release = "0.25.2"
+release = "0.25.3"
 
 extensions: list[str] = []
 
