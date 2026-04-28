@@ -309,6 +309,7 @@ Key outputs:
 | `pointing_uvw_m` | `(N_ant, T, 3)` | m | UVW coordinates for the fixed RA/Dec phase centre |
 | `pointing_hour_angles_rad` | `(T,)` | rad | Hour angle of the fixed phase centre |
 | `satellite_uvw_m` | `(N_ant, T, N_sat, 3)` | m | UVW coordinates for each satellite track |
+| `satellite_distance_m` | `(N_ant, T, N_sat)` | m | Distance from each antenna to each propagated satellite |
 | `satellite_hour_angles_rad` | `(T, N_sat)` | rad | Hour angle of each satellite track |
 | `satellite_ra_deg` | `(T, N_sat)` | deg | ICRS right ascension of each propagated satellite |
 | `satellite_dec_deg` | `(T, N_sat)` | deg | ICRS declination of each propagated satellite |
@@ -316,6 +317,72 @@ Key outputs:
 
 Here `T = mjds.size`, because the helper flattens the MJD grid to a single time
 axis before calling `compute_uvw()`.
+
+### Simulate satellite complex visibilities
+
+Use `scepter.uvw.simulate_satellite_visibilities()` after building pointing UVW
+tracks and satellite antenna ranges. The helper computes the near-field
+satellite delay from actual antenna-to-satellite distances, subtracts the
+far-field geometric delay applied for the current telescope pointing, applies
+the default `exp(-2*pi*i*nu*tau)` sign convention, and returns complex
+visibilities plus wrapped phase and normalised amplitude arrays.
+
+```python
+vis, phase_rad, amp_norm = uvw.simulate_satellite_visibilities(
+    result.pointing_uvw_m,
+    result.satellite_distance_m * u.m,
+    frequency=1420 * u.MHz,
+    bandwidth=10 * u.kHz,
+    channel_samples=16,
+)
+
+print(vis.shape)        # (N_ant, T, N_sat)
+print(phase_rad.shape)  # (N_ant, T, N_sat)
+print(amp_norm.shape)   # (N_ant, T, N_sat)
+```
+
+The residual delay is:
+
+```text
+tau = (range_ref - range_ant) / c - tau_pointing
+```
+
+where `tau_pointing` comes from `pointing_uvw_m[..., 2] / c`. The model is
+intentionally visibility-domain only: it includes range-based near-field
+geometric phase and optional finite-channel averaging, but not satellite EIRP,
+receive gain, propagation loss, or receiver noise. If you already have relative
+satellite amplitudes from a power/gain calculation, pass them with
+`source_amplitude=...`.
+
+To save the products in a compact archive:
+
+```python
+uvw.save_visibility_npz(
+    "satellite_visibilities.npz",
+    vis,
+    result.satellite_uvw_m,
+    frequency=1420 * u.MHz,
+    pointing_uvw_m=result.pointing_uvw_m,
+    satellite_uvw_m=result.satellite_uvw_m,
+    satellite_distance_m=result.satellite_distance_m,
+    phase_rad=phase_rad,
+    normalised_amplitude=amp_norm,
+    antenna_names=result.antenna_names,
+    satellite_names=result.satellite_names,
+    mjds=result.mjds,
+    metadata={"phase_convention": "exp(-2pi i nu tau)"},
+)
+
+archive = uvw.load_visibility_npz("satellite_visibilities.npz")
+print(archive.visibilities.shape)
+print(archive.uvw_m.shape)
+```
+
+Required NPZ keys are `vis` for complex visibilities and `uvw` for UVW
+coordinates in metres. Optional keys include `freq_hz`, `pointing_uvw_m`,
+`satellite_uvw_m`, `satellite_distance_m`, `phase_rad`,
+`normalised_amplitude`, `antenna_names`, `satellite_names`, `mjds`, and
+`metadata_json`.
 
 ### Lower-level path: `compute_uvw()` directly
 

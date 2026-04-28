@@ -1,0 +1,5 @@
+I want to clean up the visibility simulation scripts in the script folder. 
+
+1.Identify functions that can be made part of the regular package. 
+
+2. create two new visibility generation scripts that use a telescope pointing

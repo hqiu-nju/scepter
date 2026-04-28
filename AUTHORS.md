@@ -13,7 +13,7 @@ authoritative record for project-wide attribution.
     kernel fusion, scheduler, postprocessing studio
 - **Hao (Harry) Qiu** — GitHub: [hqiu-nju](https://github.com/hqiu-nju)
   - Core observation simulation framework (`obs`, `skynet`), original
-    propagation pipeline, TLE utilities
+    propagation pipeline, TLE utilities, radio interferometry utilities
 
 ## Special module attribution
 

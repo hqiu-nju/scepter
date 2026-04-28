@@ -5,7 +5,7 @@ Use this file with `AGENTS.md`. If there is a conflict, follow `AGENTS.md`.
 ## Project context
 
 SCEPTer models satellite constellation emissions and resulting EPFD impact for
-radio telescopes. Most work happens in Python modules under `scepter/` and in
+radio telescopes. Most work happens in Python modules under `scepter/`, CLI scripts `scripts/` and in
 analysis notebooks.
 
 Core stack:

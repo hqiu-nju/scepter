@@ -123,7 +123,7 @@ def test_uvw_baseline_helpers_return_reference_relative_vectors() -> None:
     assert_allclose(distance, distances[1])
 
 
-def test_uvw_delay_and_fringe_helpers_preserve_shapes() -> None:
+def test_uvw_geometric_delay_and_fringe_response_preserve_shapes() -> None:
     baselines_itrf = np.array(
         [
             [0.0, 0.0, 0.0],
@@ -145,14 +145,107 @@ def test_uvw_delay_and_fringe_helpers_preserve_shapes() -> None:
         np.array([550.0, 551.0]) * u.km,
         delay[1],
     )
-    fringes = uvw.bw_fringe(corrected, 10 * u.kHz, 1420 * u.MHz, chan_bin=8)
+    freqs = np.linspace(1420.0 - 0.005, 1420.0 + 0.005, 8) * u.MHz
+    fringes = uvw.fringe_response(corrected[:, np.newaxis], freqs[np.newaxis, :])
+    averaged = np.mean(fringes, axis=1)
 
     assert delay.shape == (2, 2)
     assert_allclose(delay[0].to_value(u.s), 0.0, atol=1e-15)
     assert_allclose(delay[:, 0].to_value(u.s), expected_delay)
     assert corrected.shape == (2,)
-    assert fringes.shape == (2,)
-    assert np.all(np.isfinite(fringes))
+    assert averaged.shape == (2,)
+    assert np.all(np.isfinite(averaged))
+
+
+def test_satellite_visibility_phase_and_normalised_amplitude() -> None:
+    pointing_uvw = np.zeros((2, 2, 3), dtype=np.float64)
+    pointing_uvw[1, :, 2] = 0.10
+    satellite_uvw = np.zeros((2, 2, 1, 3), dtype=np.float64)
+    satellite_distances = np.full((2, 2, 1), 550_000.0, dtype=np.float64)
+    satellite_distances[1, :, 0] = 549_999.75
+
+    vis, phase, amplitude = uvw.simulate_satellite_visibilities(
+        pointing_uvw,
+        satellite_distances * u.m,
+        frequency=300.0 * u.MHz,
+    )
+    delays = uvw.satellite_geometric_delay(
+        satellite_distances * u.m,
+        uvw.pointing_geometric_delay(pointing_uvw) * u.s,
+    )
+
+    assert vis.shape == (2, 2, 1)
+    assert phase.shape == (2, 2, 1)
+    assert amplitude.shape == (2, 2, 1)
+    assert_allclose(phase[0], 0.0, atol=1e-12)
+    assert_allclose(delays[1, :, 0], 0.15 / 3e8, atol=1e-18)
+    assert_allclose(phase[1, :, 0], -0.3 * np.pi, atol=1e-12)
+    assert_allclose(vis[1, :, 0], np.exp(-0.3j * np.pi), atol=1e-12)
+    assert_allclose(amplitude, 1.0, atol=1e-12)
+
+    vis_bw, phase_bw, amplitude_bw = uvw.simulate_satellite_visibilities(
+        pointing_uvw,
+        satellite_distances,
+        frequency=300.0 * u.MHz,
+        bandwidth=10.0 * u.kHz,
+        channel_samples=1,
+    )
+    assert_allclose(vis_bw, vis)
+    assert_allclose(phase_bw, phase)
+    assert_allclose(amplitude_bw, amplitude)
+
+    weighted_vis, _, weighted_amplitude = uvw.simulate_satellite_visibilities(
+        pointing_uvw,
+        satellite_distances,
+        frequency=300.0 * u.MHz,
+        source_amplitude=np.array([[1.0], [0.5]], dtype=np.float64),
+        visibility_mask=np.array([[True], [False]], dtype=bool),
+    )
+    assert_allclose(weighted_vis[:, 1, 0], 0.0 + 0.0j, atol=1e-12)
+    assert_allclose(weighted_amplitude[:, 0, 0], 1.0, atol=1e-12)
+    assert_allclose(weighted_amplitude[:, 1, 0], 0.0, atol=1e-12)
+
+
+def test_visibility_npz_roundtrip(tmp_path) -> None:
+    pointing_uvw = np.zeros((2, 2, 3), dtype=np.float64)
+    satellite_uvw = np.zeros((2, 2, 1, 3), dtype=np.float64)
+    satellite_distances = np.full((2, 2, 1), 550_000.0, dtype=np.float64)
+    satellite_distances[1, :, 0] = 549_999.75
+    vis, phase, amplitude = uvw.simulate_satellite_visibilities(
+        pointing_uvw,
+        satellite_distances,
+        frequency=300.0 * u.MHz,
+    )
+
+    archive_path = uvw.save_visibility_npz(
+        tmp_path / "visibilities.npz",
+        vis,
+        satellite_uvw,
+        frequency=300.0 * u.MHz,
+        pointing_uvw_m=pointing_uvw,
+        satellite_uvw_m=satellite_uvw,
+        satellite_distance_m=satellite_distances,
+        phase_rad=phase,
+        normalised_amplitude=amplitude,
+        antenna_names=("ref", "east"),
+        satellite_names=("sat0",),
+        mjds=np.array([60676.0, 60676.00001], dtype=np.float64),
+        metadata={"phase_convention": "exp(-2pi i nu tau)"},
+    )
+    loaded = uvw.load_visibility_npz(archive_path)
+
+    assert loaded.path == archive_path
+    assert loaded.antenna_names == ("ref", "east")
+    assert loaded.satellite_names == ("sat0",)
+    assert loaded.metadata["phase_convention"] == "exp(-2pi i nu tau)"
+    assert_allclose(loaded.frequency_hz, 300.0e6)
+    assert_allclose(loaded.visibilities, vis)
+    assert_allclose(loaded.uvw_m, satellite_uvw)
+    assert_allclose(loaded.pointing_uvw_m, pointing_uvw)
+    assert_allclose(loaded.satellite_uvw_m, satellite_uvw)
+    assert_allclose(loaded.satellite_distance_m, satellite_distances)
+    assert_allclose(loaded.phase_rad, phase)
+    assert_allclose(loaded.normalised_amplitude, amplitude)
 
 
 def test_obs_sim_nearfield_delays_use_uvw_geometric_delay() -> None:
@@ -178,10 +271,13 @@ def test_obs_sim_nearfield_delays_use_uvw_geometric_delay() -> None:
     sim.create_baselines()
 
     delays = sim.baselines_nearfield_delays(mode="tracking")
+    fringes = sim.sat_fringe(bwchan=10 * u.kHz, fch1=1420 * u.MHz, chan_bin=8)
 
     assert delays.shape == sim.topo_pos_dist.shape
     assert sim.pnt_tau.shape == sim.topo_pos_dist.shape
+    assert fringes.shape == sim.topo_pos_dist.shape
     assert_allclose(delays[0].to_value(u.s), 0.0, atol=1e-15)
+    assert np.all(np.isfinite(fringes))
 
 
 def test_build_tracking_uvw_from_array_and_tle_files(tmp_path) -> None:
@@ -212,6 +308,7 @@ def test_build_tracking_uvw_from_array_and_tle_files(tmp_path) -> None:
     assert result.pointing_uvw_m.shape == (2, 2, 3)
     assert result.pointing_hour_angles_rad.shape == (2,)
     assert result.satellite_uvw_m.shape == (2, 2, 2, 3)
+    assert result.satellite_distance_m.shape == (2, 2, 2)
     assert result.satellite_hour_angles_rad.shape == (2, 2)
     assert result.satellite_ra_deg.shape == (2, 2)
     assert result.satellite_dec_deg.shape == (2, 2)

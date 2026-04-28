@@ -8,7 +8,7 @@ python example_obs_uvw_plane.py -a example_telescope_array.csv -t oneweb-limited
 python example_obs_uvw_plane.py -a advanced_example_array.csv -t oneweb-limited.txt --ra 20 --dec -20  --trange-seconds 3600
 
 
-
+python point_source_visibility_simulator.py   --array-file advanced_example_array.csv   --source-file mock_point_sources.csv   --start-time 2025-05-01T00:00:00   --n-times 600   --cadence-sec 1   --freq-mhz 1420.0   --output point_source_vis.npz
 ### check uvplane and filter fov
 python plot_uv_plane.py -i tracking_uvw.npz -a -n 651 --fov-radius-deg 10 --output-filtered-npz filtered_uvw.npz
 

@@ -153,9 +153,10 @@ Version: 0.1
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from pathlib import Path
 import re
-from typing import Sequence
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 
@@ -581,49 +582,646 @@ def fringe_response(delay, frequency):
     return np.cos(2 * np.pi * frequency * delay)
 
 
-def bw_fringe(delays, bwchan, fch1, chan_bin: int = 100) -> np.ndarray:
+def _quantity_to_value(value: Any, unit: Any, assumed_unit: str) -> np.ndarray:
+    if hasattr(value, "to_value"):
+        if not ASTROPY_AVAILABLE:
+            raise ImportError(
+                f"Astropy is required to convert quantity inputs to {assumed_unit}."
+            )
+        return np.asarray(value.to_value(unit), dtype=np.float64)
+    if hasattr(value, "to"):
+        if not ASTROPY_AVAILABLE:
+            raise ImportError(
+                f"Astropy is required to convert quantity inputs to {assumed_unit}."
+            )
+        return np.asarray(value.to(unit).value, dtype=np.float64)
+    return np.asarray(value, dtype=np.float64)
+
+
+def _as_hz(value: Any) -> np.ndarray:
+    return _quantity_to_value(value, u.Hz if ASTROPY_AVAILABLE else None, "Hz")
+
+
+def _as_m(value: Any) -> np.ndarray:
+    return _quantity_to_value(value, u.m if ASTROPY_AVAILABLE else None, "m")
+
+
+def _as_s(value: Any) -> np.ndarray:
+    return _quantity_to_value(value, u.s if ASTROPY_AVAILABLE else None, "s")
+
+
+def _broadcast_to_with_trailing_axes(
+    value: np.ndarray,
+    target_shape: tuple[int, ...],
+    label: str,
+    *,
+    dtype: Any = np.float64,
+) -> np.ndarray:
+    arr = np.asarray(value, dtype=dtype)
+    try:
+        return np.broadcast_to(arr, target_shape)
+    except ValueError:
+        while arr.ndim < len(target_shape):
+            arr = np.expand_dims(arr, axis=-1)
+        try:
+            return np.broadcast_to(arr, target_shape)
+        except ValueError as second_error:
+            raise ValueError(
+                f"{label} cannot be broadcast to target shape {target_shape}."
+            ) from second_error
+
+
+def pointing_geometric_delay(pointing_uvw_m: np.ndarray) -> np.ndarray:
     """
-    Calculate bandwidth-averaged fringe response.
+    Convert tracked-pointing UVW coordinates to applied geometric delays.
 
     Parameters
     ----------
-    delays : astropy.Quantity
-        Geometric delays. The input is flattened by callers that need to
-        restore a simulation shape.
-    bwchan : astropy.Quantity
-        Channel bandwidth.
-    fch1 : astropy.Quantity
-        Channel centre frequency.
-    chan_bin : int, optional
-        Number of frequency samples used for the average. Default is 100.
+    pointing_uvw_m : numpy.ndarray, shape (..., 3)
+        UVW coordinates for the tracked phase centre in metres. The last axis
+        must be ``[u, v, w]``.
 
     Returns
     -------
-    response : numpy.ndarray
-        Dimensionless fringe response with shape ``delays.shape``.
+    delay_s : numpy.ndarray
+        Far-field geometric delay in seconds, computed as ``w / c``.
 
     Raises
     ------
-    AttributeError
-        If frequency or delay inputs are not Astropy quantities with ``to``
-        methods.
+    ValueError
+        If *pointing_uvw_m* does not end with a 3-component UVW axis.
 
     Notes
     -----
-    Frequencies are sampled linearly across the channel and averaged using the
-    same numerical convention as the historical ``obs.bw_fringe`` helper.
+    The sign convention matches :func:`geometric_delay_az_el`, so the result
+    can be subtracted from satellite range delays using
+    :func:`satellite_geometric_delay`.
     """
-    delay_shape = np.shape(delays)
-    delays_flat = np.ravel(delays)
-    fch1_khz = fch1.to(u.kHz).value
-    bwchan_khz = bwchan.to(u.kHz).value
-    freq_array = np.linspace(
-        fch1_khz - bwchan_khz * 0.5,
-        fch1_khz + bwchan_khz * 0.5,
-        int(chan_bin),
-    ) * u.kHz
-    fringes = fringe_response(delays_flat[:, np.newaxis], freq_array[np.newaxis, :])
-    return np.mean(fringes, axis=1).reshape(delay_shape)
+    pointing_uvw = _as_m(pointing_uvw_m)
+    if pointing_uvw.shape[-1:] != (3,):
+        raise ValueError("pointing_uvw_m must end with a 3-component UVW axis.")
+    return pointing_uvw[..., 2] / 3e8
+
+
+def satellite_geometric_delay(
+    satellite_distances,
+    pointing_delay_s,
+    *,
+    ref_index: int = 0,
+) -> np.ndarray:
+    """
+    Compute residual satellite delays after subtracting tracking delays.
+
+    Parameters
+    ----------
+    satellite_distances : astropy.units.Quantity or numpy.ndarray
+        Distance from each antenna to each satellite. Quantities are converted
+        to metres. Plain numeric values are interpreted as metres. Axis 0 must
+        be the antenna/baseline axis, for example ``(N_ant, T, N_sat)``.
+    pointing_delay_s : astropy.units.Quantity or numpy.ndarray
+        Far-field geometric delays applied for the telescope pointing, normally
+        from :func:`pointing_geometric_delay`. Shape must broadcast to
+        ``satellite_distances.shape``; missing trailing satellite/source axes
+        are inserted automatically.
+    ref_index : int, optional
+        Reference antenna index. Default is 0.
+
+    Returns
+    -------
+    delay_s : numpy.ndarray
+        Residual delay in seconds with the same shape as
+        ``satellite_distances``:
+
+        ``(range_ref - range_ant) / c - pointing_delay``
+
+    Raises
+    ------
+    IndexError
+        If *ref_index* is outside the antenna axis.
+    ValueError
+        If *satellite_distances* has no antenna axis or if *pointing_delay_s*
+        cannot be broadcast to the satellite-distance shape.
+
+    Notes
+    -----
+    This is the same near-field convention used by
+    :func:`baseline_nearfield_delay` and ``obs.obs_sim.baselines_nearfield_delays``.
+    It uses actual antenna-to-satellite ranges, so it captures finite-distance
+    curvature that is not present in a far-field satellite UVW projection.
+    """
+    distances_m = _as_m(satellite_distances)
+    if distances_m.ndim == 0:
+        raise ValueError("satellite_distances must include an antenna axis.")
+    index = int(ref_index)
+    if index < 0:
+        index += distances_m.shape[0]
+    if index < 0 or index >= distances_m.shape[0]:
+        raise IndexError(
+            f"ref_index {ref_index} is out of range for {distances_m.shape[0]} antennas."
+        )
+
+    ref_distances_m = np.take(distances_m, index, axis=0)[np.newaxis, ...]
+    range_delay_s = (ref_distances_m - distances_m) / 3e8
+    pointing_delay = _broadcast_to_with_trailing_axes(
+        _as_s(pointing_delay_s),
+        range_delay_s.shape,
+        "pointing_delay_s",
+    )
+    return range_delay_s - pointing_delay
+
+
+def satellite_visibility_phase(
+    pointing_uvw_m: np.ndarray,
+    satellite_distances,
+    frequency,
+    *,
+    ref_index: int = 0,
+    phase_sign: float = -1.0,
+    wrap: bool = True,
+) -> np.ndarray:
+    """
+    Compute near-field satellite visibility phase relative to a pointing.
+
+    The phase is derived from actual antenna-to-satellite ranges, then the
+    far-field geometric delays applied for the current telescope pointing are
+    subtracted:
+
+    ``delay = (range_ref - range_ant) / c - pointing_delay``
+
+    Parameters
+    ----------
+    pointing_uvw_m : numpy.ndarray, shape (..., 3)
+        UVW coordinates for the tracked phase centre in metres. The ``w``
+        component is converted to the pointing delay applied by the telescope.
+    satellite_distances : astropy.units.Quantity or numpy.ndarray
+        Distance from each antenna to each satellite. Quantities are converted
+        to metres; plain numeric values are interpreted as metres. A common
+        layout is ``(N_ant, T, N_sat)``.
+    frequency : astropy.units.Quantity or float or array-like
+        Observing frequency. Quantities are converted to hertz. Plain numeric
+        values are interpreted as hertz. A scalar returns a phase array with
+        shape ``satellite_distances.shape``; an array-valued frequency always
+        appends trailing frequency axis/axes.
+    ref_index : int, optional
+        Reference antenna index for the range-difference calculation.
+    phase_sign : float, optional
+        Sign convention applied to the phase. The default, ``-1``, follows the
+        common radio-interferometry convention ``exp(-2*pi*i*nu*tau)``.
+    wrap : bool, optional
+        If ``True`` (default), wrap phases to ``[-pi, pi]``.
+
+    Returns
+    -------
+    phase_rad : numpy.ndarray
+        Visibility phase in radians.
+
+    Raises
+    ------
+    ValueError
+        If ``pointing_uvw_m`` does not have a final component axis of length 3
+        or if the pointing delays cannot be broadcast against
+        ``satellite_distances``.
+
+    Notes
+    -----
+    This helper assumes the pointing UVW coordinates and satellite distances
+    use the same antenna axis and time grid. Use
+    ``TrackingUvwResult.satellite_distance_m`` or ``obs_sim.topo_pos_dist *
+    u.km`` for range inputs from SCEPTer propagation.
+    """
+    delay_s = satellite_geometric_delay(
+        satellite_distances,
+        pointing_geometric_delay(pointing_uvw_m),
+        ref_index=ref_index,
+    )
+    frequency_hz = _as_hz(frequency)
+    if np.ndim(frequency_hz) == 0:
+        phase = phase_sign * 2.0 * np.pi * frequency_hz * delay_s
+    else:
+        expand = (np.newaxis,) * np.ndim(frequency_hz)
+        phase = phase_sign * 2.0 * np.pi * delay_s[(...,) + expand] * frequency_hz
+
+    if wrap:
+        phase = np.angle(np.exp(1j * phase))
+    return np.asarray(phase, dtype=np.float64)
+
+
+def normalised_visibility_amplitude(
+    visibilities: np.ndarray,
+    *,
+    reference: float | None = None,
+) -> np.ndarray:
+    """
+    Convert complex visibilities to a dimensionless amplitude in ``[0, 1]``.
+
+    Parameters
+    ----------
+    visibilities : numpy.ndarray
+        Complex visibility samples. Any shape is accepted.
+    reference : float, optional
+        Amplitude used for normalisation. If omitted, the largest finite
+        absolute value in *visibilities* is used. Empty inputs, all-zero inputs,
+        and all-non-finite inputs return zeros.
+
+    Returns
+    -------
+    amplitude : numpy.ndarray
+        ``abs(visibilities) / reference`` clipped to ``[0, 1]``.
+
+    Raises
+    ------
+    ValueError
+        If *reference* is supplied and is negative.
+
+    Notes
+    -----
+    The British spelling is used to match SCEPTer documentation. The function
+    intentionally does not modify phases or replace non-finite complex samples;
+    non-finite amplitudes are returned as zero after normalisation.
+    """
+    amp = np.abs(np.asarray(visibilities))
+    finite_amp = np.where(np.isfinite(amp), amp, 0.0)
+    if reference is None:
+        ref = float(np.max(finite_amp)) if finite_amp.size else 0.0
+    else:
+        ref = float(reference)
+        if ref < 0.0:
+            raise ValueError("reference must be non-negative.")
+
+    if ref == 0.0:
+        return np.zeros_like(finite_amp, dtype=np.float64)
+    return np.clip(finite_amp / ref, 0.0, 1.0)
+
+
+def simulate_satellite_visibilities(
+    pointing_uvw_m: np.ndarray,
+    satellite_distances,
+    frequency,
+    *,
+    bandwidth=None,
+    channel_samples: int = 1,
+    source_amplitude: float | np.ndarray | None = None,
+    visibility_mask: np.ndarray | None = None,
+    ref_index: int = 0,
+    phase_sign: float = -1.0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Simulate complex satellite visibilities from range-delay geometry.
+
+    Parameters
+    ----------
+    pointing_uvw_m : numpy.ndarray, shape (..., 3)
+        UVW coordinates for the tracked phase centre in metres. The ``w``
+        component is converted to the pointing delay applied by the telescope.
+    satellite_distances : astropy.units.Quantity or numpy.ndarray
+        Distance from each antenna to each satellite. Quantities are converted
+        to metres; plain numeric values are interpreted as metres. The common
+        layout is ``(N_ant, T, N_sat)``.
+    frequency : astropy.units.Quantity or float
+        Channel centre frequency. Quantities are converted to hertz; plain
+        numeric values are interpreted as hertz.
+    bandwidth : astropy.units.Quantity or float, optional
+        Channel bandwidth. If omitted, visibilities are monochromatic. If
+        supplied, phases are sampled linearly across the channel and averaged.
+    channel_samples : int, optional
+        Number of frequency samples used when *bandwidth* is supplied. Default
+        is 1. Values below 1 raise ``ValueError``.
+    source_amplitude : float or numpy.ndarray, optional
+        Optional relative satellite amplitudes. Values are broadcast against
+        the unit complex visibility array. If omitted, unit-amplitude point
+        sources are assumed.
+    visibility_mask : numpy.ndarray, optional
+        Boolean mask broadcastable to the visibility shape. Masked samples are
+        set to zero complex visibility and zero normalised amplitude.
+    ref_index : int, optional
+        Reference antenna index for the range-difference calculation.
+    phase_sign : float, optional
+        Sign convention passed to :func:`satellite_visibility_phase`.
+
+    Returns
+    -------
+    visibilities : numpy.ndarray
+        Complex visibility samples. Shape follows ``satellite_distances.shape``
+        for scalar frequency, with a trailing frequency axis when an array of
+        frequencies is supplied and *bandwidth* is omitted.
+    phase_rad : numpy.ndarray
+        Wrapped visibility phase in radians, derived from
+        ``np.angle(visibilities)``.
+    normalised_amplitude : numpy.ndarray
+        Dimensionless amplitude normalised to the maximum finite visibility
+        amplitude in this simulation.
+
+    Raises
+    ------
+    ValueError
+        If *channel_samples* is less than 1, if *frequency* is non-scalar while
+        *bandwidth* is supplied, or if amplitudes/masks cannot be broadcast to
+        the visibility shape.
+
+    Notes
+    -----
+    This is a visibility-domain point-source model for satellites. It models
+    range-based near-field geometric phase and optional finite-channel
+    averaging; it does not include satellite EIRP, receive antenna gain,
+    propagation loss, or receiver noise. Use *source_amplitude* to inject
+    externally computed relative amplitudes such as gain- or power-weighted
+    samples.
+    """
+    samples = int(channel_samples)
+    if samples < 1:
+        raise ValueError("channel_samples must be at least 1.")
+
+    if bandwidth is None:
+        phase = satellite_visibility_phase(
+            pointing_uvw_m,
+            satellite_distances,
+            frequency,
+            ref_index=ref_index,
+            phase_sign=phase_sign,
+            wrap=False,
+        )
+        unit_vis = np.exp(1j * phase)
+    else:
+        centre_hz = _as_hz(frequency)
+        if np.ndim(centre_hz) != 0:
+            raise ValueError("frequency must be scalar when bandwidth is supplied.")
+        bandwidth_hz = _as_hz(bandwidth)
+        if np.ndim(bandwidth_hz) != 0:
+            raise ValueError("bandwidth must be scalar.")
+        if samples == 1:
+            freq_samples_hz = np.asarray([float(centre_hz)], dtype=np.float64)
+        else:
+            freq_samples_hz = np.linspace(
+                float(centre_hz) - float(bandwidth_hz) * 0.5,
+                float(centre_hz) + float(bandwidth_hz) * 0.5,
+                samples,
+            )
+        phase_samples = satellite_visibility_phase(
+            pointing_uvw_m,
+            satellite_distances,
+            freq_samples_hz,
+            ref_index=ref_index,
+            phase_sign=phase_sign,
+            wrap=False,
+        )
+        unit_vis = np.mean(np.exp(1j * phase_samples), axis=-1)
+
+    if source_amplitude is None:
+        vis = unit_vis
+    else:
+        amplitude = _broadcast_to_with_trailing_axes(
+            np.asarray(source_amplitude, dtype=np.float64),
+            unit_vis.shape,
+            "source_amplitude",
+        )
+        vis = unit_vis * amplitude
+
+    if visibility_mask is not None:
+        mask = _broadcast_to_with_trailing_axes(
+            np.asarray(visibility_mask, dtype=bool),
+            vis.shape,
+            "visibility_mask",
+            dtype=bool,
+        )
+        vis = np.where(mask, vis, 0.0 + 0.0j)
+
+    vis = np.asarray(vis, dtype=np.complex128)
+    return vis, np.angle(vis), normalised_visibility_amplitude(vis)
+
+
+@dataclass(frozen=True, slots=True)
+class VisibilityNpzArchive:
+    """
+    Complex visibility archive loaded from a SCEPTer NPZ file.
+
+    Parameters
+    ----------
+    path : pathlib.Path
+        Source archive path.
+    visibilities : numpy.ndarray
+        Complex visibility samples from the ``vis`` key.
+    uvw_m : numpy.ndarray
+        UVW coordinates in metres from the ``uvw`` key.
+    frequency_hz : numpy.ndarray or None
+        Frequency array from ``freq_hz`` if present.
+    pointing_uvw_m, satellite_uvw_m : numpy.ndarray or None
+        Optional pointing and satellite UVW arrays.
+    satellite_distance_m : numpy.ndarray or None
+        Optional per-antenna satellite ranges in metres.
+    phase_rad : numpy.ndarray or None
+        Optional wrapped phase samples.
+    normalised_amplitude : numpy.ndarray or None
+        Optional normalised amplitude samples.
+    antenna_names, satellite_names : tuple of str
+        Optional names stored as string arrays.
+    mjds : numpy.ndarray or None
+        Optional observation times in MJD.
+    metadata : dict
+        Optional JSON metadata stored under ``metadata_json``.
+
+    Notes
+    -----
+    ``vis`` and ``uvw`` are the required stable keys. Additional arrays are
+    intentionally optional so the same reader can consume compact imaging
+    products and fuller simulation products.
+    """
+
+    path: Path
+    visibilities: np.ndarray
+    uvw_m: np.ndarray
+    frequency_hz: np.ndarray | None
+    pointing_uvw_m: np.ndarray | None
+    satellite_uvw_m: np.ndarray | None
+    satellite_distance_m: np.ndarray | None
+    phase_rad: np.ndarray | None
+    normalised_amplitude: np.ndarray | None
+    antenna_names: tuple[str, ...]
+    satellite_names: tuple[str, ...]
+    mjds: np.ndarray | None
+    metadata: dict[str, Any]
+
+
+def save_visibility_npz(
+    path: str | Path,
+    visibilities: np.ndarray,
+    uvw_m: np.ndarray,
+    *,
+    frequency=None,
+    pointing_uvw_m: np.ndarray | None = None,
+    satellite_uvw_m: np.ndarray | None = None,
+    satellite_distance_m: np.ndarray | None = None,
+    phase_rad: np.ndarray | None = None,
+    normalised_amplitude: np.ndarray | None = None,
+    antenna_names: Sequence[str] | None = None,
+    satellite_names: Sequence[str] | None = None,
+    mjds: np.ndarray | None = None,
+    metadata: Mapping[str, Any] | None = None,
+    compressed: bool = True,
+) -> Path:
+    """
+    Save complex visibilities and UVW information to a SCEPTer NPZ archive.
+
+    Parameters
+    ----------
+    path : str or pathlib.Path
+        Output ``.npz`` path.
+    visibilities : numpy.ndarray
+        Complex visibility samples. Stored under the stable key ``vis``.
+    uvw_m : numpy.ndarray, shape (..., 3)
+        UVW coordinates in metres. Stored under the stable key ``uvw``.
+    frequency : astropy.units.Quantity or float or array-like, optional
+        Observing frequency/frequencies. Quantities are converted to hertz and
+        stored under ``freq_hz``; plain numeric values are interpreted as hertz.
+    pointing_uvw_m, satellite_uvw_m : numpy.ndarray, optional
+        Optional full UVW products stored under their existing descriptive keys.
+    satellite_distance_m : numpy.ndarray, optional
+        Optional per-antenna satellite ranges in metres.
+    phase_rad : numpy.ndarray, optional
+        Wrapped visibility phases in radians.
+    normalised_amplitude : numpy.ndarray, optional
+        Dimensionless normalised amplitudes.
+    antenna_names, satellite_names : sequence of str, optional
+        Optional string labels stored as Unicode arrays.
+    mjds : numpy.ndarray, optional
+        Optional observation times in Modified Julian Date.
+    metadata : mapping, optional
+        JSON-serialisable metadata stored as ``metadata_json``.
+    compressed : bool, optional
+        If ``True`` (default), use ``numpy.savez_compressed``. Otherwise use
+        ``numpy.savez``.
+
+    Returns
+    -------
+    pathlib.Path
+        Path to the written archive.
+
+    Raises
+    ------
+    ValueError
+        If ``uvw_m`` does not end with a 3-component UVW axis, or if metadata
+        cannot be serialised as JSON.
+
+    Notes
+    -----
+    The required archive keys are deliberately short and compatible with the
+    existing imaging scripts: ``vis`` for complex visibilities and ``uvw`` for
+    coordinates. Optional arrays preserve richer SCEPTer tracking context.
+    """
+    output_path = Path(path)
+    vis = np.asarray(visibilities)
+    if not np.iscomplexobj(vis):
+        vis = vis.astype(np.complex128)
+
+    uvw_arr = np.asarray(uvw_m, dtype=np.float64)
+    if uvw_arr.shape[-1:] != (3,):
+        raise ValueError("uvw_m must end with a 3-component UVW axis.")
+
+    payload: dict[str, Any] = {
+        "schema_name": np.asarray("scepter_visibility_npz"),
+        "schema_version": np.asarray("1"),
+        "vis": vis,
+        "uvw": uvw_arr,
+    }
+    if frequency is not None:
+        payload["freq_hz"] = _as_hz(frequency)
+    if pointing_uvw_m is not None:
+        payload["pointing_uvw_m"] = np.asarray(pointing_uvw_m, dtype=np.float64)
+    if satellite_uvw_m is not None:
+        payload["satellite_uvw_m"] = np.asarray(satellite_uvw_m, dtype=np.float64)
+    if satellite_distance_m is not None:
+        payload["satellite_distance_m"] = np.asarray(satellite_distance_m, dtype=np.float64)
+    if phase_rad is not None:
+        payload["phase_rad"] = np.asarray(phase_rad, dtype=np.float64)
+    if normalised_amplitude is not None:
+        payload["normalised_amplitude"] = np.asarray(normalised_amplitude, dtype=np.float64)
+    if antenna_names is not None:
+        payload["antenna_names"] = np.asarray(tuple(antenna_names), dtype=str)
+    if satellite_names is not None:
+        payload["satellite_names"] = np.asarray(tuple(satellite_names), dtype=str)
+    if mjds is not None:
+        payload["mjds"] = np.asarray(mjds, dtype=np.float64)
+    if metadata is not None:
+        try:
+            metadata_json = json.dumps(dict(metadata), sort_keys=True)
+        except TypeError as exc:
+            raise ValueError("metadata must be JSON-serialisable.") from exc
+        payload["metadata_json"] = np.asarray(metadata_json)
+
+    saver = np.savez_compressed if compressed else np.savez
+    saver(output_path, **payload)
+    return output_path
+
+
+def load_visibility_npz(path: str | Path) -> VisibilityNpzArchive:
+    """
+    Read complex visibilities and UVW information from a SCEPTer NPZ archive.
+
+    Parameters
+    ----------
+    path : str or pathlib.Path
+        Input archive produced by :func:`save_visibility_npz` or a compatible
+        file containing at least ``vis`` and ``uvw`` arrays.
+
+    Returns
+    -------
+    VisibilityNpzArchive
+        Dataclass containing the required visibility/UVW arrays and any
+        optional metadata present in the archive.
+
+    Raises
+    ------
+    FileNotFoundError
+        If *path* does not exist.
+    KeyError
+        If required ``vis`` or ``uvw`` keys are missing.
+    ValueError
+        If the stored ``uvw`` array does not end with a 3-component axis.
+
+    Notes
+    -----
+    Loading uses ``allow_pickle=False``. Metadata must therefore be stored as
+    numeric arrays, string arrays, or JSON text.
+    """
+    archive_path = Path(path)
+    if not archive_path.is_file():
+        raise FileNotFoundError(f"Visibility archive not found: {archive_path}")
+
+    with np.load(archive_path, allow_pickle=False) as data:
+        if "vis" not in data or "uvw" not in data:
+            missing = ", ".join(key for key in ("vis", "uvw") if key not in data)
+            raise KeyError(f"Visibility archive is missing required key(s): {missing}.")
+
+        uvw_arr = np.asarray(data["uvw"], dtype=np.float64)
+        if uvw_arr.shape[-1:] != (3,):
+            raise ValueError("Stored uvw array must end with a 3-component UVW axis.")
+
+        metadata: dict[str, Any] = {}
+        if "metadata_json" in data:
+            metadata = json.loads(str(np.asarray(data["metadata_json"]).item()))
+
+        def optional_array(key: str) -> np.ndarray | None:
+            return np.asarray(data[key]) if key in data else None
+
+        def optional_names(key: str) -> tuple[str, ...]:
+            if key not in data:
+                return ()
+            return tuple(np.asarray(data[key]).astype(str).tolist())
+
+        return VisibilityNpzArchive(
+            path=archive_path,
+            visibilities=np.asarray(data["vis"]),
+            uvw_m=uvw_arr,
+            frequency_hz=optional_array("freq_hz"),
+            pointing_uvw_m=optional_array("pointing_uvw_m"),
+            satellite_uvw_m=optional_array("satellite_uvw_m"),
+            satellite_distance_m=optional_array("satellite_distance_m"),
+            phase_rad=optional_array("phase_rad"),
+            normalised_amplitude=optional_array("normalised_amplitude"),
+            antenna_names=optional_names("antenna_names"),
+            satellite_names=optional_names("satellite_names"),
+            mjds=optional_array("mjds"),
+            metadata=metadata,
+        )
 
 
 def itrf_to_enu(baseline_itrf, longitude_rad, latitude_rad):
@@ -1278,6 +1876,8 @@ class TrackingUvwResult:
     satellite_uvw_m : numpy.ndarray, shape (N_ant, T, N_sat, 3)
         UVW coordinates for each propagated satellite, using its time-varying
         ICRS RA/Dec as the phase centre.
+    satellite_distance_m : numpy.ndarray, shape (N_ant, T, N_sat)
+        Distance from each antenna to each propagated satellite in metres.
     satellite_hour_angles_rad : numpy.ndarray, shape (T, N_sat)
         Satellite-specific hour-angle tracks in radians.
     satellite_ra_deg : numpy.ndarray, shape (T, N_sat)
@@ -1302,6 +1902,7 @@ class TrackingUvwResult:
     pointing_uvw_m: np.ndarray
     pointing_hour_angles_rad: np.ndarray
     satellite_uvw_m: np.ndarray
+    satellite_distance_m: np.ndarray
     satellite_hour_angles_rad: np.ndarray
     satellite_ra_deg: np.ndarray
     satellite_dec_deg: np.ndarray
@@ -1790,6 +2391,10 @@ class TrackingUvwBuilder:
         sat_icrs = sat_altaz.transform_to(ICRS())
         satellite_ra_deg = np.asarray(sat_icrs.ra.deg, dtype=np.float64)
         satellite_dec_deg = np.asarray(sat_icrs.dec.deg, dtype=np.float64)
+        satellite_distance_m = np.asarray(
+            sim.topo_pos_dist[:, 0, 0, 0, :, :],
+            dtype=np.float64,
+        ) * 1000.0
         satellite_uvw, satellite_ha = compute_uvw(
             antennas,
             ra_deg=satellite_ra_deg,
@@ -1805,6 +2410,7 @@ class TrackingUvwBuilder:
             pointing_uvw_m=np.asarray(pointing_uvw, dtype=np.float64),
             pointing_hour_angles_rad=np.asarray(pointing_ha, dtype=np.float64),
             satellite_uvw_m=np.asarray(satellite_uvw, dtype=np.float64),
+            satellite_distance_m=satellite_distance_m,
             satellite_hour_angles_rad=np.asarray(satellite_ha, dtype=np.float64),
             satellite_ra_deg=satellite_ra_deg,
             satellite_dec_deg=satellite_dec_deg,

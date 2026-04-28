@@ -46,7 +46,9 @@ repository.
      - UVW coordinate transforms for radio interferometry.
      - ``hour_angle``, ``itrf_to_enu``, ``enu_to_uvw``,
        ``baseline_bearing``, ``baseline_pairs``, ``geometric_delay_az_el``,
-       ``fringe_attenuation``, ``bw_fringe``, ``compute_uvw``
+       ``fringe_attenuation``, ``fringe_response``, ``compute_uvw``,
+       ``satellite_geometric_delay``, ``simulate_satellite_visibilities``,
+       ``save_visibility_npz``
    * - ``scepter.array``
      - Standalone baseline geometry, delay, and fringe utilities.
      - ``baseline_bearing``, ``baseline_pairs``, ``baseline_vector``,

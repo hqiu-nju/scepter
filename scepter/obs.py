@@ -2111,19 +2111,25 @@ class obs_sim():
         See Also
         --------
         baselines_nearfield_delays : Calculate delays (must run first)
-        scepter.uvw.bw_fringe : Underlying bandwidth integration
+        scepter.uvw.fringe_response : Monochromatic fringe response
         fringe_signal : Combine fringes with power and gain
         """
         from . import uvw
 
 
         delays = self.baseline_delays.flatten()
-        self.fringes = uvw.bw_fringe(
-            delays,
-            bwchan,
-            fch1,
-            chan_bin=chan_bin,
-        ).reshape(self.baseline_delays.shape)
+        fch1_khz = fch1.to(u.kHz).value
+        bwchan_khz = bwchan.to(u.kHz).value
+        freq_array = np.linspace(
+            fch1_khz - bwchan_khz * 0.5,
+            fch1_khz + bwchan_khz * 0.5,
+            int(chan_bin),
+        ) * u.kHz
+        fringes = uvw.fringe_response(
+            delays[:, np.newaxis],
+            freq_array[np.newaxis, :],
+        )
+        self.fringes = np.mean(fringes, axis=1).reshape(self.baseline_delays.shape)
 
         return self.fringes
 
